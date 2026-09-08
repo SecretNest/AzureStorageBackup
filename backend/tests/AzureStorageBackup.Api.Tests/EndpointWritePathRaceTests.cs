@@ -9,6 +9,7 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
 
 namespace AzureStorageBackup.Api.Tests;
 
@@ -72,28 +73,43 @@ public sealed class EndpointWritePathRaceTests
         public Task<string> WriteInfoConditionalAsync(Account account, string container, BackupInfoFile info, string? password, AccessTier? tier, string? ifMatch, CancellationToken ct = default)
             => throw new NotSupportedException();
 
-        public Task<VersionIndex> ReadIndexAsync(Account account, string container, string indexBlob, string? password, int volumes = 1, CancellationToken ct = default)
+        public Task<(string Name, int Volumes)> WriteIndexFileAsync(Account account, string container, int version, string serializedPath, string? password, AccessTier? tier = null, CancellationToken ct = default, StageTracker? progress = null)
             => throw new NotSupportedException();
 
-        public Task<(string Name, int Volumes)> WriteIndexAsync(Account account, string container, int version, VersionIndex index, string? password, AccessTier? tier = null, CancellationToken ct = default, StageTracker? progress = null)
+        public Task ReadIndexToFileAsync(Account account, string container, string indexBlob, string? password, int volumes, string destPath, CancellationToken ct = default)
             => throw new NotSupportedException();
     }
 
     /// <summary>The second of the delete-config cleanup steps: throws cancellation the moment it is called. These cases should not reach the other methods.</summary>
-    private sealed class CancelsOnEvictIndexCache : ILocalIndexCache
+    private sealed class CancelsOnDiscardCatalogs : IVersionCatalogs
     {
-        public Task<VersionIndex> ReadAsync(
-            Account account, string container, int version, long identityTicks,
-            string indexBlob, string? password, int indexVolumes = 1, CancellationToken ct = default) => throw new NotSupportedException();
-
-        public Task PutAsync(int accountId, string container, int version, long identityTicks, VersionIndex index, CancellationToken ct = default)
+        public Task<VersionCatalog> OpenAsync(int accountId, string container, bool readOnly, CancellationToken ct = default)
             => throw new NotSupportedException();
 
-        public Task RemoveAsync(int accountId, string container, int version, CancellationToken ct = default)
+        public Task EnsureVersionAsync(Account account, string container, BackupVersion version, long identityTicks, string? password, CancellationToken ct = default)
             => throw new NotSupportedException();
 
-        public Task RemoveForContainerAsync(int accountId, string container, CancellationToken ct = default)
+        public Task<VersionCatalog> OpenForWriteAsync(
+            CatalogWriteLock held, int accountId, string container, CancellationToken ct = default)
+            => throw new NotSupportedException();
+
+        public Task RemoveVersionAsync(int accountId, string container, int version, CancellationToken ct = default)
+            => throw new NotSupportedException();
+
+        public Task ReconcileAsync(
+            int accountId, string container, IReadOnlyCollection<int> keepVersions, CancellationToken ct = default)
+            => throw new NotSupportedException();
+
+        public Task RemoveContainerAsync(int accountId, string container, CancellationToken ct = default)
             => throw new OperationCanceledException();
+
+        public Task ApplyPatchesOrInvalidateAsync(
+            int accountId, string container, IReadOnlyList<CatalogPatch> patches, ILogger? logger,
+            CancellationToken ct = default)
+            => throw new NotSupportedException();
+
+        public Task<CatalogWriteLock> LockForWriteAsync(int accountId, string container, CancellationToken ct = default)
+            => throw new NotSupportedException();
     }
 
     /// <summary>The third of the delete-config cleanup steps: only records whether it was called.</summary>
@@ -348,8 +364,8 @@ public sealed class EndpointWritePathRaceTests
         var stateStore = new RecordingStateStore();
         using var factory = new StubbedFactory(services =>
         {
-            services.RemoveAll<ILocalIndexCache>();
-            services.AddScoped<ILocalIndexCache, CancelsOnEvictIndexCache>();
+            services.RemoveAll<IVersionCatalogs>();
+            services.AddScoped<IVersionCatalogs, CancelsOnDiscardCatalogs>();
             services.RemoveAll<ILocalBackupStateStore>();
             services.AddScoped<ILocalBackupStateStore>(_ => stateStore);
         });

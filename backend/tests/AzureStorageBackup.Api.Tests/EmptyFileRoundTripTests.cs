@@ -94,10 +94,12 @@ public sealed class EmptyFileRoundTripTests : IDisposable
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator(),
-                indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
-            new FileHasher(), authority.IndexCache, authority.Tracked);
+                catalogs: authority.Catalogs, trackedInfo: authority.Tracked),
+            new FileHasher(), authority.Catalogs, authority.Tracked,
+            workFactory: TestWorkDbs.New());
         var restore = new RestoreOrchestrator(
-            factory, store, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "restore"));
+            factory, store, TestCatalogs.New(authority.Db, store), new SevenZipCompressor(), new FileHasher(),
+            Path.Combine(_temp, "restore"));
         return (backup, restore, authority);
     }
 
@@ -290,11 +292,11 @@ public sealed class EmptyFileRoundTripTests : IDisposable
                     : e)],
             };
             await store.WriteIndexAsync(account, name, v1.Version, tampered, null);
-            // The local cache has to be changed too: a backup reading the previous version's index only honours the
-            // local copy, so changing the cloud one alone changes nothing.
-            // And this is exactly the real shape of an "old backup" — that entry with a storage reference was written into the local cache just like this back then.
-            await authority.IndexCache.PutAsync(
-                account.Id, name, v1.Version, info.Backup.CreatedAt.UtcTicks, tampered);
+            // Written to the cloud behind the catalog's back, so the catalog's copy of that version has to be
+            // dropped: a backup reads the previous version out of the catalog, and a version is only re-imported
+            // from the cloud when the catalog does not have it. What comes back is exactly the real shape of an
+            // "old backup" — an empty file's entry carrying a storage reference.
+            await authority.Catalogs.RemoveVersionAsync(account.Id, name, v1.Version);
 
             // Not one byte of the source file is touched → diff judges Unchanged, which is exactly the path where inheriting it forever is easiest.
             await backup.RunAsync(new BackupRequest

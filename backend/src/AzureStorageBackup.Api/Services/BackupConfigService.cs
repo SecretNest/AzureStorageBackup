@@ -32,7 +32,7 @@ public class BackupConfigService(AppDbContext db) : IBackupConfigService
 
     /// <summary>
     /// Update a config. The base fields (AccountId/ContainerName/LocalRoot/IndexTier/DataTier) and the password are locked
-    /// after creation (§4.5): the local authoritative state (TrackedInfoStore/LocalIndexCache) is keyed by account+container, so changing these fields
+    /// after creation (§4.5): the local authoritative state (TrackedInfoStore/IVersionCatalogs) is keyed by account+container, so changing these fields
     /// desynchronizes it from the cloud/local index. Throws <see cref="InvalidOperationException"/> when a change is detected; the endpoint maps that to 400.
     ///
     /// <para>

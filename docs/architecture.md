@@ -22,6 +22,10 @@ A backup issues **no cloud read** to decide what changed, what already exists, o
 anything. The local SQLite cache holds a copy of the info file and every version index, and dedup,
 collision avoidance and volume counts are all decided from it.
 
+That authority is **queryable rather than resident**: the indexes live in a per-container SQLite
+catalog and are answered a row at a time, so being authoritative costs no memory proportional to the
+size of the backup ([storage-format.md](storage-format.md)).
+
 > **Rationale.** Data can sit in Cold or Archive, where reads cost money and Archive reads require
 > rehydration first. A design that asks the cloud "does this blob exist?" once per file turns a
 > routine incremental backup into a bill. Import pulls everything into the local store, so "no local
@@ -139,10 +143,10 @@ what makes a resume cheap.
 | Configuration, schedules, logs | SQLite `app.db` | — |
 | Secrets (account key, proxy and backup passwords) | SQLite, encrypted by the key ring | — |
 | Info file (versions, pack metadata, settings snapshot) | cached copy + ETag | authoritative for recovery |
-| Version indexes | cached, decrypted, in `data/index-cache/…` — files, not SQLite (see storage-format.md) | authoritative for recovery |
+| Version indexes | a SQLite catalog per container in `data/index-cache/…`, decrypted, rebuilt from the cloud on demand (see storage-format.md) | authoritative for recovery |
 | Data blobs and packs | — | the backup itself |
 | Journals | `data/journal/…`, plain text | — |
-| Temp (compress, staged, verbose logs) | `{tempPath}/…`, cleared at startup | — |
+| Temp (compress, staged, verbose logs, per-run work databases, index staging, 7z extraction) | `{tempPath}/…`, cleared at startup | — |
 
 **Device-local configuration is deliberately not written to the cloud**: the local root, the ignore
 rules and the scope rules describe *this machine*, and a recovery on another machine will have

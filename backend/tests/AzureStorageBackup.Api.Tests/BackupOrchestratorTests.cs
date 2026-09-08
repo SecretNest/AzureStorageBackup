@@ -75,7 +75,8 @@ public sealed class BackupOrchestratorTests : IDisposable
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             compressor ?? new SevenZipCompressor(), uploader ?? new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor, indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked);
+            new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor, catalogs: authority.Catalogs, trackedInfo: authority.Tracked), new FileHasher(), authority.Catalogs, authority.Tracked,
+            workFactory: TestWorkDbs.New());
         return (orchestrator, store, factory);
     }
 
@@ -124,21 +125,21 @@ public sealed class BackupOrchestratorTests : IDisposable
             => inner.ExtractToStreamAsync(firstVolumePath, entryName, password, destination, ct);
     }
 
-    /// <summary>Store decorator that counts ReadIndexAsync calls (to verify local cache hits).</summary>
+    /// <summary>Store decorator that counts second-level index downloads (to verify local catalog hits).</summary>
     private sealed class CountingStore(IBackupInfoStore inner) : IBackupInfoStore
     {
         public int IndexReads { get; private set; }
         public int InfoReads { get; private set; }
-        public Task<VersionIndex> ReadIndexAsync(Account a, string c, string b, string? p, int volumes = 1, CancellationToken ct = default)
-        {
-            IndexReads++;
-            return inner.ReadIndexAsync(a, c, b, p, volumes, ct);
-        }
         public Task<BackupInfoFile?> ReadInfoAsync(Account a, string c, string? p, CancellationToken ct = default) { InfoReads++; return inner.ReadInfoAsync(a, c, p, ct); }
         public Task<(BackupInfoFile Info, string ETag)?> ReadInfoWithETagAsync(Account a, string c, string? p, CancellationToken ct = default) { InfoReads++; return inner.ReadInfoWithETagAsync(a, c, p, ct); }
         public Task WriteInfoAsync(Account a, string c, BackupInfoFile i, string? p, AccessTier? t = null, CancellationToken ct = default) => inner.WriteInfoAsync(a, c, i, p, t, ct);
         public Task<string> WriteInfoConditionalAsync(Account a, string c, BackupInfoFile i, string? p, AccessTier? t, string? e, CancellationToken ct = default) => inner.WriteInfoConditionalAsync(a, c, i, p, t, e, ct);
-        public Task<(string Name, int Volumes)> WriteIndexAsync(Account a, string c, int v, VersionIndex i, string? p, AccessTier? t = null, CancellationToken ct = default, StageTracker? progress = null) => inner.WriteIndexAsync(a, c, v, i, p, t, ct, progress);
+        public Task<(string Name, int Volumes)> WriteIndexFileAsync(Account a, string c, int v, string s, string? p, AccessTier? t = null, CancellationToken ct = default, StageTracker? progress = null) => inner.WriteIndexFileAsync(a, c, v, s, p, t, ct, progress);
+        public Task ReadIndexToFileAsync(Account a, string c, string b, string? p, int volumes, string dest, CancellationToken ct = default)
+        {
+            IndexReads++;
+            return inner.ReadIndexToFileAsync(a, c, b, p, volumes, dest, ct);
+        }
     }
 
     [SkippableFact]
@@ -160,8 +161,9 @@ public sealed class BackupOrchestratorTests : IDisposable
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, counting, staging,
-            new RetentionCleaner(factory, counting, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(),
-            authority.IndexCache, authority.Tracked);
+            new RetentionCleaner(factory, counting, new RetentionEvaluator(), catalogs: authority.Catalogs, trackedInfo: authority.Tracked), new FileHasher(),
+            authority.Catalogs, authority.Tracked,
+            workFactory: TestWorkDbs.New());
 
         var account = AzuriteAccount();
         var name = RandomName("orchlc-");
@@ -198,7 +200,8 @@ public sealed class BackupOrchestratorTests : IDisposable
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, counting, staging,
             new RetentionCleaner(factory, counting, new RetentionEvaluator()), new FileHasher(),
-            indexCache: new LocalIndexCache(db, counting, TestIndexFiles.New()), trackedInfo: tracked);
+            catalogs: TestCatalogs.New(db, counting), trackedInfo: tracked,
+            workFactory: TestWorkDbs.New());
 
         var account = AzuriteAccount();
         var name = RandomName("orchti-");
@@ -289,8 +292,9 @@ public sealed class BackupOrchestratorTests : IDisposable
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), uploader, factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
-            indexCache: new LocalIndexCache(db, store, TestIndexFiles.New()),
-            trackedInfo: new TrackedInfoStore(store, new LocalBackupStateStore(db)));
+            catalogs: TestCatalogs.New(db, store),
+            trackedInfo: new TrackedInfoStore(store, new LocalBackupStateStore(db)),
+            workFactory: TestWorkDbs.New());
         return (orchestrator, store);
     }
 
@@ -385,7 +389,8 @@ public sealed class BackupOrchestratorTests : IDisposable
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
-            indexCache: new LocalIndexCache(db, store, TestIndexFiles.New()), trackedInfo: tracked);
+            catalogs: TestCatalogs.New(db, store), trackedInfo: tracked,
+            workFactory: TestWorkDbs.New());
 
         var account = AzuriteAccount();
         var name = RandomName("orchconf-");
@@ -888,7 +893,8 @@ public sealed class BackupOrchestratorTests : IDisposable
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked, opLog: log,
+            new RetentionCleaner(factory, store, new RetentionEvaluator(), catalogs: authority.Catalogs, trackedInfo: authority.Tracked), new FileHasher(), authority.Catalogs, authority.Tracked,
+            workFactory: TestWorkDbs.New(), opLog: log,
             verboseLog: verboseLog);
 
         var account = AzuriteAccount();
@@ -929,7 +935,8 @@ public sealed class BackupOrchestratorTests : IDisposable
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked, opLog: log);
+            new RetentionCleaner(factory, store, new RetentionEvaluator(), catalogs: authority.Catalogs, trackedInfo: authority.Tracked), new FileHasher(), authority.Catalogs, authority.Tracked,
+            workFactory: TestWorkDbs.New(), opLog: log);
 
         var account = AzuriteAccount();
         var name = RandomName("orchrec-");

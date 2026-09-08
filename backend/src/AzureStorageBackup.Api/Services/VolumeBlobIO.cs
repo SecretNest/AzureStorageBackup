@@ -753,3 +753,122 @@ public static class VolumeBlobIO
 
     private static string VolumeName(string baseRef, int index) => $"{baseRef}.{index:D3}";
 }
+
+/// <summary>
+/// A read-only window <c>[offset, offset + length)</c> onto a seekable stream, presented as a stream in its own
+/// right: <see cref="Length"/> is the window's length and <see cref="Position"/> is 0 at the window's first byte.
+/// <para>
+/// It exists so one volume of a split index can be uploaded straight off the encoded file. The byte-array shape the
+/// index write used to have means the whole encoded archive in memory plus a slice per volume, and an index at a
+/// few million entries runs to hundreds of MB. The Azure SDK wants an ordinary seekable stream with a known length
+/// (it retries by seeking back to where it started), which is exactly what this looks like from the outside.
+/// </para>
+/// <para>
+/// Seeking past the end clamps to the end — the next read then returns 0, the same as arriving there by reading —
+/// while a seek to a negative position throws, because that is a caller bug and quietly serving bytes from outside
+/// the window would put one volume's content under another volume's name.
+/// </para>
+/// <para>Not thread-safe, and it repositions the wrapped stream on every read: one live window per stream.</para>
+/// </summary>
+internal sealed class RangeStream : Stream
+{
+    private readonly Stream _inner;
+    private readonly long _offset;
+    private readonly long _length;
+    private readonly bool _leaveOpen;
+    private long _position;
+
+    /// <param name="leaveOpen">False (the default) means disposing this disposes the wrapped stream too, so a
+    /// caller that opens a file purely to feed one window can hand the pair on as a single stream.</param>
+    public RangeStream(Stream inner, long offset, long length, bool leaveOpen = false)
+    {
+        ArgumentNullException.ThrowIfNull(inner);
+        ArgumentOutOfRangeException.ThrowIfNegative(offset);
+        ArgumentOutOfRangeException.ThrowIfNegative(length);
+        if (!inner.CanSeek)
+            throw new ArgumentException("A range needs a seekable stream underneath it.", nameof(inner));
+
+        _inner = inner;
+        _offset = offset;
+        _length = length;
+        _leaveOpen = leaveOpen;
+    }
+
+    public override bool CanRead => true;
+    public override bool CanSeek => true;
+    public override bool CanWrite => false;
+    public override long Length => _length;
+
+    public override long Position
+    {
+        get => _position;
+        set
+        {
+            ArgumentOutOfRangeException.ThrowIfNegative(value);
+            _position = Math.Min(value, _length);
+        }
+    }
+
+    public override int Read(byte[] buffer, int offset, int count)
+    {
+        ValidateBufferArguments(buffer, offset, count);
+        return Read(buffer.AsSpan(offset, count));
+    }
+
+    public override int Read(Span<byte> buffer)
+    {
+        var take = (int)Math.Min(buffer.Length, _length - _position);
+        if (take <= 0)
+            return 0;
+
+        _inner.Position = _offset + _position;
+        var read = _inner.Read(buffer[..take]);
+        _position += read;
+        return read;
+    }
+
+    public override Task<int> ReadAsync(byte[] buffer, int offset, int count, CancellationToken cancellationToken)
+    {
+        ValidateBufferArguments(buffer, offset, count);
+        return ReadAsync(buffer.AsMemory(offset, count), cancellationToken).AsTask();
+    }
+
+    public override async ValueTask<int> ReadAsync(Memory<byte> buffer, CancellationToken cancellationToken = default)
+    {
+        var take = (int)Math.Min(buffer.Length, _length - _position);
+        if (take <= 0)
+            return 0;
+
+        _inner.Position = _offset + _position;
+        var read = await _inner.ReadAsync(buffer[..take], cancellationToken);
+        _position += read;
+        return read;
+    }
+
+    public override long Seek(long offset, SeekOrigin origin)
+    {
+        var target = origin switch
+        {
+            SeekOrigin.Begin => offset,
+            SeekOrigin.Current => _position + offset,
+            SeekOrigin.End => _length + offset,
+            _ => throw new ArgumentOutOfRangeException(nameof(origin)),
+        };
+        if (target < 0)
+            throw new IOException("Cannot seek before the start of the range.");
+
+        _position = Math.Min(target, _length);
+        return _position;
+    }
+
+    public override void Flush() { }
+    public override void SetLength(long value) => throw new NotSupportedException();
+    public override void Write(byte[] buffer, int offset, int count) => throw new NotSupportedException();
+
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing && !_leaveOpen)
+            _inner.Dispose();
+        base.Dispose(disposing);
+    }
+}

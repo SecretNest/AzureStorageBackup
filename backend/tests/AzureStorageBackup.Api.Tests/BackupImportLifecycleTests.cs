@@ -121,14 +121,15 @@ public sealed class BackupImportLifecycleTests : IClassFixture<TestWebAppFactory
         var store = new BackupInfoStore(blobFactory, new SevenZipArchiveCodec());
         var hasher = new FileHasher();
         var tracked = new TrackedInfoStore(store, new LocalBackupStateStore(db));
-        var indexCache = new LocalIndexCache(db, store, TestIndexFiles.New());
+        var catalogs = TestCatalogs.New(db, store);
         var staging = new StagingArea(
             Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(hasher), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(blobFactory), blobFactory, store, staging,
-            new RetentionCleaner(blobFactory, store, new RetentionEvaluator(), indexCache: indexCache, trackedInfo: tracked),
-            hasher, indexCache: indexCache, trackedInfo: tracked);
+            new RetentionCleaner(blobFactory, store, new RetentionEvaluator(), catalogs: catalogs, trackedInfo: tracked),
+            hasher, catalogs: catalogs, trackedInfo: tracked,
+            workFactory: TestWorkDbs.New());
 
         var account = new Account
         {
@@ -269,7 +270,7 @@ public sealed class BackupImportLifecycleTests : IClassFixture<TestWebAppFactory
             .Where(s => s.AccountId == accountId && s.Container == container).ToListAsync());
     }
 
-    /// <summary>After the import: the local authoritative state is backfilled from the cloud info file, and every version's index has landed in the local cache.</summary>
+    /// <summary>After the import: the local authoritative state is backfilled from the cloud info file, and every version has landed in the local catalog.</summary>
     private async Task AssertLocalStateSeededAsync(int accountId, string container, int expectedVersions)
     {
         using var scope = _factory.Services.CreateScope();
@@ -281,11 +282,13 @@ public sealed class BackupImportLifecycleTests : IClassFixture<TestWebAppFactory
         Assert.NotEmpty(state!.InfoBytes);
         Assert.NotEmpty(state.ETag); // an ETag is what makes the later conditional writes possible
 
-        // The version indexes are cached in files beside the database, not in a table (see VersionIndexFileStore).
-        var files = scope.ServiceProvider.GetRequiredService<VersionIndexFileStore>();
-        var cached = Enumerable.Range(1, expectedVersions)
-            .Where(v => File.Exists(files.PathFor(accountId, container, v)));
-        Assert.Equal(Enumerable.Range(1, expectedVersions), cached);
+        // The versions live in the container's catalog beside the database, not in a table and no longer as one
+        // serialized file each (see VersionCatalogStore): import warms every one of them into it.
+        var catalogs = scope.ServiceProvider.GetRequiredService<VersionCatalogStore>();
+        await using var catalog = await catalogs.OpenAsync(accountId, container, readOnly: true, CancellationToken.None);
+        Assert.Equal(
+            Enumerable.Range(1, expectedVersions),
+            (await catalog.ListVersionsAsync(CancellationToken.None)).Select(v => v.Version));
     }
 
     /// <summary>Restores over HTTP into a brand-new empty directory and compares it against the snapshot byte for byte.</summary>

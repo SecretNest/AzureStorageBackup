@@ -75,9 +75,10 @@ public sealed class RawFlagMismatchDetectionTests : IDisposable
         var backup = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked);
+            new RetentionCleaner(factory, store, new RetentionEvaluator(), catalogs: authority.Catalogs, trackedInfo: authority.Tracked), new FileHasher(), authority.Catalogs, authority.Tracked,
+            workFactory: TestWorkDbs.New());
         var checker = new BackupChecker(
-            factory, store, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check"));
+            factory, store, authority.Catalogs, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check"));
 
         var account = AzuriteAccount();
         var name = RandomName("rawflag-");
@@ -125,6 +126,10 @@ public sealed class RawFlagMismatchDetectionTests : IDisposable
                     : e)],
             };
             await store.WriteIndexAsync(account, name, version.Version, tampered, null);
+            // The version index was rewritten out of band. The check reads the version out of the container's
+            // catalog now, so the catalog's copy has to be dropped for the doctored index to be the one it reads:
+            // a version is re-imported on demand, from the cloud.
+            await authority.Catalogs.RemoveVersionAsync(account.Id, name, version.Version);
 
             var report = await checker.CheckAsync(
                 account, name, null, null, new CheckOptions { Cloud = CloudCheckLevel.Content });
@@ -155,9 +160,10 @@ public sealed class RawFlagMismatchDetectionTests : IDisposable
         var backup = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked);
+            new RetentionCleaner(factory, store, new RetentionEvaluator(), catalogs: authority.Catalogs, trackedInfo: authority.Tracked), new FileHasher(), authority.Catalogs, authority.Tracked,
+            workFactory: TestWorkDbs.New());
         var checker = new BackupChecker(
-            factory, store, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check2"));
+            factory, store, authority.Catalogs, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check2"));
 
         var account = AzuriteAccount();
         var name = RandomName("rawflag2-");
@@ -200,6 +206,10 @@ public sealed class RawFlagMismatchDetectionTests : IDisposable
                     : e)],
             };
             await store.WriteIndexAsync(account, name, version.Version, tampered, null);
+            // The version index was rewritten out of band. The check reads the version out of the container's
+            // catalog now, so the catalog's copy has to be dropped for the doctored index to be the one it reads:
+            // a version is re-imported on demand, from the cloud.
+            await authority.Catalogs.RemoveVersionAsync(account.Id, name, version.Version);
 
             var report = await checker.CheckAsync(
                 account, name, null, null, new CheckOptions { Cloud = CloudCheckLevel.Content });

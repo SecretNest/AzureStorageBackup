@@ -101,8 +101,9 @@ public sealed class PackStoreOnlySplitTests : IDisposable
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, Staging(),
             new RetentionCleaner(
                 factory, store, new RetentionEvaluator(),
-                indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
-            new FileHasher(), authority.IndexCache, authority.Tracked);
+                catalogs: authority.Catalogs, trackedInfo: authority.Tracked),
+            new FileHasher(), authority.Catalogs, authority.Tracked,
+            workFactory: TestWorkDbs.New());
 
         var account = AzuriteAccount();
         var name = RandomName("packsplit-");

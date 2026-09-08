@@ -148,6 +148,61 @@ public sealed class BackupJournalStore(string rootDir)
     }
 
     /// <summary>
+    /// Every journal volume on this container by <b>header only</b>: the first line is deserialized, the rest are not
+    /// even looked at.
+    /// <para>
+    /// The adoption decision (<see cref="BackupRunControl.OpenJournalAsync"/>) tests four header terms and nothing
+    /// else, yet <see cref="ListAsync"/> hands it whole volumes — every record of every volume parsed as JSON to
+    /// answer a question the first line settles. On a container carrying a suspended run of a few hundred thousand
+    /// files that is hundreds of MB of parsing, done before the run has uploaded a byte. The records of the volumes
+    /// that <em>are</em> adopted are read afterwards, one at a time, by <see cref="BackupJournal.ReadRecordsAsync"/>.
+    /// </para>
+    /// <para>Volumes whose header does not read are skipped, exactly as <see cref="ListAsync"/> skips them (= that
+    /// volume is void). Order is ordinal by file name, also as in <see cref="ListAsync"/> — the caller sorts by start
+    /// time, because a file name is a runId and says nothing about age.</para>
+    /// </summary>
+    public async Task<IReadOnlyList<(string RunId, JournalHeader Header)>> ListHeadersAsync(
+        int accountId, string container, CancellationToken ct)
+    {
+        var dir = DirFor(accountId, container);
+        if (!Directory.Exists(dir))
+            return [];
+
+        var result = new List<(string, JournalHeader)>();
+        foreach (var file in Directory.EnumerateFiles(dir, "*.jsonl").OrderBy(f => f, StringComparer.Ordinal))
+            if (await ReadHeaderAsync(file, ct) is { } header)
+                result.Add((Path.GetFileNameWithoutExtension(file), header));
+        return result;
+    }
+
+    /// <summary>The first non-empty line of one volume as a header, or null for "this volume is void". No
+    /// <c>File.Exists</c> first, for the reason spelled out in <see cref="BackupJournal.ReadAsync"/>: another run may
+    /// delete its own volume in the gap between the two calls, and that is not an error, it is the same answer as
+    /// "there was never one here".</summary>
+    private static async Task<JournalHeader?> ReadHeaderAsync(string file, CancellationToken ct)
+    {
+        FileStream stream;
+        try
+        {
+            stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        }
+        catch (Exception ex) when (ex is FileNotFoundException or DirectoryNotFoundException)
+        {
+            return null;
+        }
+        using var reader = new StreamReader(stream, Encoding.UTF8);
+
+        while (await reader.ReadLineAsync(ct) is { } line)
+        {
+            if (line.Length == 0)
+                continue;
+            try { return JsonSerializer.Deserialize<JournalHeader>(line, JournalJson.Options); }
+            catch (JsonException) { return null; }
+        }
+        return null;   // an empty file has no header, so it vouches for nothing
+    }
+
+    /// <summary>
     /// The line count already tallied for one journal volume. <see cref="PeekAsync"/> relies on it to avoid rewalking the whole volume on every poll.
     /// </summary>
     /// <param name="StartedAt">The start time written in that volume's header when this tally was taken. See the invalidation rules in <see cref="PeekAsync"/>.</param>

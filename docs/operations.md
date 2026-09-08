@@ -376,6 +376,103 @@ nothing for it.
 > number is not a failed call, it is a *different* call. Neither level needs privileges: lowering your
 > own priority is always allowed, and `IOPRIO_CLASS_IDLE` dropped its privilege requirement in 2.6.25.
 
+## Temp space
+
+`Backup__TempPath` is where everything a run stages lands: the compression intermediates and staged
+volumes, the 7z codec's extraction directories, the index staging the info store and the catalogs'
+cloud import share, and the per-run work databases. Everything under it is scratch — a normal finish
+deletes its own, and startup sweeps whatever a killed process left.
+
+The part that scales with the backup is the run's work database, at **roughly 500 bytes per scanned
+file**. Budget **about twice that while a run is in flight**: the diff reads the scan through a
+cursor, and that cursor pins a read snapshot for as long as it is open, so SQLite cannot restart the
+write-ahead log underneath it. Every draft row the diff writes therefore accumulates in `-wal`
+alongside the scan rows already in the file, and the pair only collapses back to one copy when the
+diff's cursor closes. Both go when the run ends, whichever way it ends.
+
+## Memory
+
+A run's memory is bounded by the pipeline's width rather than by the size of the backup: version
+indexes are answered as queries against the container's catalog, and everything the run itself
+accumulates — the scan, the draft of the new version, its dedup reservations, an adopted journal's
+records, the pack leader map — lives in scratch databases on disk ([storage-format.md](storage-format.md)).
+What is left in memory that still grows with the file count is small, transient, and measured.
+
+Measured with one backup run per row over a synthetic tree of unique-content files, sampling
+`Process.WorkingSet64` and the managed heap every two seconds (`MemoryBenchmarkTests`, which the
+suite runs only under `ASB_BENCH=1`). Two runs at each size, shown as *first / second*:
+
+| Files in the run | Peak working set | Peak managed heap | Live heap (forced collection) | Working set after the run |
+|---|---|---|---|---|
+| 100,000 | 385.6 / 371.7 MB | 47.5 / 38.9 MB | 32.5 / 32.7 MB | 308.1 / 306.1 MB |
+| 200,000 | 478.4 / 479.6 MB | 94.3 / 58.2 MB | 47.0 / 47.5 MB | 378.9 / 389.4 MB |
+
+…and again after the work database's write channel was bounded (one run at each size):
+
+| Files in the run | Peak working set | Peak managed heap | Live heap (forced collection) | Working set after the run |
+|---|---|---|---|---|
+| 100,000 | 375 MB | 39 MB | 32 MB | 288 MB |
+| 200,000 | 501 MB | 92 MB | 39 MB | 379 MB |
+
+**The two heap columns answer different questions.** *Peak managed heap* is whatever the heap
+happened to measure, garbage the collector had not got to included. *Live heap* is read immediately
+after a full blocking collection, so it is what the run is genuinely **holding** — and it is the
+column any claim about scaling has to be judged on. It is sampled every ten seconds rather than
+continuously, so it catches the peak only approximately: differences of a few MB between rows are
+the instrument, not the build. It still rises with the file count, and the write channel turned out
+to be about half of it. On the unbounded channel the live heap grew **14.5 MB per additional 100,000
+files** — roughly **150 bytes per file** once the process's ~18 MB fixed floor is subtracted. With
+the channel bounded at 16k operations the same measurement gives **7 MB per additional 100,000
+files**, about **70 bytes per file**: the backlog of queued write closures was real per-file live
+data at the moment of peak, and capping it removed roughly half the residue. What is left is
+someone else's, and unattributed. Read the difference for what it is — one run at each size against
+a sampler that fires every ten seconds, so a few MB either way is the instrument; the direction and
+the halved slope are the finding, not the third decimal. Post-run heap and post-run working set
+landed inside the spread of the earlier pairs. Peak working set at 200,000 files did not: 501 MB
+against 478.4 / 479.6 MB before. Peak working set is the noisiest column here (it counts whatever
+the allocator had not returned yet, and the 100,000-file row moved the other way), but it is the one
+the 400 MB post-run budget's headroom is judged from, so it is worth a second look if it stays high.
+
+**Nothing survives the run.** Post-run managed heap sits at 18–21 MB regardless of file count, so
+whatever holds the per-file share at peak is transient. The working set after a run is higher than
+that because of native residue — the SQLite page caches and the allocator's own leftovers from a few
+hundred thousand inserts — and it is the figure worth watching: ~380 MB after 200,000 files, against
+a **400 MB budget for this benchmark**, is a margin of 11–21 MB.
+
+> **Rationale — why the process runs workstation GC and forces one collection per run.** A backup's
+> peak is not its steady state: the scan, the diff and the index write each touch a great deal of
+> memory briefly and let go of it, and the large object heap fragments badly under that pattern. An
+> idle process never collects on its own, so a container that finished — or suspended — a backup an
+> hour ago would sit at its high-water mark, which is what the operator sees in the process list and
+> what the OOM killer counts. `BackupRunner.ReleaseRunMemory` therefore runs one aggressive,
+> compacting, blocking collection at the end of every run, at the single moment the run's own working
+> set is provably dead. Aggressive mode also decommits, which is the half that moves the number
+> outside the runtime and not merely inside it. Server GC is off for the same reason: this process
+> shares a NAS with everything else on it.
+
+> **Rationale — the trade the current design makes.** Against the build before the catalog, peak
+> managed heap at 100,000 files is 47.5 MB where it was 322.4 MB, and at 200,000 files 94.3 MB where
+> it was 550.0 MB — five to nine times lower depending on the run, and none of what is left is a
+> cross-version index. The working set *after* a run went the other way: that build settled at
+> 176.6 / 191.4 MB, because live managed data has been traded for native residue. The last step of
+> that trade is measured directly — moving the pack leader map out of the heap and into its own
+> database cut the live heap's growth from +55.6 to +14.5 MB per 100,000 files and removed ~70 MB of
+> live data at peak, at the price of 55–66 MB more post-run native residue, measured as an A/B of the
+> two builds in one session at 200,000 files. Any future change to native allocation on this path
+> should re-measure the last column rather than assume the margin is still there.
+
+**The pack leader store's page cache stays at 16 MiB.** Sweeping it over 4, 16 and 64 MiB moved run
+duration not at all (73.7 / 73.9 / 73.7 s at 200,000 files — the access pattern is one probe per file
+over keys with no locality, and a cache four times too small misses at nearly the rate of one
+sixteen times too small), while the post-run working set tracked it upwards and reached 415.0 MB at
+64 MiB, over the budget above. Below 16 MiB the gain is inside the noise.
+
+> **Durations in this benchmark are not comparable across sessions.** The same build measured ~10 s
+> apart at both file counts in two different sessions on the same machine, while two builds differing
+> only by the leader-map change measured within noise of each other when run in the same session. Any
+> duration question has to be answered by a same-session A/B; the memory readings, by contrast,
+> reproduce to within a few MB.
+
 ## 7-Zip binary
 
 The image fetches the **official `7zz` binary** for the target architecture at build time, not the

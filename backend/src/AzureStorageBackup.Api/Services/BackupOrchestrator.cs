@@ -1,4 +1,3 @@
-using System.Collections.Concurrent;
 using System.Threading.Channels;
 using Azure.Storage.Blobs.Models;
 using AzureStorageBackup.Api.Models;
@@ -168,8 +167,9 @@ public sealed class BackupOrchestrator(
     StagingArea staging,
     RetentionCleaner cleaner,
     IFileHasher hasher,
-    ILocalIndexCache indexCache,
+    IVersionCatalogs catalogs,
     TrackedInfoStore trackedInfo,
+    RunWorkDbFactory workFactory,
     INotifier? notifier = null,
     IOperationLog? opLog = null,
     VerboseFileLog? verboseLog = null,
@@ -401,6 +401,13 @@ public sealed class BackupOrchestrator(
     /// </summary>
     private static bool IsEmptyFile(ScannedEntry entry) => entry.Kind == EntryKind.File && entry.Length == 0;
 
+    /// <summary>One scan row back as the record the diff and the pipeline speak in. The grouping verdict the sink
+    /// stored beside it is deliberately dropped here: the two callers that need it ask
+    /// <see cref="GroupingPlanner.ClassifyOne"/> for it again, over the same path and length, which is the same
+    /// answer without a second shape to carry it in.</summary>
+    private static ScannedEntry ToScannedEntry(ScanRow row) =>
+        new(row.Path, row.Kind, row.Length, row.ModifiedAt, row.Permissions, row.Target);
+
     public async Task<BackupRunResult> RunAsync(
         BackupRequest request, IProgress<BackupProgress>? progress = null, CancellationToken ct = default,
         BackupRunControl? control = null)
@@ -563,6 +570,40 @@ public sealed class BackupOrchestrator(
     {
         var opts = request.Options;
         var password = request.Password;
+        // Above the scan, because the scan is where classification happens now: WorkDbScanSink asks
+        // GroupingPlanner.ClassifyOne for every entry it writes, and the verdict is stored beside it. It must be
+        // asked with **these** options and not the bare opts.Plan — the don't-group and cross-directory rules live on
+        // the engine options, and classifying without them would send a file down one route at scan time and the
+        // other at packing time.
+        var packOptions = opts.Plan with
+        {
+            DontGroup = opts.DontGroup,
+            CrossDirGroup = opts.CrossDirGroup,
+            // Packing needs this to split each directory into a compressed group and a store-only group — without
+            // wiring it through, the rule only applies to single-file blobs and packed small files still get
+            // compressed as a whole box (which was exactly the defect in this feature before).
+            DontCompress = opts.DontCompress,
+        };
+
+        // This run's scratch database, opened before anything that might want to put something in it. Named after the
+        // run so two runs in flight never share a file, and deleted by DisposeAsync — the `await using` is what makes
+        // "dies with the run" true on every exit from this method, including the throwing ones.
+        //
+        // A run with no control (the direct API callers and most tests) still gets one: it is the same pipeline, and
+        // making the file optional would mean every user of it carrying a null branch. Its name is then a fresh GUID,
+        // which cannot collide with a real runId.
+        await using var work = await workFactory.CreateAsync(control?.RunId ?? Guid.NewGuid().ToString("N"), ct);
+        // "Who saw this content first", for the run's cross-pack dedup. A side file rather than a table in the work
+        // database, because it holds one write transaction open across thousands of claims and work.db's single
+        // writer task must never queue behind that; see PackLeaderStore. Named from the same run id, so it is swept
+        // by the same ClearStale, and deleted by its own DisposeAsync.
+        await using var packLeaders = await PackLeaderStore.CreateAsync(workFactory.SidePath(work.Name, "aliases"), ct);
+        // Everything this run learns about the version it is building — where each path was uploaded, the tail hash
+        // the compression pass produced, the identity a file that changed mid-run settled on, the paths that stopped
+        // being readable after the diff had passed them — goes in here rather than into four path-keyed dictionaries.
+        // Its reads see committed writes only, so every question asked below is asked after a FlushAsync or after the
+        // stage that answers it has settled; see the remarks on RunLedger.
+        var ledger = new RunLedger(work);
 
         // An upload-side failure must stop the diff (reading more from disk is pointless), but must **not** abort
         // the other uploads already in flight — same way the old Task.WhenAll wrapped up: let the in-flight ones
@@ -642,10 +683,13 @@ public sealed class BackupOrchestrator(
             progress?.Report(new BackupProgress(BackupStage.Scanning, 0, 0, 0, 0) { Detail = d }));
         // In hand for the pause accounting: the scan consults no gate and runs to its end, and for as long as it
         // does a hold pressed against it is pausing rather than paused (the diff parks at its first callback).
-        ScanResult scan;
+        ScanSummary scan;
         using (control?.Gate.BeginWork())
-            scan = await BeforeUploadAsync(
-                t => scanner.ScanAsync(request.LocalRoot, opts.Ignore, opts.Scan, t, scanTracker));
+            scan = await BeforeUploadAsync(t => scanner.ScanAsync(
+                request.LocalRoot, opts.Ignore, new WorkDbScanSink(work, packOptions), opts.Scan, t, scanTracker));
+        // The scan's rows are the diff's left-hand cursor and the source of the directory-candidate counts, and both
+        // are reads: they see nothing the writer has not committed yet.
+        await work.FlushAsync(ct);
         scanTracker.Complete();
 
         // The scope filtered out every single file: diff would call everything in the previous version deleted and
@@ -657,7 +701,7 @@ public sealed class BackupOrchestrator(
         // empty then only means the mount point did not answer — it says nothing about whether the scope is right.
         // Reporting that as a scope misconfiguration would send the user off to change a scope that was correct all
         // along, while the real problem (the mount never came up) gets buried.
-        if (scan.Entries.Count == 0 && scan.EmptyDirs.Count == 0 && scan.Unreadable.Count == 0
+        if (scan.Entries == 0 && scan.EmptyDirs.Count == 0 && scan.Unreadable.Count == 0
             && !opts.Scan.Scope.IsAll)
             throw new InvalidOperationException(
                 "The configured scope selects no files under the local root. "
@@ -674,77 +718,91 @@ public sealed class BackupOrchestrator(
         var firstRun = trackedInfo is not null
             && !await trackedInfo.HasLocalAsync(request.Account, request.Container, ct);
 
-        // 2. Load the previous version. The info file prefers the local authoritative copy (§3.3, avoids reading a Cold info file from the cloud); the large version index prefers the local cache.
+        // 2. Load the info file. It prefers the local authoritative copy (§3.3, avoids reading a Cold info file from
+        // the cloud); the versions themselves are not loaded at all any more — they are queried from the container's
+        // catalog, one row at a time.
         var info = (trackedInfo is not null
             ? await trackedInfo.LoadAsync(request.Account, request.Container, password, ct)
             : await store.ReadInfoAsync(request.Account, request.Container, password, ct))
             ?? NewInfo(request);
         var identity = info.Backup.CreatedAt.UtcTicks;
-        VersionIndex? previous = null;
-        if (info.Versions.Count > 0)
-        {
-            var last = info.Versions[^1];
-            previous = await BeforeUploadAsync(t => indexCache.ReadAsync(
-                request.Account, request.Container, last.Version, identity, last.IndexBlob, password, last.IndexVolumes, t));
-        }
+        var last = info.Versions.Count > 0 ? info.Versions[^1] : null;
+        var lastVer = last?.Version;
 
         // Data blob addressing scheme: encrypted backups use keyed addresses to prevent fingerprinting (the key is derived from the password + the salt in the info file).
         var addressing = new BlobAddressScheme(password, info.Backup.KdfSalt);
 
-        // The purely local dedup resolver: builds a "content identity → existing blob" map from the locally cached
-        // indexes of the retained versions, and the backup uses it to decide dedup/collision/volumes/raw while
-        // issuing **no cloud HEAD at all**. This is the only path — whether the backup was created by this tool or
-        // imported from an existing container: import pulls every version's index into the local cache (see the
-        // /import endpoint) and lands the info file too (TrackedInfoStore.SeedFromCloudAsync).
+        // Every retained version has to be in the catalog before the run asks it anything: dedup, collision
+        // avoidance and the prescreen all answer out of **all** the retained versions, not just the newest one, and
+        // a version the catalog does not have is a version whose blobs look free. This is also the moment an
+        // upgraded install pays for lazy migration — reading an old .idx file, or downloading the index from the
+        // cloud — so it runs under BeforeUploadAsync: it can take minutes per version, and a stop pressed during it
+        // must be able to end the run rather than wait for every version to be read.
         //
-        // There used to be a fallback of "no local index, so send a cloud HEAD and compare metadata"; it is gone.
-        // Trusting whatever is lying around in the cloud with no local authority is dangerous in itself: you do not
-        // know who wrote those blobs, with what password, or whether the content is still correct — and one wrong
-        // "already exists" silently records a file that was never uploaded as backed up.
-        var indexes = new List<VersionIndex>(info.Versions.Count);
-        var lastVer = info.Versions.LastOrDefault()?.Version;
+        // There is no fallback of "no local index, so send a cloud HEAD and compare metadata", and there never will
+        // be. Trusting whatever is lying around in the cloud with no local authority is dangerous in itself: you do
+        // not know who wrote those blobs, with what password, or whether the content is still correct — and one
+        // wrong "already exists" silently records a file that was never uploaded as backed up.
         foreach (var v in info.Versions)
-            indexes.Add(previous is not null && v.Version == lastVer
-                ? previous
-                : await BeforeUploadAsync(t => indexCache.ReadAsync(
-                    request.Account, request.Container, v.Version, identity, v.IndexBlob, password, v.IndexVolumes, t)));
+            await BeforeUploadAsync(async t =>
+            {
+                await catalogs.EnsureVersionAsync(request.Account, request.Container, v, identity, password, t);
+                return 0;
+            });
+
+        // …and the other direction: everything the catalog holds that the info file does NOT list has to go, before
+        // a single question is asked of it. Dedup, collision avoidance and the prescreen below all query the catalog
+        // with no version predicate, so a version retired from the info file whose rows are still here would go on
+        // offering its blobs as dedup hits — and a retention cleanup deletes those blobs from the cloud *before* it
+        // removes the rows, so a Stop, a shutdown or one 5xx in the middle of that leaves precisely a catalog whose
+        // extra version points at names the cloud no longer holds. Dedup would then record a file as backed up at an
+        // address holding nothing. Before the branch, the maps were built from info.Versions alone and could not
+        // have this problem; this is what keeps the two equivalent.
+        //
+        // It doubles as the first run's catalog creation: a container nobody has backed up yet has no catalog file
+        // at all, and a read-only open of a missing one is a FileNotFoundException rather than an empty catalog
+        // conjured for a reader that only meant to look — the right rule for every other caller and the wrong one
+        // for the run about to create the first version. Reconciling opens for writing, which creates it, empty,
+        // which is exactly what this run's diff and dedup should find.
+        //
+        // Under BeforeUploadAsync like the loop above: it takes the container's write lock, and a stop pressed while
+        // another writer holds it must end the run rather than wait it out.
+        await BeforeUploadAsync(async t =>
+        {
+            await catalogs.ReconcileAsync(
+                request.Account.Id, request.Container, info.Versions.Select(v => v.Version).ToList(), t);
+            return 0;
+        });
+
+        // Two read-only handles, because a VersionCatalog is one SQLite connection and is not thread-safe: the diff
+        // walks the previous version's entries on the run's own thread while the prober asks the dedup resolver about
+        // content from a pipeline stage, and one handle between them would interleave two readers on one connection.
+        // catalogForDiff belongs to the diff cursor alone; LocalDedupResolver gates its own.
+        // Read-only, so neither can be the writer when the finish opens the catalog to import this run's version —
+        // both are disposed before that point.
+        await using var catalogForDiff = await catalogs.OpenAsync(request.Account.Id, request.Container, readOnly: true, ct);
+        await using var catalogForDedup = await catalogs.OpenAsync(request.Account.Id, request.Container, readOnly: true, ct);
 
         // Open the journal: the baseline version and the addressing identity are only complete at this point. Recovery uses those two to decide whether a journal still counts.
         if (control is not null)
             await control.OpenJournalAsync(
                 request.Account.Id, request.Container, lastVer ?? 0, request.LocalRoot, addressing.Identity,
-                startedAt, ct, firstRun);
+                startedAt, work, ct, firstRun);
 
-        // The dedup table is built **after** opening the journal: the adopted blocks (present in the cloud, not yet
-        // in any index) have to go into the table alongside the indexed ones, otherwise a file with the same content
-        // at a different path would delete and re-upload them. See the confirmed parameter of Build for the reasoning.
-        var localResolver = LocalDedupResolver.Build(addressing, indexes, control?.Resume.ConfirmedBlobs());
+        // The resolver is built **after** opening the journal, because opening the journal is what fills the run's
+        // resume_blobs table — and the adopted blocks (present in the cloud, not yet in any index) are one of the
+        // three places it looks. Without them a file with the same content at a different path would not be
+        // recognised as already stored, and the stale-volume cleanup just before its upload would delete last run's
+        // work and send it all over again; for an encrypted multi-volume archive an interruption mid-family then
+        // leaves the address a splice of two runs' volumes. See CatalogDedupSource for the order of the three.
+        var localResolver = new LocalDedupResolver(addressing, catalogForDedup, work);
 
         // 3./4./5. Pipeline the diff with "pack + compress + upload".
         // These three used to be strictly serial: Diffing runs to completion → Plan → Uploading. On a first backup
         // the diff reads every file end to end to hash it, and during those hours not one byte goes over the network.
         // Plan does not actually have to be that global barrier — classification only looks at path and length
-        // (see GroupingPlanner.Classify) and is settled the moment the scan finishes.
-        var packOptions = opts.Plan with
-        {
-            DontGroup = opts.DontGroup,
-            CrossDirGroup = opts.CrossDirGroup,
-            // Packing needs this to split each directory into a compressed group and a store-only group — without
-            // wiring it through, the rule only applies to single-file blobs and packed small files still get
-            // compressed as a whole box (which was exactly the defect in this feature before).
-            DontCompress = opts.DontCompress,
-        };
-        var classification = planner.Classify(scan.Entries, packOptions);
-
-        var storageByPath = new ConcurrentDictionary<string, StorageRef>(StringComparer.Ordinal);
-        var tailByPath = new ConcurrentDictionary<string, string>(StringComparer.Ordinal); // tail hash of single-file blobs → index entry
-        // Files whose content changed while being processed: override the diff-time index entry with the new hash/metadata once it settles (§9, PRD special note D).
-        var overrides = new ConcurrentDictionary<string, EntryOverride>(StringComparer.Ordinal);
-        // Became unreadable only after the diff (hit when the compress/upload stage reopens the source file):
-        // treated exactly like files that were already unreadable at diff time — no blob is produced, the index
-        // carries the old entry forward, it counts into UnreadableFiles, and it must never take the whole run down
-        // (a gap in the M4 design §3).
-        var postDiffUnreadable = new ConcurrentDictionary<string, string>(StringComparer.Ordinal);
+        // (see GroupingPlanner.ClassifyOne) and is settled the instant the scanner produces an entry, which is where
+        // it now happens: the sink classifies each entry as it goes by and the verdict is a column of the scan table.
 
         // The seat is held for the whole run: the staging-disk quota is split evenly across the runs currently holding a seat, and it is returned when the run ends.
         using var stagingLease = staging.AcquireLease();
@@ -755,7 +813,7 @@ public sealed class BackupOrchestrator(
         // few changed files actually get read end to end — extrapolating by bytes would let an unchanged 100 GB
         // file fly by in a second and make the remaining time collapse on the spot.
         // The diff parks at the gate too, so its estimate's clock stops with the hold the same way the upload's does.
-        var diffTracker = new StageTracker("Diffing", scan.Entries.Count, reporter.ReportDiff,
+        var diffTracker = new StageTracker("Diffing", (int)Math.Min(int.MaxValue, scan.Entries), reporter.ReportDiff,
             heldMs: control is null ? null : () => control.Gate.HeldMs);
         // The upload total **grows as we go** (the diff is still pushing work into the queue), so report 0 = unknown
         // at first: computing a percentage against a still-growing denominator makes it shoot to 100 and fall back.
@@ -822,7 +880,7 @@ public sealed class BackupOrchestrator(
         //
         // With overlap turned off, spilling matters even more: nobody is consuming at all then, so all the work piles up until the diff ends.
         var overlap = opts.OverlapDiffAndUpload;
-        using var work = spillFactory?.Create() ?? new DiffWorkQueue(null, InMemoryOnlyLimits);
+        using var queue = spillFactory?.Create() ?? new DiffWorkQueue(null, InMemoryOnlyLimits);
 
         // The stopProducing / working tokens are created at the very top of this method (see the note there): scanning and index reading must be able to see a stop too.
 
@@ -994,7 +1052,7 @@ public sealed class BackupOrchestrator(
         {
             try
             {
-                while (await work.DequeueAsync(feeding.Token) is { } item)
+                while (await queue.DequeueAsync(feeding.Token) is { } item)
                 {
                     // Work that has not started yet is not done after a stop.
                     //
@@ -1051,8 +1109,7 @@ public sealed class BackupOrchestrator(
                                 catch (Exception ex)
                                 {
                                     if (!await TrySettleUnreadableAsync(
-                                            request, single, localPath, ex, postDiffUnreadable, ReportItem,
-                                            feeding.Token))
+                                            request, single, localPath, ex, ledger, ReportItem, feeding.Token))
                                         throw;
                                     return;
                                 }
@@ -1137,8 +1194,7 @@ public sealed class BackupOrchestrator(
                 var file = probed.Item.Single!;
                 await HandOffAsync(null, share, t => WithPauseAsync(
                     control,
-                    () => FinishBlobAsync(
-                        request, file, hit, storageByPath, tailByPath, overrides, ReportItem, control, t),
+                    () => FinishBlobAsync(request, file, hit, ledger, ReportItem, control, t),
                     t), token, ArchivelessUpload.AlreadyStored);   // nothing to send: the index entry and the journal record are all that is left
                 return;
             }
@@ -1164,7 +1220,7 @@ public sealed class BackupOrchestrator(
                     catch (Exception ex)
                     {
                         if (!await TrySettleUnreadableAsync(
-                                request, single, localPath, ex, postDiffUnreadable, ReportItem, token))
+                                request, single, localPath, ex, ledger, ReportItem, token))
                             throw;
                     }
                 }, token);
@@ -1210,12 +1266,11 @@ public sealed class BackupOrchestrator(
                         catch (Exception ex)
                         {
                             if (!await TrySettleUnreadableAsync(
-                                    request, single, localPath, ex, postDiffUnreadable, ReportItem, t))
+                                    request, single, localPath, ex, ledger, ReportItem, t))
                                 throw;
                             return;
                         }
-                        await FinishBlobAsync(
-                            request, single, placement, storageByPath, tailByPath, overrides, ReportItem, control, t);
+                        await FinishBlobAsync(request, single, placement, ledger, ReportItem, control, t);
                     }, t);
                     // The raw in-place route produced no archive (see StreamAndStageAsync): nothing of this item is in
                     // the pool, so it cannot wait in the entry the pool describes. It is still waiting to upload — the
@@ -1232,9 +1287,8 @@ public sealed class BackupOrchestrator(
             // travels with the archive.
             var poolStoreOnly = probed.Item.StoreOnly;
             await ProcessPackAsync(
-                request, probed.Item.Pack!, poolStoreOnly, addressing, localResolver, info, storageByPath,
-                tailByPath, overrides, postDiffUnreadable, uploadScope, ReportItem, uploadTracker, state, control,
-                token,
+                request, probed.Item.Pack!, poolStoreOnly, addressing, localResolver, info, ledger,
+                uploadScope, ReportItem, uploadTracker, state, control, token,
                 // This invocation runs on the compression stage, where waiting for staging room is the backpressure
                 // the whole split exists to make binding. What it hands to an uploader is marked below, one call at a time.
                 bypassQuota: false,
@@ -1257,7 +1311,7 @@ public sealed class BackupOrchestrator(
                             request, packId, members, poolStoreOnly, bypassQuota: true, precompressed: group,
                             uploadScope, uploadTracker, state, control, u);
                         await SettlePackAsync(
-                            request, packId, recorded, volumes, poolStoreOnly, info, storageByPath, ReportItem,
+                            request, packId, recorded, volumes, poolStoreOnly, info, ledger, ReportItem,
                             bytes, control, u);
 
                         // Almost always the very list the compressor already acted on: RunGroupAsync only re-judges
@@ -1289,8 +1343,8 @@ public sealed class BackupOrchestrator(
                         if (stranded.Count > 0)
                             await ProcessPackAsync(
                                 request, [.. stranded.Select(ToPlannedFile)], poolStoreOnly, addressing,
-                                localResolver, info, storageByPath, tailByPath, overrides, postDiffUnreadable,
-                                uploadScope, static _ => { }, uploadTracker, state, control, u, bypassQuota: true);
+                                localResolver, info, ledger, uploadScope, static _ => { }, uploadTracker, state,
+                                control, u, bypassQuota: true);
                     }, t);
 
                     return group.Changed;
@@ -1518,9 +1572,14 @@ public sealed class BackupOrchestrator(
         // In-flight packing state. The diff advances single-threaded in scan order, so none of this needs a lock.
         // Cross-box dedup of pack members within this run: a later arrival with the same content does not enter a
         // box, it just hangs off the first one, and everything is backfilled at the end.
-        var aliasTable = new PackAliasTable();
+        var aliasTable = new PackAliasTable(packLeaders);
         var dirPending = new Dictionary<string, List<PlannedFile>>(StringComparer.Ordinal);
-        var dirRemaining = new Dictionary<string, int>(classification.DirectoryCandidates, StringComparer.Ordinal);
+        // How many entries in each per-directory group are still un-diffed — the counter that decides when a box can
+        // be sealed. One row per directory, which is bounded by the directory count rather than the file count, so
+        // this one stays in memory; it is asked once per change and answered thousands of times a second.
+        var dirRemaining = new Dictionary<string, int>(StringComparer.Ordinal);
+        await foreach (var (dir, count) in work.DirectoryCandidatesAsync(ct))
+            dirRemaining[dir] = count;
         // The cross-directory path splits into two independent pipelines by compressibility (index 0 = compressed
         // box, 1 = store-only box): a box can only have one compression mode, so this cut has to be made before
         // packing. The two count and seal independently and do not affect each other's three limits.
@@ -1540,13 +1599,13 @@ public sealed class BackupOrchestrator(
             uploadTracker.Enqueue(item.Single?.Length ?? item.Pack!.Sum(f => f.Length));
 
             // Never blocks: what does not fit in memory spills to disk. That lets the diff run straight through, which is what gives SetTotal a chance to settle early.
-            work.Enqueue(item);
+            queue.Enqueue(item);
 
             // How much spilled has to be said out loud — it is the direct reading of "how far the diff is ahead of
             // the upload", something that used to show only indirectly by CurrentItem sitting still.
             // Report only when the number changes: SetSpilled takes the publish lock, and at normal scale nothing
             // spills at all, so reporting unconditionally would put a useless lock on every item of the diff's hot path.
-            var spilled = work.SpilledItems;
+            var spilled = queue.SpilledItems;
             if (spilled != reportedSpill)
             {
                 reportedSpill = spilled;
@@ -1585,8 +1644,17 @@ public sealed class BackupOrchestrator(
                 reporter.SetChanged(changedFiles, changedBytes);
             }
 
-            if (!classification.ByPath.TryGetValue(c.Path, out var klass))
+            // No current entry = this change was not built from a scanned entry at all: a deletion, or something
+            // under a directory the scan could not list. Neither has a route through the pipeline, and neither may
+            // touch dirRemaining — its counter counts scanned candidates, and decrementing it for a path that was
+            // never scanned seals a box before its directory has finished diffing. This is exactly what the
+            // classification lookup this replaces answered by missing.
+            if (c.Current is null)
                 return;
+
+            // The same function the scan sink used, over the same path and the same length, so the verdict is
+            // identical by construction — no lookup table, and nothing to keep in memory for it.
+            var klass = GroupingPlanner.ClassifyOne(c.Path, c.Current.Length, packOptions);
 
             // FullHash may be empty — for single-file blobs the full-content hash is deferred to the compression
             // pass (see DeferFullHash).
@@ -1615,12 +1683,13 @@ public sealed class BackupOrchestrator(
             if (file is not null && klass.Category != FileCategory.SingleFile
                 && localResolver is not null
                 && file.FullHash is { } packHash && c.HeadHash is { } packHead
-                && localResolver.TryFindPackMember(packHash, file.Length, packHead, c.TailHash) is { } priorMember)
+                && await localResolver.TryFindPackMemberAsync(packHash, file.Length, packHead, c.TailHash, token)
+                    is { } priorMember)
             {
-                storageByPath[c.Path] = new StorageRef
+                await ledger.SetStorageAsync(c.Path, new StorageRef
                 {
                     Kind = "pack", Ref = priorMember.PackId, EntryName = priorMember.EntryName,
-                };
+                }, token);
                 // From here it takes exactly the same existing path as "this entry's content did not change": the
                 // directory counter still decrements, box-sealing timing is unaffected, and it takes no upload slot
                 // and needs no settling.
@@ -1658,10 +1727,10 @@ public sealed class BackupOrchestrator(
             // next run re-backs it up as soon as the mtime changes, but this silent exception has to be written down.
             if (file is not null && klass.Category != FileCategory.SingleFile
                 && file.FullHash is { } aliasHash && c.HeadHash is { } aliasHead && c.TailHash is { } aliasTail
-                && aliasTable.TryClaim(aliasHash, file.Length, aliasHead, aliasTail, c.Path))
+                && await aliasTable.TryClaimAsync(aliasHash, file.Length, aliasHead, aliasTail, c.Path, token))
             {
                 // Ends exactly like the tier above: take the existing "this entry did not change" path.
-                // storageByPath is left for the final backfill — which pack the leader lands in is not known yet.
+                // The storage reference is left for the final backfill — which pack the leader lands in is not known yet.
                 file = null;
             }
 
@@ -1750,10 +1819,21 @@ public sealed class BackupOrchestrator(
         // hash: on that path the hash falls out of the compression read pass (StreamAndStageAsync) and afterwards
         // overwrites whatever the diff recorded. Classification only looks at path and length and is settled once
         // the scan finishes, so this verdict can be given before the diff even starts.
-        bool DeferFullHash(string path) =>
-            classification.ByPath.TryGetValue(path, out var k) && k.Category == FileCategory.SingleFile;
+        bool DeferFullHash(ScannedEntry entry) =>
+            GroupingPlanner.ClassifyOne(entry.Path, entry.Length, packOptions).Category == FileCategory.SingleFile;
 
-        DiffResult diff;
+        // Every change is written into the draft **before** it is handed to OnChangeAsync, and the order is not
+        // cosmetic: the work database's writer is FIFO, so a row seeded after the change was enqueued could still be
+        // behind an upload's SetStorageAsync for the same path — and that update would find no row to update. Seeding
+        // first makes "there is a row for this path" true from the moment anything downstream can hear about it.
+        var seq = 0;
+        async Task OnChangeSeededAsync(FileChange c, CancellationToken t)
+        {
+            await ledger.SeedAsync(seq++, c, t);
+            await OnChangeAsync(c, t);
+        }
+
+        DiffTotals diff;
         try
         {
             try
@@ -1762,7 +1842,10 @@ public sealed class BackupOrchestrator(
                 // changed file can be minutes), and only the callback's own park (OnChangeAsync) steps out.
                 using (control?.Gate.BeginWork())
                     diff = await differ.DiffAsync(
-                        request.LocalRoot, scan, previous, opts.Diff, stopProducing.Token, diffTracker, OnChangeAsync,
+                        request.LocalRoot,
+                        work.ScanOrderedAsync(stopProducing.Token).Select(ToScannedEntry),
+                        last is null ? null : catalogForDiff.EntriesAsync(last.Version, stopProducing.Token),
+                        scan.Unreadable, opts.Diff, stopProducing.Token, diffTracker, OnChangeSeededAsync,
                         DeferFullHash);
 
                 // Final sweep: seal the boxes that never filled up. The two cross-directory lanes may each have a
@@ -1782,7 +1865,7 @@ public sealed class BackupOrchestrator(
             finally
             {
                 diffTracker.Complete();
-                work.CompleteAdding(); // no matter what, the consumers must learn "there is no more work", or they wait forever
+                queue.CompleteAdding(); // no matter what, the consumers must learn "there is no more work", or they wait forever
             }
 
             // Everything from here to the settle below is inside this try for one reason: **it runs while the
@@ -1809,7 +1892,10 @@ public sealed class BackupOrchestrator(
             // Placed before waiting on the uploads: this path runs every single time, and pushing it to the very end
             // would let one upload failure swallow these warnings along the way — precisely when "some files could not
             // be read" is what the operator most needs to hear.
-            await RecordUnreadableWarningsAsync(request, scan, diff, ct);
+            // The ledger reads only what is committed, and every one of these rows was seeded by the diff callback
+            // that has just finished — so the flush is what makes them visible, not a precaution.
+            await ledger.FlushAsync(ct);
+            await RecordUnreadableWarningsAsync(request, scan, ledger, ct);
 
             // Settle the consumers first, then check for a stop request: once stopped, no version index may be
             // written — writing a version for a run that did not finish amounts to claiming the files that were never
@@ -1880,38 +1966,42 @@ public sealed class BackupOrchestrator(
         // switches to a single-file blob is only known once every consumer has finished. That is why the packing
         // side needs no concurrency primitive at all, and why there is no race of "the diff just attached an alias
         // while the consumer had already condemned the leader".
+        // Before the first question, because every answer below is a read of the draft and the draft's writer batches:
+        // the storage references, overrides and post-diff reasons this loop judges the leaders on were written by the
+        // stages that have just settled, and until they are committed the leaders all look as though they went astray.
+        await ledger.FlushAsync(ct);
         var orphanAliases = new List<PlannedFile>();
         foreach (var (leaderPath, aliases) in aliasTable.AliasesByLeader)
         {
             // Two real paths plus one redundant safety net, covering every way a leader can go astray:
-            //   overrides has it            → the content changed inside the compression window and a new hash was written;
+            //   an override on it           → the content changed inside the compression window and a new hash was written;
             //   storage is not a pack or missing → it grew past the threshold and switched to a single-file blob, or the whole group became unreadable.
-            //   postDiffUnreadable has it   → **unreachable** today: by the time a leader is marked by
+            //   post-diff unreadable        → **unreachable** today: by the time a leader is marked by
             //     MarkPostDiffUnreadableAsync it has necessarily already been excluded from the stable pack,
-            //     RecordPack never wrote storageByPath for it, and the "storage missing" clause above already covers
+            //     RecordPack never recorded storage for it, and the "storage missing" clause above already covers
             //     this case completely. It is kept as a zero-cost safety net — against a future where these two
-            //     things get decoupled (say, postDiffUnreadable grows its own path that does not go through
-            //     storageByPath) and this check quietly stops holding.
+            //     things get decoupled (say, post-diff unreadability grows its own path that does not go through the
+            //     storage column) and this check quietly stops holding.
             // If any of them hits, the alias's content is **no longer equal** to what the leader finally stored — it
             // must not point there, or the index points at someone else's content and restore produces wrong data.
             //
-            // These three criteria assume that overrides / postDiffUnreadable / storageByPath are **append-only for
-            // the whole run** (which is true today — nowhere in the code does anything Remove/TryRemove from them).
-            // The moment someone adds a removal (say, "clear the failure marker after a successful retry"), a leader
-            // that went astray would look intact at wrap-up time, the aliases would point at it anyway, and restore
-            // would produce someone else's content — and no test would go red, because the existing tests pin "the
-            // current state of the three tables", not "whether anything is ever removed from them". Before changing
-            // how these three tables are written, think through whether this assumption still holds.
-            var leaderStorage = storageByPath.GetValueOrDefault(leaderPath);
+            // These three criteria assume that the storage, override and post-diff-reason columns are **append-only
+            // for the whole run** (which is true today — nothing in the code ever clears one). The moment someone
+            // adds a removal (say, "clear the failure marker after a successful retry"), a leader that went astray
+            // would look intact at wrap-up time, the aliases would point at it anyway, and restore would produce
+            // someone else's content — and no test would go red, because the existing tests pin "the current state
+            // of the draft", not "whether anything is ever unset in it". Before changing how these three columns are
+            // written, think through whether this assumption still holds.
+            var leaderStorage = await ledger.StorageAsync(leaderPath, ct);
             if (leaderStorage is { Kind: "pack" }
-                && !overrides.ContainsKey(leaderPath)
-                && !postDiffUnreadable.ContainsKey(leaderPath))
+                && !await ledger.HasOverrideAsync(leaderPath, ct)
+                && !await ledger.IsPostDiffUnreadableAsync(leaderPath, ct))
             {
                 // The whole StorageRef is copied verbatim: Ref and EntryName are the leader's, and the shape is
                 // byte-for-byte what RecordPack always wrote, so retention cleanup / dead-weight compaction /
                 // restore / check all need no changes.
                 foreach (var a in aliases)
-                    storageByPath[a.Path] = leaderStorage;
+                    await ledger.SetStorageAsync(a.Path, leaderStorage, ct);
             }
             else
             {
@@ -1925,7 +2015,7 @@ public sealed class BackupOrchestrator(
         // the compression window.
         //
         // The premise "this is rare anyway" deserves a discount: when a share drops off mid-run on a NAS, the
-        // leaders in that subtree turn into postDiffUnreadable **in bulk**, the perfectly healthy aliases hanging
+        // leaders in that subtree turn post-diff unreadable **in bulk**, the perfectly healthy aliases hanging
         // off them and scattered elsewhere dangle **in bulk**, and then get re-run **serially** in the loop below —
         // not necessarily a short stretch, possibly a whole subtree.
         //
@@ -1937,9 +2027,9 @@ public sealed class BackupOrchestrator(
         // item count stays 0 throughout. Sitting at 100% while silently running for a long time is, for this user
         // base (mostly on NAS boxes, no command line available), the shape most likely to be mistaken for a hang.
         //
-        // This stretch deliberately has no try around it: wrapping and catching would make BuildEntries produce
-        // entries for these aliases with Length > 0 and Storage == null (Added has a null CarriedStorage, and
-        // storageByPath does not have it either) — and that is the real shape of silent data loss. Letting it throw
+        // This stretch deliberately has no try around it: wrapping and catching would make the ledger produce
+        // entries for these aliases with Length > 0 and Storage == null (Added carries no previous storage, and the
+        // run recorded none either) — and that is the real shape of silent data loss. Letting it throw
         // is correct: the run fails, no index is written, the orphan packs are reclaimed by retention cleanup, and
         // the next run starts over. Without writing this down, someone will eventually "just add a try".
         //
@@ -1964,9 +2054,8 @@ public sealed class BackupOrchestrator(
             // In hand for the pause accounting — this stretch compresses and uploads on the run's own thread,
             // with the pipeline's loops all gone — and ProcessPackAsync's group loop is where it parks.
             using (control?.Gate.BeginWork())
-                await ProcessPackAsync(request, pool, side.Key, addressing, localResolver, info,
-                    storageByPath, tailByPath, overrides, postDiffUnreadable, uploadScope, static _ => { },
-                    uploadTracker, state, control, ct);
+                await ProcessPackAsync(request, pool, side.Key, addressing, localResolver, info, ledger,
+                    uploadScope, static _ => { }, uploadTracker, state, control, ct);
         }
         // A stop pressed while the re-run above was going: its group loop broke off, and what it did not send
         // has no storage reference — written into an index, that is silent data loss. Same rule as the check
@@ -1981,15 +2070,43 @@ public sealed class BackupOrchestrator(
         var total = totalItems;
         var uploaded = uploadedItems;
 
-        // 6. Build the second-level index of the new version
-        var entries = BuildEntries(diff, storageByPath, tailByPath, overrides, postDiffUnreadable);
+        // 6. Serialize the second-level index of the new version.
+        // Everything the finish reads is a read of the draft, so the writer has to be caught up first.
+        await ledger.FlushAsync(ct);
         var version = (info.Versions.LastOrDefault()?.Version ?? 0) + 1;
-        var index = new VersionIndex
+        var emptyDirs = await CarryEmptyDirsAsync(scan, last is null ? null : catalogForDiff, last?.Version, ct);
+        // One pass for both numbers, and the same predicate answers both: the count the header declares and the count
+        // the version record reports are the same count, and a second query for it would be a second chance to
+        // disagree as well as a second scan of a million rows.
+        var (files, bytes) = await ledger.FinalStatsAsync(ct);
+
+        // The two read-only catalog handles have answered their last question — the diff is long over and this line
+        // was the previous version's empty-directory list. They close here rather than at the end of the method
+        // because the catalog import below opens the same file for writing, under the store's write lock.
+        await catalogForDiff.DisposeAsync();
+        await catalogForDedup.DisposeAsync();
+
+        // Straight to a file, entry by entry, rather than into a List<IndexEntry> the store then serializes: the
+        // list was the last structure in this method that grew with the file count, and at a few million entries it
+        // is hundreds of MB of live objects held for the length of the upload that follows. The file sits beside the
+        // run's work database, named after the run, so a killed process leaves it where RunWorkDbFactory.ClearStale
+        // and the operator both already look.
+        var serialized = Path.Combine(workFactory.RootDir, $"{work.Name}.v{version}.idx");
+        // It dies with this method however the method ends, the same way the work database beside it does. Everything
+        // between here and the catalog import can throw — the index upload meeting a bad patch of network, the info
+        // file losing an ETag race — and nothing else would ever delete this file: it is named for the run, not for
+        // the container, so no later run recognises it as its own.
+        using var serializedFile = new TempFile(serialized);
+        await using (var file = File.Create(serialized))
+        using (var w = new IndexStreamWriter(file))
         {
-            Version = version,
-            Entries = entries,
-            EmptyDirs = CarryEmptyDirs(scan, previous),
-        };
+            w.WriteHeader(version, (int)files);
+            await foreach (var e in ledger.FinalEntriesAsync(ct))
+                w.WriteEntry(e);
+            w.WriteEmptyDirs(emptyDirs);
+            // Nothing this run wrote is unrecoverable: that list is repair's to add, one version at a time.
+            w.WriteUnrecoverable([]);
+        }
 
         // 7. WriteIndex (upload the second-level index first)
         progress?.Report(new BackupProgress(BackupStage.WritingIndex, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
@@ -2002,14 +2119,15 @@ public sealed class BackupOrchestrator(
         int indexVolumes;
         try
         {
-            (indexBlob, indexVolumes) = await store.WriteIndexAsync(
-                request.Account, request.Container, version, index, password, request.IndexTier, ct, indexTracker);
+            (indexBlob, indexVolumes) = await store.WriteIndexFileAsync(
+                request.Account, request.Container, version, serialized, password, request.IndexTier, ct, indexTracker);
         }
         finally
         {
             indexTracker.Complete();
         }
-        // The local index cache Put is deferred until the info file commits successfully (see below), so that a write conflict on the info file does not leave a ghost cache entry for an uncommitted version.
+        // The catalog import is deferred until the info file commits successfully (see below), so that a write
+        // conflict on the info file does not leave the catalog holding a version nothing in the cloud claims.
 
         // 8/9. Finalize (atomically update the info file)
         progress?.Report(new BackupProgress(BackupStage.Finalizing, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
@@ -2021,16 +2139,22 @@ public sealed class BackupOrchestrator(
             StartedAt = startedAt,
             IndexBlob = indexBlob,
             IndexVolumes = indexVolumes,
-            Stats = new VersionStats(entries.Count, entries.Sum(e => e.Length), diff.ChangedFiles, diff.ChangedBytes),
+            Stats = new VersionStats((int)files, bytes, diff.ChangedFiles, diff.ChangedBytes),
         });
         if (trackedInfo is not null)
             await trackedInfo.WriteAsync(request.Account, request.Container, info, password, request.IndexTier, ct);
         else
             await store.WriteInfoAsync(request.Account, request.Container, info, password, request.IndexTier, ct);
 
-        // The info file is committed → now write the version index into the local cache (a conflict would already have thrown in the previous step and never reach here).
-        if (indexCache is not null)
-            await indexCache.PutAsync(request.Account.Id, request.Container, version, identity, index, ct);
+        // The info file is committed → record the version in the local catalog, by reading back the very file that
+        // went to the cloud rather than by re-deriving the entries from the draft. That is what makes "the catalog
+        // holds exactly what the container holds" true by construction, seq order included, instead of true as long
+        // as two pieces of code keep agreeing.
+        await ImportIntoCatalogAsync(request, version, identity, serialized, ct);
+        // The last reader of it is gone. Dropped here rather than left to the scope below, because what follows is
+        // retention cleanup, which downloads and repacks archives onto the same temp volume — an index at a few
+        // million entries is hundreds of MB, and there is no reason for it to be lying there while that runs.
+        serializedFile.Dispose();
 
         // The index is committed and the journal has served its purpose. It must be deleted before cleanup:
         // keep it and cleanup will think this content is still "in flight" and not dare touch it; delete it earlier
@@ -2132,30 +2256,15 @@ public sealed class BackupOrchestrator(
 
         progress?.Report(new BackupProgress(BackupStage.Completed, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
 
-        // Count every category in a single pass: on a 500,000-entry index each extra Count(…) pass is another
-        // 500,000 delegate invocations, and all these numbers live in the same list anyway.
-        var newFiles = 0;
-        var modifiedFiles = 0;
-        var deletedFiles = 0;
-        long deletedBytes = 0;
-        var unreadableFiles = 0;
-        foreach (var c in diff.Changes)
-        {
-            switch (c.Kind)
-            {
-                case ChangeKind.Added: newFiles++; break;
-                case ChangeKind.Modified: modifiedFiles++; break;
-                // A Deleted change is synthesized from a previous-version entry and always carries it, so Length is
-                // right there for free; symlinks weigh 0 (their content is the Target string), which is what they
-                // occupied at the source too.
-                case ChangeKind.Deleted: deletedFiles++; deletedBytes += c.Previous?.Length ?? 0; break;
-                case ChangeKind.Unreadable: unreadableFiles++; break;
-                default: break;   // MetadataOnly / Unchanged: nothing was touched this run, so it stays out of the summary
-            }
-        }
+        // Every category in one SQL pass over the draft, rather than one pass per category over a list of every
+        // change the diff made — that list was the last thing here that grew with the file count. A deleted file's
+        // size comes from the previous version's entry beside it, which is where it still exists (symlinks weigh 0:
+        // their content is the Target string, which is what they occupied at the source too).
+        var (newFiles, modifiedFiles, deletedFiles, deletedBytes) = await ledger.ChangeCountsAsync(ct);
+        var unreadableFiles = await ledger.UnreadableCountAsync(ct);
 
         return new BackupRunResult(version, diff.ChangedFiles, diff.ChangedBytes,
-            unreadableFiles + postDiffUnreadable.Count)
+            unreadableFiles + (int)await ledger.PostDiffUnreadableCountAsync(ct))
         {
             // Deliberately do **not** subtract files found unreadable post-diff from added/modified: subtracting
             // produces books that say "340 changed" while "128 + 209 ≠ 340", which nobody can make sense of without
@@ -2189,51 +2298,119 @@ public sealed class BackupOrchestrator(
     /// copies of the identical reason.
     /// </para></summary>
     private async Task RecordUnreadableWarningsAsync(
-        BackupRequest request, ScanResult scan, DiffResult diff, CancellationToken ct)
+        BackupRequest request, ScanSummary scan, RunLedger ledger, CancellationToken ct)
     {
         var source = $"backup:{request.Account.Id}/{request.Container}";
         var unreadableDirs = scan.Unreadable.Where(u => u.IsDirectory).ToList();
 
         foreach (var dir in unreadableDirs)
         {
-            var affected = diff.Changes.Count(c => c.Kind == ChangeKind.Unreadable && IsUnder(dir.Path, c.Path));
+            // Counted in SQL over the subtree rather than by walking every change: the whole point of the summary is
+            // that a directory holding 5,000 files must not cost 5,000 of anything.
+            var affected = await ledger.UnreadableUnderAsync(dir.Path, ct);
             await Record(NotificationEvents.UnrecoverableError, source,
                 $"Directory unreadable, skipped: {dir.Path}",
                 $"{affected} entr{(affected == 1 ? "y" : "ies")} carried forward from the previous version. {dir.Reason}", ct);
         }
 
-        foreach (var c in diff.Changes.Where(c => c.Kind == ChangeKind.Unreadable))
+        // Streamed, one row at a time: on a healthy run there are none, and on the run where a whole share dropped
+        // there are as many as the share had files.
+        await foreach (var (path, reason) in ledger.UnreadableAsync(ct))
         {
-            if (unreadableDirs.Any(d => IsUnder(d.Path, c.Path)))
+            if (unreadableDirs.Any(d => PathUnder.IsUnder(d.Path, path)))
                 continue; // already covered by the directory summary above
             await Record(NotificationEvents.UnrecoverableError, source,
-                $"File unreadable, skipped: {c.Path}", c.UnreadableReason ?? "", ct);
+                $"File unreadable, skipped: {path}", reason, ct);
         }
     }
-
-    /// <summary>Whether path lies under dir. When dir is the root ("" or "."), it covers everything.</summary>
-    private static bool IsUnder(string dir, string path) =>
-        dir is "" or "." || path.StartsWith(dir + "/", StringComparison.Ordinal);
 
     /// <summary>The empty-directory list of the new version. An unreadable directory cannot have its contents
     /// listed this run, so neither it nor the empty directories below it appear in this scan — using the scan result
     /// directly would make those directories vanish into thin air after a restore, so the entries from the previous
-    /// version that lie under an unreadable directory are carried over verbatim.</summary>
-    private static List<string> CarryEmptyDirs(ScanResult scan, VersionIndex? previous)
+    /// version that lie under an unreadable directory are carried over verbatim.
+    /// <para>
+    /// The previous version's list is only fetched when there is an unreadable directory to carry something for, so
+    /// the healthy run — every run — never asks the catalog for it at all. It is bounded by the directory count
+    /// rather than the file count, which is why this one may be a list.
+    /// </para></summary>
+    private static async Task<List<string>> CarryEmptyDirsAsync(
+        ScanSummary scan, VersionCatalog? catalog, int? previousVersion, CancellationToken ct)
     {
         var dirs = new List<string>(scan.EmptyDirs);
         var unreadableDirs = scan.Unreadable.Where(u => u.IsDirectory).ToList();
-        if (unreadableDirs.Count == 0 || previous is null)
+        if (unreadableDirs.Count == 0 || catalog is null || previousVersion is not { } previous)
             return dirs;
 
         var known = new HashSet<string>(dirs, StringComparer.Ordinal);
-        foreach (var d in previous.EmptyDirs)
+        foreach (var d in await catalog.EmptyDirsAsync(previous, ct))
         {
-            if (unreadableDirs.Any(u => IsUnder(u.Path, d)) && known.Add(d))
+            if (unreadableDirs.Any(u => PathUnder.IsUnder(u.Path, d)) && known.Add(d))
                 dirs.Add(d);
         }
         dirs.Sort(StringComparer.Ordinal);
         return dirs;
+    }
+
+    /// <summary>
+    /// Records the version just committed in the container's local catalog, from the serialized file that went to the
+    /// cloud. Best effort: the run is already a success by the time this is called.
+    /// <para>
+    /// Two attempts, because the write lock is shared with every other process-local reader of this container and a
+    /// transient loser is not worth a warning. If the second one fails too the run is still a **success** — the
+    /// version is in the cloud and the info file lists it — and the only cost is that the next reader has to migrate
+    /// it back in, which for an Archive-tier index means a rehydration the operator has to consent to. That is worth
+    /// saying out loud rather than swallowing, which is what the record below does.
+    /// </para>
+    /// </summary>
+    private async Task ImportIntoCatalogAsync(
+        BackupRequest request, int version, long identity, string serialized, CancellationToken ct)
+    {
+        try
+        {
+            for (var attempt = 1; ; attempt++)
+            {
+                try
+                {
+                    using var held = await catalogs.LockForWriteAsync(request.Account.Id, request.Container, ct);
+                    await using var catalog = await catalogs.OpenForWriteAsync(
+                        held, request.Account.Id, request.Container, ct);
+                    await using var file = File.OpenRead(serialized);
+                    using var reader = new IndexStreamReader(file);
+                    await catalog.ImportVersionAsync(version, identity, reader, ct);
+                    return;
+                }
+                catch (Exception ex) when (attempt == 1 && ex is not OperationCanceledException)
+                {
+                    // One retry, no delay. What it is retrying is a *transient* loser of the race for the file:
+                    // another process-local writer that had the lock, or a busy_timeout expiring against a second
+                    // host writing the same catalog on a shared volume — both of them gone by the time the lock
+                    // comes back, which is why there is no delay and why one more attempt is enough. A corrupt
+                    // file is not among the things it retries: that is handled inside the open, which deletes and
+                    // recreates the file rather than throwing (see VersionCatalogStore.OpenForWriteAsync).
+                }
+            }
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            await Record(
+                NotificationEvents.BackupFailure, $"backup:{request.Account.Id}/{request.Container}",
+                $"Local catalog not updated: {request.Name}",
+                $"Version {version} was written to the cloud but could not be recorded in the local catalog "
+                + $"({ex.Message}). It will be re-downloaded on first use; for an Archive-tier index that means a "
+                + "rehydration.", ct, OperationLogLevel.Error);
+        }
+    }
+
+    /// <summary>A file that is deleted when the scope holding it ends, whichever way it ends. A failed delete is
+    /// swallowed: some disk left occupied is not worth failing a run that has otherwise finished.</summary>
+    private sealed class TempFile(string path) : IDisposable
+    {
+        public void Dispose()
+        {
+            try { File.Delete(path); }
+            catch (IOException) { /* wasted disk; the startup sweep clears what a killed process leaves */ }
+            catch (UnauthorizedAccessException) { /* same */ }
+        }
     }
 
     /// <summary>Found unreadable only after the diff (when the compress/upload stage reopens the source file):
@@ -2278,9 +2455,7 @@ public sealed class BackupOrchestrator(
     /// responsible for returning (see <see cref="StagingArea.StageWithoutBackpressureAsync"/>).</param>
     private async Task HandleBlobAsync(
         BackupRequest request, PlannedFile file, bool bypassQuota,
-        BlobAddressScheme addressing, LocalDedupResolver localResolver,
-        ConcurrentDictionary<string, StorageRef> storageByPath, ConcurrentDictionary<string, string> tailByPath,
-        ConcurrentDictionary<string, EntryOverride> overrides, ConcurrentDictionary<string, string> postDiffUnreadable,
+        BlobAddressScheme addressing, LocalDedupResolver localResolver, RunLedger ledger,
         VolumeUploadScope uploadScope, Action<long> onItem, StageTracker uploadTracker, RunState state,
         BackupRunControl? control, CancellationToken ct)
     {
@@ -2300,21 +2475,20 @@ public sealed class BackupOrchestrator(
         // not three inline conditions.
         catch (Exception ex)
         {
-            if (await TrySettleUnreadableAsync(request, file, localPath, ex, postDiffUnreadable, onItem, ct))
+            if (await TrySettleUnreadableAsync(request, file, localPath, ex, ledger, onItem, ct))
                 return;
             throw;
         }
 
-        await FinishBlobAsync(
-            request, file, placement, storageByPath, tailByPath, overrides, onItem, control, ct);
+        await FinishBlobAsync(request, file, placement, ledger, onItem, control, ct);
     }
 
     /// <summary>
     /// Recognise "this run failed to store this file" and settle it as such: no blob is produced, the index carries
     /// the old entry forward or omits it, one warning is logged, and the run continues. Readable at diff time and
     /// unreadable afterwards (when compression / raw upload reopens the source file) is handled exactly like
-    /// diff-stage unreadability — nothing is written to storageByPath/overrides, and this single file must never
-    /// take the whole run down.
+    /// diff-stage unreadability — the ledger records no storage and no override for it, and this single file must
+    /// never take the whole run down.
     /// <para>
     /// The exception type on its own is not enough to conclude it: <see cref="BlobUploader"/> classifies
     /// IOException as a retryable network error and rethrows it verbatim once the retry budget runs out, in exactly
@@ -2335,12 +2509,12 @@ public sealed class BackupOrchestrator(
     /// <returns>true when this exception was recognised and the item settled; false when the caller must rethrow.</returns>
     private async Task<bool> TrySettleUnreadableAsync(
         BackupRequest request, PlannedFile file, string localPath, Exception ex,
-        ConcurrentDictionary<string, string> postDiffUnreadable, Action<long> onItem, CancellationToken ct)
+        RunLedger ledger, Action<long> onItem, CancellationToken ct)
     {
         if (ex is not ArchiveMembersMissingException
             && !((ex is IOException or UnauthorizedAccessException) && SourceUnreadable(localPath)))
             return false;
-        await MarkPostDiffUnreadableAsync(request, file.Path, ex.Message, postDiffUnreadable, ct);
+        await MarkPostDiffUnreadableAsync(request, file.Path, ex.Message, ledger, ct);
         onItem(file.Length);
         return true;
     }
@@ -2352,9 +2526,7 @@ public sealed class BackupOrchestrator(
     /// and both have to record exactly the same things.
     /// </summary>
     private async Task FinishBlobAsync(
-        BackupRequest request, PlannedFile file, BlobPlacement placement,
-        ConcurrentDictionary<string, StorageRef> storageByPath, ConcurrentDictionary<string, string> tailByPath,
-        ConcurrentDictionary<string, EntryOverride> overrides, Action<long> onItem,
+        BackupRequest request, PlannedFile file, BlobPlacement placement, RunLedger ledger, Action<long> onItem,
         BackupRunControl? control, CancellationToken ct)
     {
         // The content actually stored is not the same as what the diff saw: override the index entry with the
@@ -2397,15 +2569,15 @@ public sealed class BackupOrchestrator(
                 $"Different content shares hash {content.FullHash}; stored at {placement.Ref}", ct);
 
         if (content.FullHash != file.FullHash)
-            overrides[file.Path] = new EntryOverride(
-                content.FullHash, content.HeadHash, content.Length, content.Mtime);
+            await ledger.SetOverrideAsync(file.Path, new EntryOverride(
+                content.FullHash, content.HeadHash, content.Length, content.Mtime), ct);
 
-        storageByPath[file.Path] = new StorageRef
+        await ledger.SetStorageAsync(file.Path, new StorageRef
         {
             Kind = "blob", Ref = placement.Ref, Volumes = Math.Max(1, placement.Volumes), Raw = content.Raw,
             VolumeSizes = [.. placement.VolumeSizes],
-        };
-        tailByPath[file.Path] = content.TailHash;
+        }, ct);
+        await ledger.SetTailAsync(file.Path, content.TailHash, ct);
 
         await LogFileAsync(request, file.Path, ct);
         onItem(file.Length);
@@ -2447,26 +2619,29 @@ public sealed class BackupOrchestrator(
         StageTracker uploadTracker, BackupRunControl? control, CancellationToken ct)
     {
         var headBytes = request.Options.Diff.HeadHashBytes;
+        // Null unless this run adopted a journal, which is the common case; both resume tiers below start by saying so.
+        var resume = control?.Resume;
 
         // Zeroth tier, and the only one that costs no read at all: the previous run uploaded this path and the file has
         // not been touched since. It is asked **first**, in front of the probe, because everything below it opens the
         // file — the pre-filter reads the head, and a candidate escalates to reading the whole thing to get a content
         // identity. That is the read this tier exists to avoid, and asking afterwards would avoid nothing.
         // The judgement it makes is the diff's own (length + mtime), not a relaxation of the content test below; see
-        // JournalResume.FindUntouchedBlob for why that is sound and where its boundary lies.
-        // The empty table is checked before the stat, not after: a run with no journal adopted (every ordinary backup,
+        // ResumeLedger.FindUntouchedBlobAsync for why that is sound and where its boundary lies.
+        // The empty ledger is checked before the stat, not after: a run with no journal adopted (every ordinary backup,
         // a first one most of all) would otherwise pay one more stat per file to be told there is nothing to resume.
         // Exists is checked because FileInfo.Length throws on a file that has gone away, and where "the source
         // disappeared" gets settled is the existing route below, unchanged.
-        if (control?.Resume is { IsEmpty: false } resume && new FileInfo(localPath) is { Exists: true } info)
+        if (resume is not null && !await resume.IsEmptyAsync(ct)
+            && new FileInfo(localPath) is { Exists: true } info)
         {
             var mtime = new DateTimeOffset(info.LastWriteTimeUtc);
             // The identity comes from the record, which is the identity of the bytes that were actually uploaded — the
             // same thing the tier below hands over, just without having re-derived it from the file. A record missing
             // any of the three hashes cannot supply one, and falls through to the content test like any other miss.
-            if (resume.FindUntouchedBlob(file.Path, mtime, info.Length)
+            if (await resume.FindUntouchedBlobAsync(file.Path, mtime, info.Length, ct)
                 is { FullHash: { } full, HeadHash: { } head, TailHash: { } tail } untouched
-                && !localResolver.IsDamagedRef(untouched.Ref))
+                && !await localResolver.IsDamagedRefAsync(untouched.Ref, ct))
                 return new BlobPlacement(
                     untouched.Ref, false, Math.Max(1, untouched.Volumes), [.. untouched.VolumeSizes],
                     new BlobContent(full, head, tail, untouched.Length, mtime, untouched.Raw),
@@ -2486,15 +2661,16 @@ public sealed class BackupOrchestrator(
             // the upload path also skips the one place healing happens (the damagedTarget force-replacement).
             // Falling through re-uploads and heals in passing. Same guard on all three tiers: without it, an
             // adoption wrote a fresh index entry pointing at content already judged unrecoverable.
-            if (control?.Resume.FindBlob(file.Path, p.FullHash, p.Length, p.HeadHash, p.TailHash) is { } done
-                && !localResolver.IsDamagedRef(done.Ref))
+            if (resume is not null
+                && await resume.FindBlobAsync(file.Path, p.FullHash, p.Length, p.HeadHash, p.TailHash, ct) is { } done
+                && !await localResolver.IsDamagedRefAsync(done.Ref, ct))
                 return new BlobPlacement(
                     done.Ref, false, Math.Max(1, done.Volumes), [.. done.VolumeSizes], p with { Raw = done.Raw },
                     Resumed: true);
 
             // Second tier: an existing blob from another version (the original behavior, unchanged).
-            if (localResolver.TryFindExisting(p.FullHash, p.Length, p.HeadHash, p.TailHash) is { } prior
-                && !localResolver.IsDamagedRef(prior.Ref))
+            if (await localResolver.TryFindExistingAsync(p.FullHash, p.Length, p.HeadHash, p.TailHash, ct) is { } prior
+                && !await localResolver.IsDamagedRefAsync(prior.Ref, ct))
                 return new BlobPlacement(prior.Ref, false, prior.Volumes, prior.VolumeSizes, p with { Raw = prior.Raw });
         }
 
@@ -2631,7 +2807,7 @@ public sealed class BackupOrchestrator(
             // Purely local decision: cross-version lookups against the map, and within this batch a reservation
             // coordinates things (same content shares ref/raw/volume count, different content steps aside). No cloud reads.
             var res = await localResolver.ResolveAsync(
-                content.FullHash, content.Length, content.HeadHash, content.TailHash, uploadTracker);
+                content.FullHash, content.Length, content.HeadHash, content.TailHash, ct, uploadTracker);
             if (res.Exists)
             {
                 var existing = res.Existing!;
@@ -2650,8 +2826,13 @@ public sealed class BackupOrchestrator(
                     uploadTracker, state, file.Path, control, ct,
                     // The healing upload: this content address is marked damaged in some retained version, so the
                     // family is replaced outright — nothing a condemned blob says about itself is trusted.
-                    damagedTarget: localResolver.IsDamagedRef(res.Ref));
-                res.Complete(content.Raw, volumes, sizes); // wake the later arrivals with the same content in this batch and hand them the same storage info
+                    damagedTarget: await localResolver.IsDamagedRefAsync(res.Ref, ct));
+                // Wake the later arrivals with the same content in this batch and hand them the same storage info —
+                // and write the reservation row, so the ones that have not asked yet find it without waiting at all.
+                // CancellationToken.None for the same reason the journal append beside it uses one: the bytes are in
+                // the cloud, and losing the record of that only makes the next file with this content upload it
+                // again on top of itself.
+                await res.CompleteAsync(content.Raw, volumes, sizes, CancellationToken.None);
                 handoff?.MarkSettled();
                 return new BlobPlacement(res.Ref, res.Collision, volumes, sizes, content);
             }
@@ -2725,11 +2906,11 @@ public sealed class BackupOrchestrator(
         {
             var length = new FileInfo(localPath).Length;
             var head = await hasher.HeadHashAsync(localPath, headBytes, ct);
-            // The journal takes part in the pre-filter too: the adopted confirmed blocks were already folded into
-            // localResolver's pre-filter set inside LocalDedupResolver.Build (see JournalResume.ConfirmedBlobs), so
-            // asking it alone is enough here.
-            var may = localResolver.MayDeduplicate(length, head);
-            localResolver.NoteInFlight(length, head);
+            // The journal takes part in the pre-filter too: the resolver asks the run's own resume_blobs table
+            // alongside the catalog and the heads this run has started on (see CatalogDedupSource), so asking it
+            // alone is enough here.
+            var may = await localResolver.MayDeduplicateAsync(length, head, ct);
+            await localResolver.NoteInFlightAsync(length, head, ct);
             return may ? await ReadContentIdentityAsync(localPath, headBytes, ct) : null;
         }
         finally
@@ -3278,7 +3459,7 @@ public sealed class BackupOrchestrator(
     /// next box) rather than pulled out as single files; only members that grow past the threshold, or that keep
     /// changing up to the attempt limit, are demoted to single files (the latter raises a warning).
     /// <para>
-    /// The moment of sealing moved over to the diff side (see <see cref="GroupingPlanner.Classify"/> and the
+    /// The moment of sealing moved over to the diff side (see <see cref="GroupingPlanner.ClassifyOne"/> and the
     /// pipeline): this method used to receive "all groupable files of one directory" and pack them itself as it
     /// went; now it receives an already-packed box, so boxes can run concurrently instead of waiting for the
     /// previous box of the same directory to finish uploading.
@@ -3305,9 +3486,7 @@ public sealed class BackupOrchestrator(
     private async Task ProcessPackAsync(
         BackupRequest request, IReadOnlyList<PlannedFile> pool, bool storeOnly,
         BlobAddressScheme addressing, LocalDedupResolver localResolver,
-        BackupInfoFile info, ConcurrentDictionary<string, StorageRef> storageByPath,
-        ConcurrentDictionary<string, string> tailByPath,
-        ConcurrentDictionary<string, EntryOverride> overrides, ConcurrentDictionary<string, string> postDiffUnreadable,
+        BackupInfoFile info, RunLedger ledger,
         VolumeUploadScope uploadScope, Action<long> onItem, StageTracker uploadTracker,
         RunState state, BackupRunControl? control, CancellationToken ct, bool bypassQuota = false,
         GroupDispatch? dispatch = null)
@@ -3364,19 +3543,19 @@ public sealed class BackupOrchestrator(
             // them missing, while the index insists they are there); a subset undercounts OriginalBytes, from which
             // dead-weight compaction misjudges how much live flesh is left in the box.
             //
-            // RecordPackAsync still has to run (only the upload is skipped): this run's cross-box dedup wrap-up uses
-            // storageByPath[leaderPath] to decide whether the leader went astray, and simply continuing here would
+            // RecordPackAsync still has to run (only the upload is skipped): this run's cross-box dedup wrap-up asks
+            // the ledger where the leader landed to decide whether it went astray, and simply continuing here would
             // leave every alias hanging off this leader dangling and re-run.
             //
             // control is passed as null: this record still lives in the adopted journal and stays there until this
             // run successfully commits the index, so there is no need to copy it again.
             var journalMembers = members
                 .Select(m => new JournalMember(m.Path, m.EntryName, m.FullHash, m.Length)).ToList();
-            if (control?.Resume.FindPack(journalMembers) is { } donePack)
+            if (control?.Resume is { } resume && await resume.FindPackAsync(journalMembers, ct) is { } donePack)
             {
                 await RecordPackAsync(
                     request, donePack.Ref, members, donePack.VolumeSizes, donePack.StoreOnly, info,
-                    storageByPath, control: null, ct);
+                    ledger, control: null, ct);
                 foreach (var m in members) await LogFileAsync(request, m.Path, ct);
                 onItem(bytes);   // settle this group's slot and bytes as usual, otherwise progress never catches up with total
                 continue;
@@ -3403,7 +3582,7 @@ public sealed class BackupOrchestrator(
                     request, packId, members, storeOnly, bypassQuota, precompressed: null,
                     uploadScope, uploadTracker, state, control, ct);
                 await SettlePackAsync(
-                    request, packId, recordedMembers, recordedVolumes, storeOnly, info, storageByPath, onItem,
+                    request, packId, recordedMembers, recordedVolumes, storeOnly, info, ledger, onItem,
                     bytes, control, ct);
                 changedMembers = changed;
             }
@@ -3418,7 +3597,7 @@ public sealed class BackupOrchestrator(
                     newHash = await hasher.FullHashAsync(local, ct);
                     newLen = new FileInfo(local).Length;
                     // The content changed (≠ the diff-time fullHash): write an index override so that fullHash/name/metadata match the new content.
-                    overrides[m.Path] = await BuildOverrideAsync(local, newHash, headBytes, ct);
+                    await ledger.SetOverrideAsync(m.Path, await BuildOverrideAsync(local, newHash, headBytes, ct), ct);
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
@@ -3431,7 +3610,7 @@ public sealed class BackupOrchestrator(
                     // from denying the rest of the directory their chance to be processed.
                     // Do not call onItem() here: this group's slot was already reported once above, and reporting
                     // again would double-count.
-                    await MarkPostDiffUnreadableAsync(request, m.Path, ex.Message, postDiffUnreadable, ct);
+                    await MarkPostDiffUnreadableAsync(request, m.Path, ex.Message, ledger, ct);
                     continue;
                 }
 
@@ -3453,8 +3632,7 @@ public sealed class BackupOrchestrator(
                     // without putting it behind the gate, one hiccup on this single item could take the whole run down.
                     await WithPauseAsync(control, () => HandleBlobAsync(
                         request, new PlannedFile(m.Path, newLen, newHash), bypassQuota, addressing, localResolver,
-                        storageByPath, tailByPath, overrides, postDiffUnreadable, uploadScope, static _ => { },
-                        uploadTracker, state, control, ct), ct);
+                        ledger, uploadScope, static _ => { }, uploadTracker, state, control, ct), ct);
                 }
                 else
                 {
@@ -3502,14 +3680,14 @@ public sealed class BackupOrchestrator(
     /// </summary>
     private async Task SettlePackAsync(
         BackupRequest request, string packId, IReadOnlyList<PackEntry> recorded, IReadOnlyList<long> volumes,
-        bool storeOnly, BackupInfoFile info, ConcurrentDictionary<string, StorageRef> storageByPath,
+        bool storeOnly, BackupInfoFile info, RunLedger ledger,
         Action<long> onItem, long bytes, BackupRunControl? control, CancellationToken ct)
     {
         // When every member of the group is unreadable there is nothing to record, and it is skipped naturally with
         // no special case.
         if (recorded.Count > 0)
         {
-            await RecordPackAsync(request, packId, recorded, volumes, storeOnly, info, storageByPath, control, ct);
+            await RecordPackAsync(request, packId, recorded, volumes, storeOnly, info, ledger, control, ct);
             foreach (var m in recorded) await LogFileAsync(request, m.Path, ct);
         }
         onItem(bytes);
@@ -3552,7 +3730,7 @@ public sealed class BackupOrchestrator(
         // entered, ProcessPackAsync has re-read every member that pass excluded under its new hash and either queued
         // it into a later group or demoted it to a single file. Re-judging the original list would let a member that
         // was excluded then and looks stable now travel in this archive **as well as** in wherever the compressor
-        // has meanwhile sent it. The same content stored twice, and worse: two threads writing storageByPath[path]
+        // has meanwhile sent it. The same content stored twice, and worse: two threads recording storage for one path
         // with nothing ordering them, so which row survives is a coin toss, and the losing shape is an index entry
         // carrying the member's new hash while pointing at a pack that recorded it under the stale diff-time one —
         // restore then pulls out content that does not match the entry beside it.
@@ -3819,10 +3997,13 @@ public sealed class BackupOrchestrator(
 
     /// <summary>Degrade under "this run failed to store this file": the index carries the old entry forward or omits it entirely, and one warning is pushed.</summary>
     private async Task MarkPostDiffUnreadableAsync(
-        BackupRequest request, string path, string reason,
-        ConcurrentDictionary<string, string> postDiffUnreadable, CancellationToken ct)
+        BackupRequest request, string path, string reason, RunLedger ledger, CancellationToken ct)
     {
-        postDiffUnreadable[path] = reason;
+        // Through the ledger, and never by overwriting the draft row's `state`: `state` and `change_kind` answer two
+        // different questions — which rows become an entry in the new version, and which paths the operator is
+        // warned about as unreadable **by the diff**. This one is neither the diff's verdict nor a warning of its
+        // own kind; it is a reason in its own column, counted on its own line.
+        await ledger.MarkPostDiffUnreadableAsync(path, reason, ct);
         await RecordPostDiffUnreadableAsync(request, path, reason, ct);
     }
 
@@ -3904,11 +4085,12 @@ public sealed class BackupOrchestrator(
     /// no sign of it whatsoever.</param>
     private static async Task RecordPackAsync(
         BackupRequest request, string packId, IReadOnlyList<PackEntry> members, IReadOnlyList<long> volumeSizes,
-        bool storeOnly, BackupInfoFile info, ConcurrentDictionary<string, StorageRef> storageByPath,
+        bool storeOnly, BackupInfoFile info, RunLedger ledger,
         BackupRunControl? control, CancellationToken ct)
     {
         foreach (var m in members)
-            storageByPath[m.Path] = new StorageRef { Kind = "pack", Ref = packId, EntryName = m.EntryName };
+            await ledger.SetStorageAsync(
+                m.Path, new StorageRef { Kind = "pack", Ref = packId, EntryName = m.EntryName }, ct);
 
         var packInfo = new PackInfo
         {
@@ -4000,85 +4182,6 @@ public sealed class BackupOrchestrator(
                 VolumeBytes: request.Options.VolumeBytes, StoreOnly: storeOnly, Hold: hold), ct);
         return result.VolumeFiles;
     }
-
-    /// <summary>A file whose content changed during processing: the settled hash/metadata override the diff-time index entry (§9).</summary>
-    private sealed record EntryOverride(string FullHash, string? HeadHash, long Length, DateTimeOffset Mtime);
-
-    private static List<IndexEntry> BuildEntries(
-        DiffResult diff, IReadOnlyDictionary<string, StorageRef> storageByPath,
-        IReadOnlyDictionary<string, string> tailByPath,
-        IReadOnlyDictionary<string, EntryOverride> overrides,
-        IReadOnlyDictionary<string, string> postDiffUnreadable)
-    {
-        var entries = new List<IndexEntry>();
-        foreach (var c in diff.Changes)
-        {
-            // Unreadable: carry the previous version's entry forward (including Storage, so nothing is re-uploaded
-            // and dedup is unaffected), appending only UnreadableAt. When the previous version does not have the
-            // file, the entry is skipped entirely — there is no content to point at.
-            // Readable at diff time but unreadable when the compress/upload stage reopens it (postDiffUnreadable)
-            // gets exactly the same treatment: as far as the index is concerned, "this run failed to store the
-            // content" is one and the same thing and should not grow a second set of rules.
-            // This block must come before the Current is null check: entries derived from an unreadable directory
-            // have **no** Current (the whole subtree was never scanned at all), and placed after it they would be
-            // skipped as "no current state" and vanish from the new index — which is precisely the silent data loss
-            // this change fixes.
-            if (c.Kind == ChangeKind.Unreadable || postDiffUnreadable.ContainsKey(c.Path))
-            {
-                if (c.Previous is not null)
-                    // Entries that already carry an UnreadableAt keep their original value: this field answers
-                    // "since when has this content been unable to update", and refreshing it to UtcNow every run
-                    // erases that answer, leaving only "it wasn't readable just now" either.
-                    // Once some run reads it again, the entry is rebuilt normally and the field returns to null.
-                    entries.Add(c.Previous with { UnreadableAt = c.Previous.UnreadableAt ?? DateTimeOffset.UtcNow });
-                continue;
-            }
-
-            if (c.Kind == ChangeKind.Deleted || c.Current is null)
-                continue;
-
-            var ov = overrides.GetValueOrDefault(c.Path);
-            var kind = c.Current.Kind == EntryKind.File ? "file" : "symlink";
-            // Judge by the length **that finally goes into the index**, not the one the diff saw: when the content
-            // shrinks to an empty file during processing, the override is the truth for this entry.
-            var length = ov?.Length ?? c.Current.Length;
-            entries.Add(new IndexEntry
-            {
-                Path = c.Path,
-                Kind = kind,
-                Length = length,
-                Mtime = ov?.Mtime ?? c.Current.ModifiedAt,
-                Permissions = c.Current.Permissions,
-                HeadHash = ov?.HeadHash ?? c.HeadHash,
-                // Tail hash precedence: for single-file blobs uploaded this run, use the value computed during the
-                // compression pass (the most authoritative — those are the bytes that actually went into the
-                // archive); otherwise use what the diff computed; otherwise inherit the previous version's entry.
-                // The middle tier is the one that fills gaps: pack members used to have none of these, so they could
-                // only dedup on three criteria, inconsistent with the four used on the single-file blob path. It is
-                // filled in by BackupDiffer whenever an entry is actually read — added, modified, or metadata-only.
-                // An Unchanged entry is **not** one of those and reaches the third tier with the previous version's
-                // value, null included: there is deliberately no backfill pass, because it would be a random read
-                // conjured out of nothing on files nobody touched (content-identity.md § "An unchanged entry reads
-                // nothing"). So a tail-less entry in an old index stays tail-less until its file is modified.
-                TailHash = tailByPath.GetValueOrDefault(c.Path) ?? c.TailHash ?? c.Previous?.TailHash,
-                FullHash = ov?.FullHash ?? c.FullHash,
-                Target = c.Current.Target,
-                // Zero-length regular files never carry a storage reference — including the ones **carried forward
-                // from the previous version**.
-                // Empty files in old backups were compressed and uploaded like everything else, and an empty file
-                // that never changes (.gitkeep, __init__.py, lock files, …) is judged Unchanged every run, so
-                // CarriedStorage passes that old reference down generation after generation: if it recorded the
-                // wrong raw flag back then, the user has no reason whatsoever to touch that file and it would never
-                // get better. Cutting it off here makes the next backup self-heal, and the old blob is subsequently
-                // reclaimed by retention cleanup.
-                Storage = kind == "file" && length == 0
-                    ? null
-                    : storageByPath.GetValueOrDefault(c.Path) ?? c.CarriedStorage,
-            });
-        }
-        return entries;
-    }
-
 
     private static BackupInfoFile NewInfo(BackupRequest request)
     {

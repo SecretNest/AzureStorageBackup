@@ -48,10 +48,10 @@ public sealed class OperationLogSourceTests
         public Task<string> WriteInfoConditionalAsync(Account account, string container, BackupInfoFile info, string? password, AccessTier? tier, string? ifMatch, CancellationToken ct = default)
             => throw new NotImplementedException();
 
-        public Task<VersionIndex> ReadIndexAsync(Account account, string container, string indexBlob, string? password, int volumes = 1, CancellationToken ct = default)
+        public Task<(string Name, int Volumes)> WriteIndexFileAsync(Account account, string container, int version, string serializedPath, string? password, AccessTier? tier = null, CancellationToken ct = default, StageTracker? progress = null)
             => throw new NotImplementedException();
 
-        public Task<(string Name, int Volumes)> WriteIndexAsync(Account account, string container, int version, VersionIndex index, string? password, AccessTier? tier = null, CancellationToken ct = default, StageTracker? progress = null)
+        public Task ReadIndexToFileAsync(Account account, string container, string indexBlob, string? password, int volumes, string destPath, CancellationToken ct = default)
             => throw new NotImplementedException();
     }
 
@@ -77,10 +77,10 @@ public sealed class OperationLogSourceTests
         public Task<string> WriteInfoConditionalAsync(Account account, string container, BackupInfoFile info, string? password, AccessTier? tier, string? ifMatch, CancellationToken ct = default)
             => throw new NotImplementedException();
 
-        public Task<VersionIndex> ReadIndexAsync(Account account, string container, string indexBlob, string? password, int volumes = 1, CancellationToken ct = default)
+        public Task<(string Name, int Volumes)> WriteIndexFileAsync(Account account, string container, int version, string serializedPath, string? password, AccessTier? tier = null, CancellationToken ct = default, StageTracker? progress = null)
             => throw new NotImplementedException();
 
-        public Task<(string Name, int Volumes)> WriteIndexAsync(Account account, string container, int version, VersionIndex index, string? password, AccessTier? tier = null, CancellationToken ct = default, StageTracker? progress = null)
+        public Task ReadIndexToFileAsync(Account account, string container, string indexBlob, string? password, int volumes, string destPath, CancellationToken ct = default)
             => throw new NotImplementedException();
     }
 
@@ -96,7 +96,9 @@ public sealed class OperationLogSourceTests
     {
         var log = new RecordingOperationLog();
         var checker = new BackupChecker(
-            new UnusedBlobClientFactory(), new ThrowingBackupInfoStore(), opLog: log);
+            // The catalog source is demanded by the constructor and never reached: the fake store throws first.
+            new UnusedBlobClientFactory(), new ThrowingBackupInfoStore(),
+            new TestLocalAuthority(new ThrowingBackupInfoStore()).Catalogs, opLog: log);
         var account = new Account { Id = 3, Name = "acct3" };
 
         try { await checker.CheckAsync(account, "photos", null, null, new CheckOptions()); }
@@ -114,12 +116,17 @@ public sealed class OperationLogSourceTests
     {
         var log = new RecordingOperationLog();
         var checker = new BackupChecker(
-            new UnusedBlobClientFactory(), new ThrowingBackupInfoStore(), opLog: log);
+            // The catalog source is demanded by the constructor and never reached: the fake store throws first.
+            new UnusedBlobClientFactory(), new ThrowingBackupInfoStore(),
+            new TestLocalAuthority(new ThrowingBackupInfoStore()).Catalogs, opLog: log);
+        var store = new OneVersionBackupInfoStore();
         var repairer = new BackupRepairer(
-            new UnusedBlobClientFactory(), new OneVersionBackupInfoStore(), compressor: null!, hasher: null!,
+            new UnusedBlobClientFactory(), store, compressor: null!, hasher: null!,
             uploader: null!, tempRoot: Path.GetTempPath(),
             // This case never reaches compression; the staging area is only here so the object can be constructed at all.
             staging: new StagingArea(Path.GetTempPath(), Path.GetTempPath(), () => long.MaxValue),
+            // Likewise the catalogs: the pre-check throws long before anything opens one.
+            catalogs: new TestLocalAuthority(store).Catalogs,
             checker: checker, opLog: log);
         var account = new Account { Id = 7, Name = "acct7" };
 

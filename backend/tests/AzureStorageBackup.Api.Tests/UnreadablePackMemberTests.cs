@@ -166,7 +166,8 @@ public sealed class UnreadablePackMemberTests : IDisposable
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             touching, new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor, indexCache: authority.IndexCache, trackedInfo: authority.Tracked), flaky, authority.IndexCache, authority.Tracked);
+            new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor, catalogs: authority.Catalogs, trackedInfo: authority.Tracked), flaky, authority.Catalogs, authority.Tracked,
+            workFactory: TestWorkDbs.New());
 
         var account = AzuriteAccount();
         var name = RandomName("unreadpk-");
@@ -284,7 +285,8 @@ public sealed class UnreadablePackMemberTests : IDisposable
             var orchestrator = new BackupOrchestrator(
                 new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
                 compressor, new BlobUploader(factory), factory, store, staging,
-                new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked);
+                new RetentionCleaner(factory, store, new RetentionEvaluator(), catalogs: authority.Catalogs, trackedInfo: authority.Tracked), new FileHasher(), authority.Catalogs, authority.Tracked,
+                workFactory: TestWorkDbs.New());
 
             await orchestrator.RunAsync(Request(account, name));
 
@@ -361,7 +363,8 @@ public sealed class UnreadablePackMemberTests : IDisposable
             var orchestrator = new BackupOrchestrator(
                 new LocalFileScanner(), new BackupDiffer(new LockAfterDiffHasher(new FileHasher(), "d/y.txt")),
                 new GroupingPlanner(), new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-                new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked);
+                new RetentionCleaner(factory, store, new RetentionEvaluator(), catalogs: authority.Catalogs, trackedInfo: authority.Tracked), new FileHasher(), authority.Catalogs, authority.Tracked,
+                workFactory: TestWorkDbs.New());
 
             var result = await orchestrator.RunAsync(Request(account, name));
 

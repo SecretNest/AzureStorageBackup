@@ -30,14 +30,13 @@ public sealed class BackupDifferUnreadableTests : IDisposable
         return full;
     }
 
-    private static Task<ScanResult> ScanAsync(string root) =>
-        new LocalFileScanner().ScanAsync(root, new IgnoreRuleSet([]));
 
     /// <summary>Produce a "previous version index" snapshot using the differ itself (previous=null, so everything comes out Added).</summary>
     private async Task<VersionIndex> SnapshotAsync()
     {
-        var scan = await ScanAsync(_root);
-        var diff = await new BackupDiffer(new FileHasher()).DiffAsync(_root, scan, previous: null);
+        var (entries0, summary) = await DiffTestHarness.ScanSortedAsync(_root);
+        var diff = await new BackupDiffer(new FileHasher()).RunDiffAsync(
+            _root, entries0, summary.Unreadable, previous: null);
 
         var entries = diff.Changes
             .Where(c => c.Current is not null)
@@ -55,10 +54,10 @@ public sealed class BackupDifferUnreadableTests : IDisposable
             })
             .ToList();
 
-        return new VersionIndex { Version = 1, Entries = entries, EmptyDirs = scan.EmptyDirs.ToList() };
+        return new VersionIndex { Version = 1, Entries = entries, EmptyDirs = summary.EmptyDirs.ToList() };
     }
 
-    private static FileChange Change(DiffResult d, string path) => d.Changes.Single(c => c.Path == path);
+    private static FileChange Change(DiffOutcome d, string path) => d.Changes.Single(c => c.Path == path);
 
     /// <summary>The given path throws the given exception; everything else is hashed as usual.</summary>
     private sealed class ThrowingHasher(string lockedPath, Exception toThrow) : IFileHasher
@@ -87,7 +86,7 @@ public sealed class BackupDifferUnreadableTests : IDisposable
         var hasher = new ThrowingHasher("locked.mdf",
             new IOException("The process cannot access the file 'locked.mdf' because it is being used by another process."));
 
-        var diff = await new BackupDiffer(hasher).DiffAsync(_root, await ScanAsync(_root), previous: null);
+        var diff = await new BackupDiffer(hasher).RunDiffAsync(_root, previous: null);
 
         var locked = Change(diff, "locked.mdf");
         Assert.Equal(ChangeKind.Unreadable, locked.Kind);
@@ -113,7 +112,7 @@ public sealed class BackupDifferUnreadableTests : IDisposable
         var hasher = new ThrowingHasher("locked.mdf",
             new IOException("The process cannot access the file because it is being used by another process."));
 
-        var diff = await new BackupDiffer(hasher).DiffAsync(_root, await ScanAsync(_root), previous);
+        var diff = await new BackupDiffer(hasher).RunDiffAsync(_root, previous);
 
         var c = Change(diff, "locked.mdf");
         Assert.Equal(ChangeKind.Unreadable, c.Kind);
@@ -137,7 +136,7 @@ public sealed class BackupDifferUnreadableTests : IDisposable
         var hasher = new ThrowingHasher("locked.mdf",
             new IOException("The process cannot access the file because it is being used by another process."));
 
-        var diff = await new BackupDiffer(hasher).DiffAsync(_root, await ScanAsync(_root), previous);
+        var diff = await new BackupDiffer(hasher).RunDiffAsync(_root, previous);
 
         var c = Change(diff, "locked.mdf");
         Assert.Equal(ChangeKind.Unreadable, c.Kind);
@@ -155,7 +154,7 @@ public sealed class BackupDifferUnreadableTests : IDisposable
 
         var hasher = new ThrowingHasher("locked.mdf", new UnauthorizedAccessException("Access to the path is denied."));
 
-        var diff = await new BackupDiffer(hasher).DiffAsync(_root, await ScanAsync(_root), previous: null);
+        var diff = await new BackupDiffer(hasher).RunDiffAsync(_root, previous: null);
 
         var c = Change(diff, "locked.mdf");
         Assert.Equal(ChangeKind.Unreadable, c.Kind);
@@ -170,11 +169,9 @@ public sealed class BackupDifferUnreadableTests : IDisposable
         // Expected: when the hasher throws OperationCanceledException the diff rethrows it as usual and does not treat it as Unreadable.
         // This is a guardrail: widening the catch to catch(Exception) would turn a cancellation into "skipped one file".
         Write("locked.mdf", "database content");
-        var scan = await ScanAsync(_root);
-
         var hasher = new ThrowingHasher("locked.mdf", new OperationCanceledException("cancelled"));
 
         await Assert.ThrowsAsync<OperationCanceledException>(() =>
-            new BackupDiffer(hasher).DiffAsync(_root, scan, previous: null));
+            new BackupDiffer(hasher).RunDiffAsync(_root, previous: null));
     }
 }

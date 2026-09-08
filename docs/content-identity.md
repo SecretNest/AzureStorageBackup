@@ -126,7 +126,7 @@ settling the item outright on a hit:
 
 ### Tier 0 — metadata only, no read
 
-If this run adopted a journal, `JournalResume.FindUntouchedBlob` is asked first: **path + mtime +
+If this run adopted a journal, `ResumeLedger.FindUntouchedBlobAsync` is asked first: **path + mtime +
 length**. A hit means the previous run already uploaded this exact path and the file has not been
 touched since, so the recorded storage reference is reused directly.
 
@@ -147,11 +147,14 @@ there is nothing to resume.
 `ProbeForDedupAsync` computes the head hash and asks `LocalDedupResolver.MayDeduplicate(length, head)`.
 The key is `length` **and** `headHash` together, and the set it consults has three sources:
 
-| Source | Populated by |
+| Source | Where it is asked |
 |---|---|
-| Retained version indexes | `LocalDedupResolver.Build` |
-| Content this run has already started on | `NoteInFlight`, called on every probe |
-| Confirmed blocks in an adopted journal | `Build`'s `confirmed` parameter |
+| Retained version indexes | the container's catalog, on `(length, head_hash)` |
+| Confirmed blocks in an adopted journal | the run's work database |
+| Content this run has already started on | the run's work database, written by `NoteInFlight` on every probe |
+
+None of the three is a set assembled up front: each is one indexed lookup, so the prescreen costs a
+query per changed file rather than a resident table per run.
 
 **A miss ends the probe.** The caller falls straight through to `StageBlobAsync` — no further reading,
 no content identity computed.
@@ -169,10 +172,13 @@ A prescreen hit escalates to `ReadContentIdentityAsync`, which reads **the whole
 produces all four fields in that single pass. Two lookups then run, both requiring **all four fields
 strictly equal**:
 
-1. `JournalResume.FindBlob` — the copy the previous run already confirmed as uploaded. Path **and**
+1. `ResumeLedger.FindBlobAsync` — the copy the previous run already confirmed as uploaded. Path **and**
    content must both match: after an interruption the file may well have been modified, and reusing
    on path alone would write old content into the index as if it were new.
-2. `LocalDedupResolver.TryFindExisting` — an existing blob from any retained version.
+2. `LocalDedupResolver.TryFindExisting` — an existing blob from any retained version, from the
+   adopted journal's confirmed blocks, or from an upload this run has already finished. All three
+   are the same situation — in the cloud, address taken — and are asked in that order, the catalog
+   having the last word over a journal's record of the same block.
 
 A miss on both means the item is genuinely new: it goes to `StageBlobAsync`, and `ResolveAsync`
 claims an address for it during the upload.
@@ -247,6 +253,15 @@ that went astray orphans its aliases, and those are re-run as ordinary files.
 > **Rationale — why a failed claim is withdrawn.** Without it, a retry of the same content comes back
 > to `ResolveAsync`, matches the dead claim on content key, and waits on a completion that never
 > succeeds — replaying the same exception forever and never reaching a real second attempt.
+
+The table holds only claims that are **still uploading**: a finished one is written to the run's work
+database and leaves. So "is this address taken?" is asked of three places, and this run's own
+finished uploads come first, ahead of the catalog and the adopted journal. Both ends of that order
+are load-bearing. A claim leaves the table the instant its row is committed, so without asking the
+rows first, a second file with the same content — arriving in the gap between the content lookup and
+this one — would find the address free and upload straight over the volumes just written. And an
+address the catalog reports as damage-marked has already been healed by that very upload, so the peer
+must deduplicate onto it rather than heal it a second time.
 
 ## Where the address comes from
 

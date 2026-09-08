@@ -1,80 +1,91 @@
 using AzureStorageBackup.Api.Services;
 using Microsoft.AspNetCore.Hosting;
-using Microsoft.AspNetCore.Mvc.Testing;
-using Microsoft.Data.Sqlite;
-using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
-using AzureStorageBackup.Api.Data;
+using Microsoft.Extensions.Logging;
 
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// `Backup__IndexCacheSize` is the switch that lets a low-memory machine turn the in-process index cache
-/// off (the README suggests values).
-/// Testing <see cref="VersionIndexMemoryCache"/> alone is not enough — what actually breaks is the
-/// **configuration binding**: a mistyped key, or a parse failure silently falling back to the default,
-/// leaves the class itself correct and useless. This takes the instance from Program.cs's real wiring.
+/// <c>Backup__IndexCacheSize</c> used to size the in-process cache of deserialized version indexes that sat in
+/// front of the on-disk version index. Both are gone: <see cref="IVersionCatalogs"/> reads versions from the
+/// SQLite catalog on demand, so there is nothing left for a deserialized-object cache to shortcut. The setting is
+/// retired, not removed from configuration binding — an operator's existing environment variable must not turn
+/// into a startup failure, so this asserts the host still starts and logs one line saying the value no longer
+/// does anything, rather than silently ignoring it or throwing on an unrecognised key.
 /// </summary>
 public sealed class IndexCacheSizeConfigTests
 {
-    private sealed class Factory(string? indexCacheSize) : WebApplicationFactory<Program>
+    /// <summary>Same technique as <c>BackupRunnerFailureLoggingTests.CapturingLoggerProvider</c>: attach a provider
+    /// to the host's own logging pipeline rather than parsing container output, so the assertion is on the actual
+    /// log record (level and text), not a side channel.</summary>
+    private sealed class CapturingLoggerProvider : ILoggerProvider
     {
-        private readonly SqliteConnection _connection = new("DataSource=:memory:");
+        private readonly List<(LogLevel Level, string Message)> _entries = [];
+        public IReadOnlyList<(LogLevel Level, string Message)> Entries { get { lock (_entries) return [.. _entries]; } }
 
+        public ILogger CreateLogger(string categoryName) => new Logger(this);
+        public void Dispose() { }
+
+        private sealed class Logger(CapturingLoggerProvider owner) : ILogger
+        {
+            public IDisposable? BeginScope<TState>(TState state) where TState : notnull => null;
+            public bool IsEnabled(LogLevel logLevel) => true;
+            public void Log<TState>(
+                LogLevel logLevel, EventId eventId, TState state, Exception? exception,
+                Func<TState, Exception?, string> formatter)
+            {
+                lock (owner._entries) owner._entries.Add((logLevel, formatter(state, exception)));
+            }
+        }
+    }
+
+    private sealed class Factory(string? indexCacheSize, CapturingLoggerProvider log) : TestWebAppFactory
+    {
         protected override void ConfigureWebHost(IWebHostBuilder builder)
         {
-            _connection.Open();
-            builder.UseSetting("Scheduler:Enabled", "false");
-            builder.UseSetting("Backup:TempPath",
-                Path.Combine(Path.GetTempPath(), "asb-cfg-" + Guid.NewGuid().ToString("N")));
+            base.ConfigureWebHost(builder);
             if (indexCacheSize is not null)
                 builder.UseSetting("Backup:IndexCacheSize", indexCacheSize);
-
-            builder.ConfigureServices(services =>
-            {
-                var d = services.SingleOrDefault(x => x.ServiceType == typeof(DbContextOptions<AppDbContext>));
-                if (d is not null) services.Remove(d);
-                services.AddDbContext<AppDbContext>(o => o.UseSqlite(_connection));
-            });
-        }
-
-        protected override void Dispose(bool disposing)
-        {
-            base.Dispose(disposing);
-            if (disposing) _connection.Dispose();
+            builder.ConfigureServices(services => services.AddLogging(b => b.AddProvider(log)));
         }
     }
 
-    private static int CapacityFor(string? setting)
+    /// <summary>The low-memory setting an operator would have used to disable the old cache. The host must still
+    /// start with it present, and <see cref="IVersionCatalogs"/> — the service that replaced the cache's reason
+    /// for existing — must resolve normally out of a request scope.</summary>
+    [Fact]
+    public void Setting_Present_App_Starts_And_Catalogs_Resolve()
     {
-        using var factory = new Factory(setting);
+        var log = new CapturingLoggerProvider();
+        using var factory = new Factory("0", log);
         using var scope = factory.Services.CreateScope();
-        return scope.ServiceProvider.GetRequiredService<VersionIndexMemoryCache>().Capacity;
+
+        var catalogs = scope.ServiceProvider.GetRequiredService<IVersionCatalogs>();
+        Assert.NotNull(catalogs);
     }
 
     [Fact]
-    public void Unset_Defaults_To_Two_Favouring_Responsiveness()
-        => Assert.Equal(2, CapacityFor(null));
-
-    /// <summary>The low-memory setting: 0 disables it entirely, restoring the behaviour from before this cache existed.</summary>
-    [Fact]
-    public void Zero_Disables_The_Cache()
+    public void Setting_Present_Logs_That_It_No_Longer_Does_Anything()
     {
-        Assert.Equal(0, CapacityFor("0"));
-        using var factory = new Factory("0");
-        using var scope = factory.Services.CreateScope();
-        Assert.False(scope.ServiceProvider.GetRequiredService<VersionIndexMemoryCache>().Enabled);
+        var log = new CapturingLoggerProvider();
+        using var factory = new Factory("0", log);
+        // Force the host to actually start (WebApplicationFactory builds it lazily on first access to Server/Services).
+        _ = factory.Server;
+
+        var entry = Assert.Single(log.Entries, e => e.Message.Contains("no longer used", StringComparison.Ordinal));
+        Assert.Equal(LogLevel.Information, entry.Level);
+        Assert.Contains("Backup__IndexCacheSize=0", entry.Message, StringComparison.Ordinal);
     }
 
+    /// <summary>The common case — the variable was never set — must stay silent: logging the note unconditionally
+    /// would tell every operator about a setting they never touched.</summary>
     [Fact]
-    public void One_Is_The_Half_Memory_Middle_Ground()
-        => Assert.Equal(1, CapacityFor("1"));
+    public void Setting_Absent_Nothing_Is_Logged()
+    {
+        var log = new CapturingLoggerProvider();
+        using var factory = new Factory(indexCacheSize: null, log);
+        _ = factory.Server;
 
-    /// <summary>Unparseable or negative → fall back to the default rather than silently disabling the cache (which would look like the setting took effect).</summary>
-    [Theory]
-    [InlineData("abc")]
-    [InlineData("")]
-    [InlineData("-1")]
-    public void Invalid_Values_Fall_Back_To_The_Default(string value)
-        => Assert.Equal(2, CapacityFor(value));
+        Assert.DoesNotContain(log.Entries, e => e.Message.Contains("IndexCacheSize", StringComparison.Ordinal));
+    }
 }

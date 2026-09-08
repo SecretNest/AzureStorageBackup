@@ -92,9 +92,10 @@ public sealed class StagedReleaseTests : IDisposable
                 new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
                 new TouchesAMemberAfterPacking(new SevenZipCompressor(), target, packed),
                 new BlobUploader(factory), factory, store, staging,
-                new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
+                new RetentionCleaner(factory, store, new RetentionEvaluator(), catalogs: authority.Catalogs, trackedInfo: authority.Tracked),
                 new ThrowsOnTheRecheckHash(new FileHasher(), target, packed, new InvalidOperationException("boom")),
-                authority.IndexCache, authority.Tracked);
+                authority.Catalogs, authority.Tracked,
+                workFactory: TestWorkDbs.New());
 
             await Assert.ThrowsAnyAsync<Exception>(() => orchestrator.RunAsync(new BackupRequest
             {

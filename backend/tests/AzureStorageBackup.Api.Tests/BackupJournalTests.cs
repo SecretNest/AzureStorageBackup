@@ -141,7 +141,7 @@ public class BackupJournalTests : IDisposable
     /// `"MtimeUtcTicks":null`, absent entirely. Deserialising it must not throw, and must not produce anything that
     /// could be mistaken for a real mtime; it has to come back as null so the resume falls back to the full content
     /// test, exactly as it did before this field existed. Getting this wrong is the one mistake that could put the
-    /// wrong content in the index (see <see cref="JournalResume.FindBlob"/>'s reasoning for why path alone is unsafe).
+    /// wrong content in the index (see <see cref="ResumeLedger.FindBlobAsync"/>'s reasoning for why path alone is unsafe).
     /// </summary>
     [Fact]
     public async Task Record_without_the_mtime_field_deserialises_as_null()

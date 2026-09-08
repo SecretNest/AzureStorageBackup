@@ -313,7 +313,8 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             var orchestrator = new BackupOrchestrator(
                 new LocalFileScanner(), differ, new GroupingPlanner(),
                 new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-                new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked,
+                new RetentionCleaner(factory, store, new RetentionEvaluator(), catalogs: authority.Catalogs, trackedInfo: authority.Tracked), new FileHasher(), authority.Catalogs, authority.Tracked,
+                workFactory: TestWorkDbs.New(),
                 notifier: notifier);
 
             var result = await orchestrator.RunAsync(Request(account, name, singleFileThresholdBytes: 1));
@@ -372,7 +373,8 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             var orchestrator = new BackupOrchestrator(
                 new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
                 compressor, new BlobUploader(factory), factory, store, staging,
-                new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked,
+                new RetentionCleaner(factory, store, new RetentionEvaluator(), catalogs: authority.Catalogs, trackedInfo: authority.Tracked), new FileHasher(), authority.Catalogs, authority.Tracked,
+                workFactory: TestWorkDbs.New(),
                 notifier: notifier);
 
             var result = await orchestrator.RunAsync(
@@ -432,7 +434,8 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             var orchestrator = new BackupOrchestrator(
                 new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
                 compressor, new BlobUploader(factory), factory, store, staging,
-                new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked,
+                new RetentionCleaner(factory, store, new RetentionEvaluator(), catalogs: authority.Catalogs, trackedInfo: authority.Tracked), new FileHasher(), authority.Catalogs, authority.Tracked,
+                workFactory: TestWorkDbs.New(),
                 notifier: notifier);
 
             var result = await orchestrator.RunAsync(
@@ -506,7 +509,8 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             var orchestrator = new BackupOrchestrator(
                 new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
                 compressor, new BlobUploader(factory), factory, store, staging,
-                new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked,
+                new RetentionCleaner(factory, store, new RetentionEvaluator(), catalogs: authority.Catalogs, trackedInfo: authority.Tracked), new FileHasher(), authority.Catalogs, authority.Tracked,
+                workFactory: TestWorkDbs.New(),
                 notifier: notifier, verboseLog: verboseLog);
 
             var request = Request(account, name, singleFileThresholdBytes: 30) with
@@ -564,7 +568,8 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             var orchestrator = new BackupOrchestrator(
                 new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
                 new SevenZipCompressor(), new NetworkFailingUploader(), factory, store, staging,
-                new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked,
+                new RetentionCleaner(factory, store, new RetentionEvaluator(), catalogs: authority.Catalogs, trackedInfo: authority.Tracked), new FileHasher(), authority.Catalogs, authority.Tracked,
+                workFactory: TestWorkDbs.New(),
                 notifier: notifier);
 
             // An upload failure must fail the whole run, not be quietly skipped as "this file is unreadable".
@@ -623,7 +628,8 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             var orchestrator = new BackupOrchestrator(
                 new LocalFileScanner(), differ, new GroupingPlanner(),
                 new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-                new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked,
+                new RetentionCleaner(factory, store, new RetentionEvaluator(), catalogs: authority.Catalogs, trackedInfo: authority.Tracked), new FileHasher(), authority.Catalogs, authority.Tracked,
+                workFactory: TestWorkDbs.New(),
                 notifier: notifier);
 
             var result = await orchestrator.RunAsync(Request(account, name, singleFileThresholdBytes: 100));
@@ -687,7 +693,8 @@ public sealed class UnreadableDuringUploadTests : IDisposable
             var orchestrator = new BackupOrchestrator(
                 new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
                 compressor, new BlobUploader(factory), factory, store, staging,
-                new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked,
+                new RetentionCleaner(factory, store, new RetentionEvaluator(), catalogs: authority.Catalogs, trackedInfo: authority.Tracked), new FileHasher(), authority.Catalogs, authority.Tracked,
+                workFactory: TestWorkDbs.New(),
                 notifier: notifier);
 
             // Threshold dropped to 1 → the single-file path (HandleBlobAsync), the one that used to have no protection.

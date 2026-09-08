@@ -473,6 +473,21 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         return createdAt.UtcTicks;
     }
 
+    /// <summary>Puts a version index where the endpoints will find it, as a pre-migration
+    /// <see cref="CachedVersionIndex"/> row: the catalog's lazy migration imports it on the first read, which is
+    /// both the shortest way to seed a version without Azurite and a free exercise of that migration.</summary>
+    private async Task SeedVersionIndexAsync(int accountId, string container, int version, long identityTicks, VersionIndex index)
+    {
+        using var scope = factory.Services.CreateScope();
+        var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+        db.CachedVersionIndexes.Add(new CachedVersionIndex
+        {
+            AccountId = accountId, Container = container, Version = version,
+            IdentityTicks = identityTicks, Bytes = LegacyIndexSerializer.SerializeIndex(index),
+        });
+        await db.SaveChangesAsync();
+    }
+
     private sealed record VersionSummary(int version, DateTimeOffset createdAt, long files, long bytes, long changedFiles);
     private sealed record VersionSpanRow(int version, DateTimeOffset createdAt, DateTimeOffset? startedAt);
     private sealed record FileVersionCandidate(int version, DateTimeOffset createdAt, long length);
@@ -597,7 +612,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
             db.CachedVersionIndexes.Add(new CachedVersionIndex
             {
                 AccountId = account.Id, Container = created.ContainerName, Version = 1,
-                IdentityTicks = identityTicks, Bytes = IndexSerializer.SerializeIndex(index),
+                IdentityTicks = identityTicks, Bytes = LegacyIndexSerializer.SerializeIndex(index),
             });
             await db.SaveChangesAsync();
         }
@@ -671,7 +686,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
             db.CachedVersionIndexes.Add(new CachedVersionIndex
             {
                 AccountId = account.Id, Container = created.ContainerName, Version = 1,
-                IdentityTicks = identityTicks, Bytes = IndexSerializer.SerializeIndex(index),
+                IdentityTicks = identityTicks, Bytes = LegacyIndexSerializer.SerializeIndex(index),
             });
             await db.SaveChangesAsync();
         }
@@ -699,6 +714,75 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
         var fvBroken = await _client.GetAsync(
             $"/api/backup-configs/{created.Id}/file-versions?path={Uri.EscapeDataString("broken.txt")}");
         Assert.Empty((await fvBroken.Content.ReadFromJsonAsync<List<FileVersionCandidate>>())!);
+    }
+
+    /// <summary>
+    /// /file-versions answers per version with two bounded lookups — "is this path unrecoverable here" and "is there an
+    /// entry with storage at it" — instead of materializing each version's whole index to search it. Three versions,
+    /// three different fates for the same path, and only the middle one is a substitution candidate: the newest has it
+    /// marked unrecoverable (there is no content to give), the oldest has an entry with no storage at all (nothing to
+    /// download). Both exclusions are per version, so an implementation that answered them from a single version, or
+    /// that dropped either check on the way to the catalog, fails here.
+    /// </summary>
+    [Fact]
+    public async Task File_Versions_Answers_Each_Version_On_Its_Own_Terms()
+    {
+        var account = await CreateAzuriteAccountAsync();
+        var created = await (await _client.PostAsJsonAsync("/api/backup-configs",
+                SampleRequest("ep-fv-per-version") with { AccountId = account.Id, ContainerName = "ep-fv-per-version-container" }))
+            .Content.ReadFromJsonAsync<BackupConfigResponse>();
+
+        var identityTicks = SeedLocalInfo(account.Id, created!.ContainerName,
+        [
+            new BackupVersion { Version = 1, CreatedAt = DateTimeOffset.UtcNow.AddDays(-3), IndexBlob = "v1.index", Stats = new VersionStats(1, 5, 1, 5) },
+            new BackupVersion { Version = 2, CreatedAt = DateTimeOffset.UtcNow.AddDays(-2), IndexBlob = "v2.index", Stats = new VersionStats(1, 22, 1, 22) },
+            new BackupVersion { Version = 3, CreatedAt = DateTimeOffset.UtcNow.AddDays(-1), IndexBlob = "v3.index", Stats = new VersionStats(1, 22, 1, 22) },
+        ]);
+
+        VersionIndex Index(int version, long length, StorageRef? storage, bool unrecoverable) => new()
+        {
+            Version = version,
+            Entries =
+            [
+                new IndexEntry
+                {
+                    Path = "doc.txt", Kind = "file", Length = length, Mtime = DateTimeOffset.UnixEpoch,
+                    Permissions = "644", Storage = storage,
+                },
+            ],
+            UnrecoverablePaths = unrecoverable ? ["doc.txt"] : [],
+        };
+
+        using (var scope = factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            db.CachedVersionIndexes.AddRange(
+                new CachedVersionIndex
+                {
+                    AccountId = account.Id, Container = created.ContainerName, Version = 1, IdentityTicks = identityTicks,
+                    Bytes = LegacyIndexSerializer.SerializeIndex(Index(1, 5, storage: null, unrecoverable: false)),
+                },
+                new CachedVersionIndex
+                {
+                    AccountId = account.Id, Container = created.ContainerName, Version = 2, IdentityTicks = identityTicks,
+                    Bytes = LegacyIndexSerializer.SerializeIndex(
+                        Index(2, 22, new StorageRef { Kind = "blob", Ref = "data/ok" }, unrecoverable: false)),
+                },
+                new CachedVersionIndex
+                {
+                    AccountId = account.Id, Container = created.ContainerName, Version = 3, IdentityTicks = identityTicks,
+                    Bytes = LegacyIndexSerializer.SerializeIndex(
+                        Index(3, 22, new StorageRef { Kind = "blob", Ref = "data/broken" }, unrecoverable: true)),
+                });
+            await db.SaveChangesAsync();
+        }
+
+        var candidates = await _client.GetFromJsonAsync<List<FileVersionCandidate>>(
+            $"/api/backup-configs/{created.Id}/file-versions?path=doc.txt");
+
+        var only = Assert.Single(candidates!);
+        Assert.Equal(2, only.version);
+        Assert.Equal(22, only.length);
     }
 
     [Fact]
@@ -758,9 +842,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
                     Version = 9, IndexBlob = "indexes/9", CreatedAt = DateTimeOffset.UtcNow,
                     Stats = new VersionStats(3, 30, 3, 30),
                 }]);
-            using (var scope = factory.Services.CreateScope())
-                await scope.ServiceProvider.GetRequiredService<ILocalIndexCache>().PutAsync(
-                    accountId, created.ContainerName, 9, identity,
+            await SeedVersionIndexAsync(accountId, created.ContainerName, 9, identity,
                     new VersionIndex
                     {
                         Version = 9,
@@ -1020,9 +1102,7 @@ public class BackupConfigEndpointsTests(TestWebAppFactory factory) : IClassFixtu
                     Version = 9, IndexBlob = "indexes/9", CreatedAt = DateTimeOffset.UtcNow,
                     Stats = new VersionStats(1, 20, 1, 20),
                 }]);
-            using (var scope = factory.Services.CreateScope())
-                await scope.ServiceProvider.GetRequiredService<ILocalIndexCache>().PutAsync(
-                    accountId, created.ContainerName, 9, identity,
+            await SeedVersionIndexAsync(accountId, created.ContainerName, 9, identity,
                     new VersionIndex
                     {
                         Version = 9,

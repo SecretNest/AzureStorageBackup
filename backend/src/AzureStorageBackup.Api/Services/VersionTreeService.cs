@@ -18,87 +18,45 @@ public sealed record TreeNode(
     DateTimeOffset? UnreadableAt = null);
 
 /// <summary>
-/// Lazily loads the directory tree out of a version index (M4 §4.1a, decision 1): given a directory path, returns its direct children
-/// (subdirectories + files) without recursing. Directory nodes are tagged with HasChildren so the frontend can decide whether they are expandable; empty directories (EmptyDirs) are included as expandable directory nodes too.
-/// Pure logic, no IO whatsoever, reusable by the endpoints.
+/// Renders one directory of the restore tree (M4 §4.1a, decision 1) out of what the catalog answered for it: direct
+/// children only, never a recursion, with directory nodes tagged <c>HasChildren</c> so the frontend can decide whether
+/// they are expandable before anyone clicks.
+/// <para>
+/// It used to take the whole <see cref="VersionIndex"/> and walk every path in it to find the handful under one
+/// prefix — which meant every click in the restore dialog paid for the entire version. The catalog answers the same
+/// question with two indexed lookups (<see cref="VersionCatalog.ChildrenAsync"/>), so what is left here is the pure
+/// shaping: names into paths, entries into nodes. Still no IO whatsoever, and still reusable by the endpoints.
+/// </para>
 /// </summary>
 public static class VersionTreeService
 {
-    public static IReadOnlyList<TreeNode> Children(VersionIndex index, string? dirPath)
+    /// <param name="children">One directory's direct children, straight from <see cref="VersionCatalog.ChildrenAsync"/>.</param>
+    /// <param name="dirPath">The directory those children belong to, exactly as the request spelled it; it is what the
+    /// returned paths are prefixed with, so it is normalized here the same way <see cref="NormalizePrefix"/> normalized
+    /// it for the query.</param>
+    public static IReadOnlyList<TreeNode> Children(IReadOnlyList<CatalogChild> children, string? dirPath)
     {
         var prefix = NormalizePrefix(dirPath);
-        var nodes = new Dictionary<string, TreeNode>(StringComparer.Ordinal);
+        var nodes = new List<TreeNode>(children.Count);
 
-        foreach (var entry in index.Entries)
+        foreach (var child in children)
         {
-            if (!TryGetRelative(entry.Path, prefix, out var rest))
-                continue;
-
-            var slash = rest.IndexOf('/');
-            if (slash < 0)
-            {
-                // The direct child is the file itself
-                var childPath = prefix.Length == 0 ? entry.Path : $"{prefix}/{rest}";
-                nodes[rest] = new TreeNode(rest, childPath, IsDir: false, HasChildren: false,
-                    entry.Length, entry.Mtime, entry.Storage?.Kind, entry.Storage?.Ref, entry.UnreadableAt);
-            }
-            else
-            {
-                // The direct child is a directory (the file sits deeper down)
-                var name = rest[..slash];
-                var childPath = prefix.Length == 0 ? name : $"{prefix}/{name}";
-                nodes[name] = new TreeNode(name, childPath, IsDir: true, HasChildren: true,
-                    Length: null, Mtime: null, StorageKind: null, StorageRef: null);
-            }
+            var path = prefix.Length == 0 ? child.Name : $"{prefix}/{child.Name}";
+            // A directory node carries no file metadata: it has no length, no mtime and no storage of its own, and
+            // inventing zeros for them would render as "an empty file" in the tree.
+            nodes.Add(child is { IsDir: false, Entry: { } entry }
+                ? new TreeNode(child.Name, path, IsDir: false, HasChildren: false,
+                    entry.Length, entry.Mtime, entry.Storage?.Kind, entry.Storage?.Ref, entry.UnreadableAt)
+                : new TreeNode(child.Name, path, IsDir: true, child.HasChildren,
+                    Length: null, Mtime: null, StorageKind: null, StorageRef: null));
         }
 
-        foreach (var emptyDir in index.EmptyDirs)
-        {
-            if (!TryGetRelative(emptyDir, prefix, out var rest))
-                continue;
-
-            var slash = rest.IndexOf('/');
-            if (slash < 0)
-            {
-                // The empty directory itself is the direct child: expandable (with no children of its own, unless other EmptyDirs/Entries fill in underneath it)
-                var childPath = prefix.Length == 0 ? rest : $"{prefix}/{rest}";
-                if (!nodes.ContainsKey(rest))
-                    nodes[rest] = new TreeNode(rest, childPath, IsDir: true, HasChildren: false,
-                        Length: null, Mtime: null, StorageKind: null, StorageRef: null);
-            }
-            else
-            {
-                // The empty directory sits deeper down → the direct child is an intermediate directory and must have content beneath it
-                var name = rest[..slash];
-                var childPath = prefix.Length == 0 ? name : $"{prefix}/{name}";
-                nodes[name] = new TreeNode(name, childPath, IsDir: true, HasChildren: true,
-                    Length: null, Mtime: null, StorageKind: null, StorageRef: null);
-            }
-        }
-
-        return nodes.Values.ToList();
+        return nodes;
     }
 
-    /// <summary>Strips leading and trailing '/', normalizing to the empty string (root) or a path with no slash at either end.</summary>
-    private static string NormalizePrefix(string? dirPath) =>
+    /// <summary>Strips leading and trailing '/', normalizing to the empty string (root) or a path with no slash at
+    /// either end — which is exactly the shape the catalog stores in <c>entries.parent</c> and <c>dirs.parent</c>, so
+    /// the endpoint passes the request's raw path through this before asking for a directory's children.</summary>
+    public static string NormalizePrefix(string? dirPath) =>
         string.IsNullOrEmpty(dirPath) ? string.Empty : dirPath.Trim('/');
-
-    /// <summary>Whether the path lies under the prefix directory; if so, outputs the remainder relative to prefix.</summary>
-    private static bool TryGetRelative(string path, string prefix, out string rest)
-    {
-        if (prefix.Length == 0)
-        {
-            rest = path;
-            return rest.Length > 0;
-        }
-
-        if (path.Length > prefix.Length && path.StartsWith(prefix, StringComparison.Ordinal) && path[prefix.Length] == '/')
-        {
-            rest = path[(prefix.Length + 1)..];
-            return rest.Length > 0;
-        }
-
-        rest = string.Empty;
-        return false;
-    }
 }

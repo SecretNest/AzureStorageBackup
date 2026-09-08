@@ -111,31 +111,35 @@ public sealed class BackupLifecycleTests : IDisposable
         IBackupInfoStore Store,
         BlobClientFactory Factory);
 
-    /// <summary>Wires up the whole chain the way production does: the local authoritative state machine (TrackedInfoStore + LocalIndexCache) runs through backup/cleanup/compaction/repair.</summary>
+    /// <summary>Wires up the whole chain the way production does: the local authoritative state machine
+    /// (TrackedInfoStore for the info file, one container catalog for the version indexes) runs through
+    /// backup/cleanup/compaction/repair.</summary>
     private Rig Build()
     {
         var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         var hasher = new FileHasher();
         var tracked = new TrackedInfoStore(store, new LocalBackupStateStore(_db));
-        var indexCache = new LocalIndexCache(_db, store, TestIndexFiles.New());
+        var catalogs = TestCatalogs.New(_db, store);
         var staging = new StagingArea(
             Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
         var compactor = new DeadWeightCompactor(
             _uploader, new SevenZipCompressor(), hasher, Path.Combine(_temp, "compact"), staging);
         var cleaner = new RetentionCleaner(
-            factory, store, new RetentionEvaluator(), compactor, indexCache, tracked);
+            factory, store, new RetentionEvaluator(), compactor, catalogs, tracked);
         var backup = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(hasher), new GroupingPlanner(),
             new SevenZipCompressor(), _uploader, factory, store, staging, cleaner, hasher,
-            indexCache: indexCache, trackedInfo: tracked);
+            catalogs: catalogs, trackedInfo: tracked,
+            workFactory: TestWorkDbs.New());
         var checker = new BackupChecker(
-            factory, store, new SevenZipCompressor(), hasher, Path.Combine(_temp, "check"), trackedInfo: tracked);
+            factory, store, catalogs, new SevenZipCompressor(), hasher, Path.Combine(_temp, "check"), trackedInfo: tracked);
         var repairer = new BackupRepairer(
             factory, store, new SevenZipCompressor(), hasher, _uploader, Path.Combine(_temp, "repair"), staging,
-            checker: checker, trackedInfo: tracked, indexCache: indexCache);
+            catalogs, checker: checker, trackedInfo: tracked);
         var restore = new RestoreOrchestrator(
-            factory, store, new SevenZipCompressor(), hasher, Path.Combine(_temp, "restore"));
+            factory, store, TestCatalogs.New(_db, store), new SevenZipCompressor(), hasher,
+            Path.Combine(_temp, "restore"));
         return new Rig(backup, checker, repairer, restore, store, factory);
     }
 

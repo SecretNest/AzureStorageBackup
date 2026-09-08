@@ -5,6 +5,13 @@ using AzureStorageBackup.Api.Services;
 
 namespace AzureStorageBackup.Api.Tests;
 
+/// <summary>
+/// The two binary formats, field for field. The info-file half is <see cref="IndexSerializer"/>, still the
+/// product's; the index half is <see cref="LegacyIndexSerializer"/>, which the product retired but the test project
+/// keeps — and keeping it honest matters beyond these cases, because <see cref="IndexStreamTests"/> uses it as the
+/// oracle the shipping <see cref="IndexStreamWriter"/> is compared against. An oracle nobody round-trips is an
+/// oracle that can agree with a bug.
+/// </summary>
 public sealed class IndexSerializerTests
 {
     private static BackupInfoFile SampleInfo() => new()
@@ -90,7 +97,7 @@ public sealed class IndexSerializerTests
     [Fact]
     public void Index_RoundTrips_With_Pack_And_Blob_Storage()
     {
-        var back = IndexSerializer.DeserializeIndex(IndexSerializer.SerializeIndex(SampleIndex()));
+        var back = LegacyIndexSerializer.DeserializeIndex(LegacyIndexSerializer.SerializeIndex(SampleIndex()));
 
         Assert.Equal(1, back.Version);
         Assert.Equal(["sub/empty1", "sub/empty2"], back.EmptyDirs);
@@ -117,7 +124,7 @@ public sealed class IndexSerializerTests
             Entries = [SampleIndex().Entries[0] with { Mtime = new DateTimeOffset(2026, 3, 1, 8, 30, 15, TimeSpan.FromHours(-5)) }],
         };
 
-        var back = IndexSerializer.DeserializeIndex(IndexSerializer.SerializeIndex(index));
+        var back = LegacyIndexSerializer.DeserializeIndex(LegacyIndexSerializer.SerializeIndex(index));
 
         Assert.Equal(index.Entries[0].Mtime, back.Entries[0].Mtime);
     }
@@ -140,7 +147,7 @@ public sealed class IndexSerializerTests
             ],
         };
 
-        var e = Assert.Single(IndexSerializer.DeserializeIndex(IndexSerializer.SerializeIndex(index)).Entries);
+        var e = Assert.Single(LegacyIndexSerializer.DeserializeIndex(LegacyIndexSerializer.SerializeIndex(index)).Entries);
         Assert.Null(e.Target);
         Assert.Null(e.Storage!.EntryName);
     }
@@ -159,7 +166,7 @@ public sealed class IndexSerializerTests
         }).ToList();
         var index = new VersionIndex { Version = 1, Entries = entries };
 
-        var binary = IndexSerializer.SerializeIndex(index);
+        var binary = LegacyIndexSerializer.SerializeIndex(index);
         var json = JsonSerializer.SerializeToUtf8Bytes(index);
 
         Assert.True(binary.Length < json.Length, $"binary {binary.Length} should be < json {json.Length}");
@@ -176,7 +183,7 @@ public sealed class IndexSerializerTests
         };
 
         var backInfo = IndexSerializer.DeserializeInfoFile(IndexSerializer.SerializeInfoFile(info));
-        var backIndex = IndexSerializer.DeserializeIndex(IndexSerializer.SerializeIndex(index));
+        var backIndex = LegacyIndexSerializer.DeserializeIndex(LegacyIndexSerializer.SerializeIndex(index));
 
         Assert.Equal(4, backInfo.Packs["p0001"].Volumes);          // Pack volume count (info file)
         Assert.Equal(3, backIndex.Entries[0].Storage!.Volumes);    // Single-file blob volume count (index)
@@ -185,7 +192,7 @@ public sealed class IndexSerializerTests
     [Fact]
     public void Defaults_To_One_Volume()
     {
-        var backIndex = IndexSerializer.DeserializeIndex(IndexSerializer.SerializeIndex(SampleIndex()));
+        var backIndex = LegacyIndexSerializer.DeserializeIndex(LegacyIndexSerializer.SerializeIndex(SampleIndex()));
         Assert.Equal(1, backIndex.Entries[0].Storage!.Volumes); // Not set explicitly → 1 volume
     }
 
@@ -201,7 +208,7 @@ public sealed class IndexSerializerTests
         };
 
         var backInfo = IndexSerializer.DeserializeInfoFile(IndexSerializer.SerializeInfoFile(info));
-        var backIndex = IndexSerializer.DeserializeIndex(IndexSerializer.SerializeIndex(index));
+        var backIndex = LegacyIndexSerializer.DeserializeIndex(LegacyIndexSerializer.SerializeIndex(index));
 
         Assert.Equal([100L, 200L, 50L], backInfo.Packs["p0001"].VolumeSizes);       // Pack volume sizes (info file)
         Assert.Equal([4096L, 512L], backIndex.Entries[0].Storage!.VolumeSizes);     // Single-file blob volume sizes (index)
@@ -211,7 +218,7 @@ public sealed class IndexSerializerTests
     [Fact]
     public void New_Fields_Default_Empty()
     {
-        var backIndex = IndexSerializer.DeserializeIndex(IndexSerializer.SerializeIndex(SampleIndex()));
+        var backIndex = LegacyIndexSerializer.DeserializeIndex(LegacyIndexSerializer.SerializeIndex(SampleIndex()));
         Assert.Empty(backIndex.Entries[0].Storage!.VolumeSizes);
         Assert.Empty(backIndex.UnrecoverablePaths);
     }

@@ -2,6 +2,7 @@ using Azure;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using AzureStorageBackup.Api.Models;
+using Microsoft.Extensions.Logging;
 
 namespace AzureStorageBackup.Api.Services;
 
@@ -46,8 +47,8 @@ public sealed record CleanupReport(int RetiredVersions, int DeletedPacks, int De
 /// </summary>
 public sealed class RetentionCleaner(
     IBlobClientFactory factory, IBackupInfoStore store, RetentionEvaluator retention,
-    DeadWeightCompactor? compactor = null, ILocalIndexCache? indexCache = null, TrackedInfoStore? trackedInfo = null,
-    BackupJournalStore? journals = null, BackupBusyTracker? busy = null)
+    DeadWeightCompactor? compactor = null, IVersionCatalogs? catalogs = null, TrackedInfoStore? trackedInfo = null,
+    BackupJournalStore? journals = null, BackupBusyTracker? busy = null, ILogger<RetentionCleaner>? logger = null)
 {
     /// <summary>Standalone cleanup: reads the info file itself (preferring the locally authoritative copy).</summary>
     public async Task<CleanupReport> CleanupAsync(
@@ -134,6 +135,18 @@ public sealed class RetentionCleaner(
         var identity = info.Backup.CreatedAt.UtcTicks;
         long freedBytes = 0;
 
+        // Asked before the first destructive step, not where the catalog is first used: a cleaner wired without one
+        // cannot tell what the retained versions still reference, and the failure has to land before it has written
+        // or deleted anything rather than half-way through. Null is legitimate for a container with no version at
+        // all — the "first backup was cancelled, blocks but no index" sweep — which asks the catalog nothing.
+        // Production DI always injects one.
+        var catalogs_ = info.Versions.Count > 0
+            ? catalogs ?? throw new InvalidOperationException(
+                "RetentionCleaner was constructed without an IVersionCatalogs, so it cannot tell what the retained " +
+                "versions still reference — and deleting on that basis would delete live data. Production DI always " +
+                "provides one; a test that cleans a container holding versions must pass one too.")
+            : null;
+
         // Retirement commits BEFORE it deletes — the same "upload first, delete after" discipline every other
         // destructive path in this codebase follows, and the one place that had it backwards. The old order
         // deleted a retired version's index volumes first and wrote the info file last; a cancellation or crash
@@ -154,7 +167,67 @@ public sealed class RetentionCleaner(
                 await store.WriteInfoAsync(account, container, info, password, tier: null, ct);
         }
 
-        // Now the second-level indexes of the retired versions (cloud + local cache). Best-effort per volume:
+        // Everything below reads the criterion out of the catalog, so the catalog first has to know every version the
+        // info file listed on the way in — the retiring ones included, since what they alone reference is exactly
+        // what may go. Migration is lazy, so a container nobody has cleaned since the upgrade pays for its indexes
+        // here, once, and afterwards this is three SQL queries against a file.
+        //
+        // Deliberately **after** the retirement commit above: that commit is this method's first destructive step and
+        // has to stay first (see the block comment on it), and nothing between the two touches an index blob the
+        // migration below still needs to read.
+        var candidates = CleanupCandidates.NoVersions;
+        if (catalogs_ is not null)
+        {
+            // The retained versions are mandatory. Their refs are the whole of what protects live content, so a
+            // version whose index cannot be migrated leaves the criterion unable to tell "in use" from "orphan" —
+            // and deleting on a half-known set is data loss. A failure here stops the round instead.
+            foreach (var v in info.Versions)
+                await catalogs_.EnsureVersionAsync(account, container, v, identity, password, ct);
+
+            // The retiring ones are best-effort, and can be: their only contribution is **naming** what may go, and
+            // a retired version that never reaches the catalog simply leaves the refs it alone held to the orphan
+            // half of the criterion below — which is precisely what the old code, which never read a retired index
+            // at all, did with them. What this buys is that one unreadable index blob on a version that is retiring
+            // anyway cannot block every future cleanup of the container from freeing anything.
+            foreach (var v in retired)
+            {
+                try
+                {
+                    await catalogs_.EnsureVersionAsync(account, container, v, identity, password, ct);
+                }
+                catch (Exception ex) when (ex is not OperationCanceledException)
+                {
+                    logger?.LogWarning(ex,
+                        "Retention could not bring retiring version {Version} of container {Container} into the catalog ({Message}); what it alone referenced will be collected as orphans instead.",
+                        v.Version, container, ex.Message);
+                }
+            }
+
+            // Reconcile the catalog against the info file, which is the authority on which versions exist. Anything
+            // in the catalog that the info file does not list was retired by an earlier round that died between its
+            // cloud deletes and the removal further down — and its rows are actively harmful, because
+            // `Referenced` below is read from the whole catalog: those stale refs would protect, for good, exactly
+            // the blobs that failed round left behind (the next round retires nothing, so it never reaches the
+            // removal that would have cleared them). The old code could not have this problem — it rebuilt the
+            // referenced set from `info.Versions` on every pass — so this is what keeps the two equivalent.
+            //
+            // This round's own retirees are excluded: they must stay until the cloud deletes are done (cloud first),
+            // and they leave through the removal below.
+            //
+            // The same call a run makes at its start, for the same reason — one implementation of "the info file
+            // says which versions exist; make the catalog agree" (see IVersionCatalogs.ReconcileAsync).
+            var known = new HashSet<int>(info.Versions.Select(v => v.Version));
+            known.UnionWith(retired.Select(v => v.Version));
+            await catalogs_.ReconcileAsync(account.Id, container, known, ct);
+
+            if (await TryOpenAsync(catalogs_, account.Id, container, ct) is { } catalog)
+            {
+                await using (catalog)
+                    candidates = await CandidatesAsync(catalog, toDelete, ct);
+            }
+        }
+
+        // Now the second-level indexes of the retired versions. Best-effort per volume:
         // everything here is already unreferenced by the committed info file, so a failed delete is an orphan
         // for a later sweep, never a lie — and one stubborn blob (a stray lease, a transient 5xx past the
         // retries) must not abort the rest of the cleanup.
@@ -183,49 +256,6 @@ public sealed class RetentionCleaner(
                     _ = ex;
                 }
             }
-            if (indexCache is not null)
-                await indexCache.RemoveAsync(account.Id, container, v.Version, ct);
-        }
-
-        // Collect the data blobs and packs the remaining versions still reference, plus the still-live members of each pack (for dead-weight compaction).
-        //
-        // This section **reads one index per retained version**, and the orphan sweep cannot do without it: without
-        // knowing what the retained versions reference there is no way to judge whether a listed object is an orphan.
-        // But be honest about the cost — what is read is the locally authoritative copy (ILocalIndexCache, zero cloud
-        // traffic), except SQLite stores serialized bytes, so even a hit has to rebuild the whole index back into
-        // objects: measured in this repo, a 500,000-entry index costs about 0.9 s / 350 MB of allocation per read,
-        // while the in-process LRU above it (VersionIndexMemoryCache) holds only 2 by default. So a large backup
-        // keeping a dozen-odd versions pays a dozen-odd seconds of CPU plus several GB of transient allocation for one nightly "standalone cleanup" — that is the real price of sweeping for orphans every night.
-        var referencedBlobs = new HashSet<string>(StringComparer.Ordinal);
-        var referencedPacks = new HashSet<string>(StringComparer.Ordinal);
-        var liveByPack = new Dictionary<string, Dictionary<string, LivePackMember>>(StringComparer.Ordinal);
-        foreach (var v in info.Versions)
-        {
-            var vi = indexCache is not null
-                ? await indexCache.ReadAsync(account, container, v.Version, identity, v.IndexBlob, password, v.IndexVolumes, ct)
-                : await store.ReadIndexAsync(account, container, v.IndexBlob, password, v.IndexVolumes, ct);
-            foreach (var e in vi.Entries)
-            {
-                if (e.Storage is null)
-                    continue;
-                if (e.Storage.Kind == "pack")
-                {
-                    referencedPacks.Add(e.Storage.Ref);
-                    if (e.FullHash is not null)
-                    {
-                        var members = liveByPack.TryGetValue(e.Storage.Ref, out var m)
-                            ? m
-                            : liveByPack[e.Storage.Ref] = new Dictionary<string, LivePackMember>(StringComparer.Ordinal);
-                        // Group by entryName (unique within a pack): identical content at different paths dedups to the same fullHash but is still two members, so hash cannot be the key.
-                        var entryName = e.Storage.EntryName ?? e.Path;
-                        members[entryName] = new LivePackMember(entryName, e.Length, e.FullHash);
-                    }
-                }
-                else
-                {
-                    referencedBlobs.Add(e.Storage.Ref);
-                }
-            }
         }
 
         // The other half of the criterion: content referenced by an active journal. It exists in the cloud but not yet
@@ -243,7 +273,7 @@ public sealed class RetentionCleaner(
         await foreach (var blob in container_.GetBlobsAsync(BlobTraits.None, BlobStates.None, "packs/", ct))
         {
             var packId = PackIdOf(blob.Name);
-            if (referencedPacks.Contains(packId) || active.Packs.Contains(packId))
+            if (!candidates.IsDeletablePack(packId) || active.Packs.Contains(packId))
                 continue;
             if ((await WithRetryAsync(t => container_.GetBlobClient(blob.Name).DeleteIfExistsAsync(cancellationToken: t), ct)).Value)
             {
@@ -252,7 +282,7 @@ public sealed class RetentionCleaner(
             }
         }
         var prunedFromInfo = info.Packs.Keys
-            .Where(id => !referencedPacks.Contains(id) && !active.Packs.Contains(id)).ToList();
+            .Where(id => candidates.IsDeletablePack(id) && !active.Packs.Contains(id)).ToList();
         foreach (var packId in prunedFromInfo)
             info.Packs.Remove(packId);
 
@@ -261,7 +291,7 @@ public sealed class RetentionCleaner(
         await foreach (var blob in container_.GetBlobsAsync(BlobTraits.None, BlobStates.None, "data/", ct))
         {
             var baseRef = BaseRef(blob.Name);
-            if (referencedBlobs.Contains(baseRef) || active.Blobs.Contains(baseRef))
+            if (!candidates.IsDeletableBlob(baseRef) || active.Blobs.Contains(baseRef))
                 continue;
             if ((await WithRetryAsync(t => container_.GetBlobClient(blob.Name).DeleteIfExistsAsync(cancellationToken: t), ct)).Value)
             {
@@ -269,6 +299,19 @@ public sealed class RetentionCleaner(
                 freedBytes += blob.Properties.ContentLength ?? 0;
             }
         }
+
+        // The cloud is done with the retired versions, so now — and not a moment earlier — they leave the catalog:
+        // the same "delete in the cloud first, forget locally after" discipline the rest of this file follows, and
+        // the order that keeps the candidate set computable while the deletes are still running.
+        //
+        // A round that dies between the deletes above and this line leaves the catalog remembering versions the info
+        // file (committed long before, at the top) no longer lists. That state is **not** self-healing on its own:
+        // the next round retires nothing, so it never reaches this line, and those rows would go on protecting the
+        // very objects the failed round did not manage to delete. What repairs it is the reconcile before the
+        // candidates are computed — it drops every catalog version the info file does not list, which is exactly
+        // this leftover — so the next cleanup starts from a catalog that agrees with the info file again.
+        foreach (var v in retired)
+            await catalogs_!.RemoveVersionAsync(account.Id, container, v.Version, ct);
 
         // Dead-weight compaction (§6): recompress in place the still-live packs whose dead weight exceeds the
         // threshold. Checked **only when a version really retired** — dead weight is piled up by "a member is no
@@ -279,11 +322,24 @@ public sealed class RetentionCleaner(
         // and the "member missing locally" branch), so the next round's judgement comes out identical. Hung off a
         // nightly scheduled cleanup, that means the same packs get downloaded, recompressed and re-uploaded every
         // night, forever — whereas before this, it happened once after one retirement.
+        //
+        // Its input is read here rather than above because it has to be "what survives": the retired versions left
+        // the catalog a few lines ago, so streaming the live members now needs no filter — and the null-forgiveness
+        // on the catalogs is sound for the same reason the gate is, since a retirement is what got us here.
         if (compactor is not null && toDelete.Count > 0)
+        {
+            // The handle is closed again before compaction starts: compaction downloads, recompresses and re-uploads
+            // whole packs, which can run for minutes, and holding a SQLite connection open across all of it for a
+            // dictionary that was already read would block the container's next writer for no reason.
+            Dictionary<string, Dictionary<string, LivePackMember>> liveByPack;
+            await using (var catalog = await catalogs_!.OpenAsync(account.Id, container, readOnly: true, ct))
+                liveByPack = await LiveByPackAsync(catalog, ct);
+
             await compactor.CompactAsync(
                 account, container_, password, info, liveByPack,
                 options.DataTier, options.VolumeBytes, options.DeadWeightThreshold,
                 options.LocalRoot, options.AllowRepackDownload, ct, lease);
+        }
 
         // The info file is rewritten only when its content really changed. There are only two ways it can change:
         // retirement removed versions, or the orphan sweep dropped packs out of info.Packs (compaction also edits
@@ -312,6 +368,104 @@ public sealed class RetentionCleaner(
         // Dead-weight compaction **rewrites** a pack more tightly, it does not delete, so it is not counted here —
         // reporting it as "deleted N packs" would make the operator think data had been retired.
         return new CleanupReport(toDelete.Count, deletedPacks.Count, deletedBlobs.Count, freedBytes);
+    }
+
+    /// <summary>
+    /// What this round is allowed to delete from the container, as three sets read out of the catalog instead of the
+    /// two that used to be accumulated by walking every retained version's index.
+    /// <para>
+    /// The old criterion — "delete what no retained version references" — quietly answered two questions at once, and
+    /// both are still needed: <see cref="RetiredOnlyBlobs"/>/<see cref="RetiredOnlyPacks"/> are what the retiring
+    /// versions alone referenced, and <see cref="Referenced"/> (every ref any version in the catalog names, of either
+    /// kind) is what tells a genuine orphan — in the container, in nobody's index — from content in use. Asking for
+    /// the first separately is what lets the cloud deletes run <em>before</em> the retired versions leave the
+    /// catalog, which is the order the rest of this codebase deletes in.
+    /// </para>
+    /// </summary>
+    internal sealed record CleanupCandidates(
+        IReadOnlySet<string> RetiredOnlyBlobs, IReadOnlySet<string> RetiredOnlyPacks, IReadOnlySet<string> Referenced)
+    {
+        /// <summary>A container with no version in the info file at all: nothing is referenced, so every object in it
+        /// is an orphan — exactly what the old loop concluded from an empty <c>referencedBlobs</c>.</summary>
+        internal static readonly CleanupCandidates NoVersions = new(
+            new HashSet<string>(StringComparer.Ordinal),
+            new HashSet<string>(StringComparer.Ordinal),
+            new HashSet<string>(StringComparer.Ordinal));
+
+        internal bool IsDeletableBlob(string baseRef) => RetiredOnlyBlobs.Contains(baseRef) || !Referenced.Contains(baseRef);
+
+        internal bool IsDeletablePack(string packId) => RetiredOnlyPacks.Contains(packId) || !Referenced.Contains(packId);
+    }
+
+    /// <summary>
+    /// Opens the container's catalog read-only, or returns null when it does not have one yet. A missing file is not
+    /// an error here: it means no version has ever been imported, which for a cleanup is the same answer as "nothing
+    /// is referenced". Only reachable when every version the info file listed is retiring and not one of their
+    /// indexes could be read, since migrating a retained version creates the file.
+    /// </summary>
+    private static async Task<VersionCatalog?> TryOpenAsync(
+        IVersionCatalogs catalogs, int accountId, string container, CancellationToken ct)
+    {
+        try
+        {
+            return await catalogs.OpenAsync(accountId, container, readOnly: true, ct);
+        }
+        catch (FileNotFoundException)
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// The deletion criterion, read out of the catalog in three queries — no index is deserialized and nothing but
+    /// the ref strings is held in memory.
+    /// <para>
+    /// <see cref="VersionCatalog.RefsOnlyInAsync"/> is asked per storage kind because the two sides of the container
+    /// are compared separately (a pack id and a <c>data/</c> ref are different namespaces, and a pack reference has
+    /// never protected a data blob of the same name). <see cref="VersionCatalog.DistinctRefsAsync"/> deliberately is
+    /// not: for the orphan half "referenced anywhere, as anything" is the safe direction to err in, and the two
+    /// namespaces cannot collide anyway.
+    /// </para>
+    /// <para>Called with the catalog still holding the retiring versions — that is what makes the difference
+    /// computable at all.</para>
+    /// </summary>
+    internal static async Task<CleanupCandidates> CandidatesAsync(
+        VersionCatalog catalog, IReadOnlyCollection<int> retired, CancellationToken ct)
+    {
+        var blobs = new HashSet<string>(await catalog.RefsOnlyInAsync(retired, "blob", ct), StringComparer.Ordinal);
+        var packs = new HashSet<string>(await catalog.RefsOnlyInAsync(retired, "pack", ct), StringComparer.Ordinal);
+        var referenced = new HashSet<string>(StringComparer.Ordinal);
+        // Kind-agnostic on purpose (see the remarks above): the ref alone is what the candidate sets are compared
+        // against. The kind and volume count the query also carries are the orphan sweep's business, not this one's
+        // — a ref recorded under two different volume counts arrives twice and lands in the same set entry.
+        await foreach (var (_, storageRef, _) in catalog.DistinctRefsAsync(ct))
+            referenced.Add(storageRef);
+        return new CleanupCandidates(blobs, packs, referenced);
+    }
+
+    /// <summary>
+    /// The still-live members of every pack, in the nested shape <see cref="DeadWeightCompactor"/> takes: pack id →
+    /// member name → member. Streamed straight out of the catalog, which already resolves "the newest version's copy
+    /// of a member wins" in its ORDER BY, where the old loop got the same result by letting later versions overwrite
+    /// earlier ones in the dictionary.
+    /// <para>Called with only the retained versions left in the catalog: dead weight is measured against what
+    /// survives, so a retired version's members must already be gone.</para>
+    /// </summary>
+    internal static async Task<Dictionary<string, Dictionary<string, LivePackMember>>> LiveByPackAsync(
+        VersionCatalog catalog, CancellationToken ct)
+    {
+        var liveByPack = new Dictionary<string, Dictionary<string, LivePackMember>>(StringComparer.Ordinal);
+        await foreach (var (packId, entryName, length, fullHash) in catalog.LivePackMembersAsync(ct))
+        {
+            // Grouped by entry name (unique within a pack): identical content at different paths dedups to the same
+            // fullHash but is still two members, so hash cannot be the key.
+            var members = liveByPack.TryGetValue(packId, out var m)
+                ? m
+                : liveByPack[packId] = new Dictionary<string, LivePackMember>(StringComparer.Ordinal);
+            members[entryName] = new LivePackMember(entryName, length, fullHash);
+        }
+
+        return liveByPack;
     }
 
     /// <summary>

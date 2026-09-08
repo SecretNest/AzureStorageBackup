@@ -437,8 +437,9 @@ public sealed class BackupPackRetryUnitTests : IDisposable
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             compressor, uploader, factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor,
-                indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
-            new FileHasher(), authority.IndexCache, authority.Tracked,
+                catalogs: authority.Catalogs, trackedInfo: authority.Tracked),
+            new FileHasher(), authority.Catalogs, authority.Tracked,
+            workFactory: TestWorkDbs.New(),
             verboseLog: verboseLog);
         return (orchestrator, factory, store);
     }

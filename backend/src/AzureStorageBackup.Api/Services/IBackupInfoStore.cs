@@ -26,20 +26,27 @@ public interface IBackupInfoStore
     Task<string> WriteInfoConditionalAsync(Account account, string container, BackupInfoFile info, string? password, AccessTier? tier, string? ifMatch, CancellationToken ct = default);
 
     /// <summary>
-    /// Reads the second-level index at the given blob name. <paramref name="volumes"/> comes from
-    /// <see cref="BackupVersion.IndexVolumes"/>; 1 (the default, and what every info file older than format 5 reads
-    /// back) is the single-blob layout.
-    /// </summary>
-    Task<VersionIndex> ReadIndexAsync(Account account, string container, string indexBlob, string? password, int volumes = 1, CancellationToken ct = default);
-
-    /// <summary>
     /// Writes the second-level index of a version and returns its blob name (recorded in the info file's
     /// versions[].indexBlob) together with the number of volumes it was split into (versions[].indexVolumes). An
-    /// empty tier means the default.
+    /// empty tier means the default. The index has already been serialized to <paramref name="serializedPath"/> in
+    /// <see cref="IndexStreamWriter"/> format and goes up from there — encoded file to file, uploaded as ranges of
+    /// that file — so nothing larger than one buffer is ever held in memory.
     /// </summary>
+    /// <param name="serializedPath">A file in <see cref="IndexStreamWriter"/> format. Read, never modified.</param>
     /// <param name="progress">Where the write reports each transfer it makes, when the caller has a screen to put it
     /// on. Every volume goes up once and comes back once for verification (a single-blob index is three transfers:
     /// temp up, verify down, commit up), and each is booked as it completes with its bytes — at a few million
     /// entries the index is hundreds of MB, and this stage used to be minutes of "Writing index" with nothing moving.</param>
-    Task<(string Name, int Volumes)> WriteIndexAsync(Account account, string container, int version, VersionIndex index, string? password, AccessTier? tier = null, CancellationToken ct = default, StageTracker? progress = null);
+    Task<(string Name, int Volumes)> WriteIndexFileAsync(Account account, string container, int version, string serializedPath,
+        string? password, AccessTier? tier = null, CancellationToken ct = default, StageTracker? progress = null);
+
+    /// <summary>
+    /// Reads the second-level index at the given blob name: downloads the volumes, concatenates them, decodes the
+    /// result and leaves the serialized index at <paramref name="destPath"/> (overwriting it) for an
+    /// <see cref="IndexStreamReader"/> to walk one entry at a time. <paramref name="volumes"/> comes from
+    /// <see cref="BackupVersion.IndexVolumes"/>; 1 (the default, and what every info file older than format 5 reads
+    /// back) is the single-blob layout.
+    /// </summary>
+    Task ReadIndexToFileAsync(Account account, string container, string indexBlob, string? password, int volumes, string destPath,
+        CancellationToken ct = default);
 }

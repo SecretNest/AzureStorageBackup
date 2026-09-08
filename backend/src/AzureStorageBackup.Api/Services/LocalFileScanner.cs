@@ -26,12 +26,6 @@ public sealed record ScannedEntry(
 /// </summary>
 public sealed record UnreadablePath(string Path, bool IsDirectory, string Reason);
 
-/// <summary>Scan result: entries + empty directories (which restore has to recreate) + unreadable paths.</summary>
-public sealed record ScanResult(
-    IReadOnlyList<ScannedEntry> Entries,
-    IReadOnlyList<string> EmptyDirs,
-    IReadOnlyList<UnreadablePath> Unreadable);
-
 /// <summary>Scan options.</summary>
 public sealed record ScanOptions
 {
@@ -43,14 +37,21 @@ public sealed record ScanOptions
 }
 
 /// <summary>
-/// Local file scanner: walk the local root, apply the gitignore ignore rules, produce entries (metadata) + empty directories.
-/// symlinks are skipped by default. Hashes are computed lazily by the diff stage.
+/// Local file scanner: walk the local root, apply the gitignore ignore rules, hand each entry (metadata) to a sink,
+/// and record the empty directories and unreadable paths along the way. symlinks are skipped by default. Hashes are
+/// computed lazily by the diff stage.
 /// </summary>
 public sealed class LocalFileScanner
 {
-    public async Task<ScanResult> ScanAsync(
+    /// <summary>
+    /// Walks <paramref name="rootPath"/> and hands every kept entry to <paramref name="sink"/> one at a time, instead
+    /// of building a list proportional to file count — a real run's sink (<see cref="WorkDbScanSink"/>) writes
+    /// straight into the per-run work database, so the whole tree is never resident in memory here.
+    /// </summary>
+    public async Task<ScanSummary> ScanAsync(
         string rootPath,
         IgnoreRuleSet ignore,
+        IScanSink sink,
         ScanOptions? options = null,
         CancellationToken ct = default,
         // Scanning a large directory tree takes minutes on its own, and the UI shows nothing at all for that whole time.
@@ -60,27 +61,30 @@ public sealed class LocalFileScanner
         options ??= new ScanOptions();
         var root = Path.GetFullPath(rootPath);
 
-        var entries = new List<ScannedEntry>();
         var emptyDirs = new List<string>();
         var unreadable = new List<UnreadablePath>();
+        // A single-element array, not a plain local: ScanDirectory is recursive and async, so the count has to be
+        // threaded through as a mutable reference (async methods cannot take ref/out parameters) rather than
+        // returned and summed by hand at every call site.
+        var count = new long[1];
 
-        _ = ScanDirectory(root, root, ignore, options, entries, emptyDirs, unreadable, ct, tracker);
+        await ScanDirectory(root, root, ignore, options, sink, count, emptyDirs, unreadable, ct, tracker);
 
-        entries.Sort((a, b) => string.CompareOrdinal(a.Path, b.Path));
         emptyDirs.Sort(StringComparer.Ordinal);
         unreadable.Sort((a, b) => string.CompareOrdinal(a.Path, b.Path));
-        return await Task.FromResult(new ScanResult(entries, emptyDirs, unreadable));
+        return new ScanSummary(count[0], emptyDirs, unreadable);
     }
 
     /// <returns>Whether this subtree really left anything behind (entries / empty directories / unreadable paths).
     /// The parent directory uses this to decide whether to count itself as having "kept children" — a directory that was
     /// only passed through on the way down to some re-included directory deeper in has left nothing of its own behind, and must never enter EmptyDirs.</returns>
-    private bool ScanDirectory(
+    private async Task<bool> ScanDirectory(
         string dir,
         string root,
         IgnoreRuleSet ignore,
         ScanOptions options,
-        List<ScannedEntry> entries,
+        IScanSink sink,
+        long[] count,
         List<string> emptyDirs,
         List<UnreadablePath> unreadable,
         CancellationToken ct,
@@ -150,7 +154,7 @@ public sealed class LocalFileScanner
 
                 // keptChildren only increments when the subtree **actually** left something behind. Directories merely passed
                 // through don't count — otherwise `- docs` + `+ docs/2026` would record docs as an empty directory and restore would conjure it back out of nowhere.
-                if (ScanDirectory(info.FullName, root, ignore, options, entries, emptyDirs, unreadable, ct, tracker))
+                if (await ScanDirectory(info.FullName, root, ignore, options, sink, count, emptyDirs, unreadable, ct, tracker))
                     keptChildren++;
                 continue;
             }
@@ -160,6 +164,12 @@ public sealed class LocalFileScanner
 
             // A single entry's metadata can be unreadable too (deleted after enumeration, permissions revoked). Silently
             // skipping is just as unacceptable: skipping is the same as telling diff it was deleted. Record one, and let diff carry over the previous version's entry.
+            // Only the metadata reads are inside the try. Handing the entry over is **not**: the sink is now
+            // something that can fail on its own account — the run's work database, whose writer reports a failed
+            // statement as an IOException like any other — and inside the catch that failure would be filed as
+            // "this file could not be read", carrying the previous version's entry forward for a file that is
+            // perfectly readable while the run went on reporting success.
+            ScannedEntry entry;
             try
             {
                 if (isSymlink)
@@ -168,33 +178,40 @@ public sealed class LocalFileScanner
                         continue;
 
                     keptChildren++;
-                    entries.Add(new ScannedEntry(
+                    entry = new ScannedEntry(
                         relative, EntryKind.Symlink, 0,
                         new DateTimeOffset(info.LastWriteTimeUtc),
                         // NOT ReadPermissions: GetUnixFileMode(string) resolves the link, and on a dangling target it
-                    // throws FileNotFoundException — which the unreadable catch swallowed, so the symlink (a
-                    // legitimate piece of content whose target string has nothing to do with the target existing)
-                    // silently never entered the index at all: the worst-direction failure. The checker and the
-                    // compressor both special-case symlinks away from GetUnixFileMode for exactly this reason,
-                    // and the diff compares symlinks by Target alone, never by permissions.
-                    "0777",
-                        Target: info.LinkTarget));
-                    tracker?.Advance(0); // Scanning reads metadata only, never content, so zero bytes
-                    continue;
+                        // throws FileNotFoundException — which the unreadable catch swallowed, so the symlink (a
+                        // legitimate piece of content whose target string has nothing to do with the target existing)
+                        // silently never entered the index at all: the worst-direction failure. The checker and the
+                        // compressor both special-case symlinks away from GetUnixFileMode for exactly this reason,
+                        // and the diff compares symlinks by Target alone, never by permissions.
+                        "0777",
+                        Target: info.LinkTarget);
                 }
-
-                keptChildren++;
-                var file = (FileInfo)info;
-                entries.Add(new ScannedEntry(
-                    relative, EntryKind.File, file.Length,
-                    new DateTimeOffset(file.LastWriteTimeUtc),
-                    ReadPermissions(file.FullName)));
-                tracker?.Advance(0);
+                else
+                {
+                    // keptChildren is incremented **before** the metadata read, and stays there: a directory holding
+                    // one file nobody can stat is not an empty directory, and recording it as one would have restore
+                    // recreate it bare.
+                    keptChildren++;
+                    var file = (FileInfo)info;
+                    entry = new ScannedEntry(
+                        relative, EntryKind.File, file.Length,
+                        new DateTimeOffset(file.LastWriteTimeUtc),
+                        ReadPermissions(file.FullName));
+                }
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
             {
                 unreadable.Add(new UnreadablePath(relative, IsDirectory: false, ex.Message));
+                continue;
             }
+
+            await sink.AddAsync(entry, ct);
+            count[0]++;
+            tracker?.Advance(0); // Scanning reads metadata only, never content, so zero bytes
         }
 
         // Empty directory: after applying ignore and scope, no kept files and no kept subdirectories (the root itself is not recorded).

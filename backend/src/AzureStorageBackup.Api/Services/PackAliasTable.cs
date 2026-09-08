@@ -28,26 +28,20 @@ public sealed record PlannedAlias(
 /// </para>
 /// <para>
 /// Exclusively owned by the single-threaded diff, so no locking — the same constraint as
-/// <c>dirPending</c>/<c>crossPending</c> in the orchestrator.
+/// <c>dirPending</c>/<c>crossPending</c> in the orchestrator, and the same constraint
+/// <see cref="PackLeaderStore"/>'s single connection is under.
 /// </para>
 /// </summary>
-public sealed class PackAliasTable
+public sealed class PackAliasTable(PackLeaderStore leaders)
 {
-    // Four-part content identity → the path that saw this content first. On a first backup every changed
-    // small file takes one row.
-    //
-    // How the estimate was derived (reasoned from object layout, not measured — the rule in this project is
-    // to measure before judging; this is only an order of magnitude):
-    // the key is the string ContentKey builds, shaped like "xxh128:<32 hex>\n<length>\n xxh128:<32 hex>\n xxh128:<32 hex>",
-    // about 124 chars → roughly 272 B per string instance; plus about 40 B for the Dictionary entry itself
-    // (the value is a reference to the leader path, which diff.Changes already holds, so it is not counted
-    // twice), about 312 B per row in total. 200k rows is about 62 MB, 500k rows about 155 MB — diff.Changes
-    // already holds one FileChange per scanned entry, so this table is the **same order of magnitude** as
-    // that existing baseline, not a new order on top of it.
-    private readonly Dictionary<string, string> _leaderByContent = new(StringComparer.Ordinal);
-
     // Leader path → the aliases hanging off it. **Only leaders that actually have aliases get a list**:
     // a first backup has hundreds of thousands of leaders, and an empty List for each wastes tens of MB.
+    //
+    // This is the half of the table that is genuinely bounded by duplicates, and the only half still in memory.
+    // The other half — content key → the path that saw it first — used to be a Dictionary here, one entry for
+    // **every** packed member rather than only for duplicates. Task 23's benchmark caught it: ~56 MB of live
+    // managed heap per 100 000 files, surviving a forced collection. It now lives in PackLeaderStore's per-run
+    // SQLite file.
     private readonly Dictionary<string, List<PlannedAlias>> _aliasesByLeader = new(StringComparer.Ordinal);
 
     /// <summary>Contains only leaders that actually have aliases. The end-of-run backfill walks this.</summary>
@@ -74,7 +68,8 @@ public sealed class PackAliasTable
     /// the comment written when <see cref="LocalDedupResolver.ContentKey"/> was promoted to public).
     /// </para>
     /// </summary>
-    public bool TryClaim(string? fullHash, long length, string? headHash, string? tailHash, string path)
+    public async ValueTask<bool> TryClaimAsync(
+        string? fullHash, long length, string? headHash, string? tailHash, string path, CancellationToken ct)
     {
         // On the production path the caller has already done the three non-null checks with pattern matching
         // (file.FullHash is { } / c.HeadHash is { } / c.TailHash is { }), so what arrives here is always
@@ -84,17 +79,13 @@ public sealed class PackAliasTable
         if (fullHash is null || headHash is null || tailHash is null)
             return false;
 
-        var candidate = new PlannedAlias(path, length, fullHash, headHash, tailHash);
         var key = LocalDedupResolver.ContentKey(fullHash, length, headHash, tailHash);
-        if (_leaderByContent.TryGetValue(key, out var leader))
-        {
-            if (!_aliasesByLeader.TryGetValue(leader, out var list))
-                _aliasesByLeader[leader] = list = [];
-            list.Add(candidate);
-            return true;
-        }
+        if (await leaders.ClaimAsync(key, path, ct).ConfigureAwait(false) is not { } leader)
+            return false;   // this path is the leader now; the caller packs it as usual
 
-        _leaderByContent[key] = candidate.Path;
-        return false;
+        if (!_aliasesByLeader.TryGetValue(leader, out var list))
+            _aliasesByLeader[leader] = list = [];
+        list.Add(new PlannedAlias(path, length, fullHash, headHash, tailHash));
+        return true;
     }
 }

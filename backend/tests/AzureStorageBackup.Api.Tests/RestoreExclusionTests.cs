@@ -176,8 +176,8 @@ public sealed class RestoreExclusionTests(TestWebAppFactory factory) : IClassFix
             return Task.CompletedTask;
         }
         public Task<string> WriteInfoConditionalAsync(Account a, string c, BackupInfoFile i, string? p, AccessTier? t, string? e, CancellationToken ct = default) => Task.FromResult("etag");
-        public Task<VersionIndex> ReadIndexAsync(Account a, string c, string i, string? p, int v = 1, CancellationToken ct = default) => Task.FromResult(new VersionIndex());
-        public Task<(string Name, int Volumes)> WriteIndexAsync(Account a, string c, int v, VersionIndex i, string? p, AccessTier? t = null, CancellationToken ct = default, StageTracker? progress = null) => Task.FromResult(("indexes/v.bin", 1));
+        public Task<(string Name, int Volumes)> WriteIndexFileAsync(Account a, string c, int v, string s, string? p, AccessTier? t = null, CancellationToken ct = default, StageTracker? progress = null) => throw new NotSupportedException();
+        public Task ReadIndexToFileAsync(Account a, string c, string b, string? p, int volumes, string dest, CancellationToken ct = default) => throw new NotSupportedException();
     }
 
     [Fact]
@@ -257,8 +257,11 @@ public sealed class RestoreExclusionTests(TestWebAppFactory factory) : IClassFix
                 busy.RemoveReader(9, "held");
             throw new StopBeforeTheCloud(); // pinned at the first destructive step; nothing network runs
         };
+        // A catalog only so the cleaner is wired the way production wires it: the info write below is still the
+        // first thing this round does, and the catalog is not touched until after it.
         var cleaner = new RetentionCleaner(
-            new BlobClientFactory(TestSecrets.Reader), store, new RetentionEvaluator(), busy: busy);
+            new BlobClientFactory(TestSecrets.Reader), store, new RetentionEvaluator(), busy: busy,
+            catalogs: new TestLocalAuthority(store).Catalogs);
         var account = new Account { Id = 9, Name = "a", BlobEndpoint = "http://127.0.0.1:1", AccountKeyProtected = TestSecrets.Protect("dGVzdGtleQ==") };
 
         Assert.True(busy.TryAcquire(9, "held", "BackingUp"));

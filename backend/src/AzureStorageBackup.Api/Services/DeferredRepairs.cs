@@ -15,6 +15,13 @@ namespace AzureStorageBackup.Api.Services;
 /// addressed, so no future backup would ever re-upload it on its own — diff sees "unchanged", dedup sees
 /// "already in the cloud", and the damage outlives every version that inherits the reference.
 /// </para>
+/// <para>
+/// Asks the catalog rather than loading every version's whole index into memory: <c>UnrecoverableAnyVersionAsync</c>
+/// is the DISTINCT set of marked paths across every retained version (the same question the old in-memory scan
+/// asked by opening one whole index per version), and <c>EntriesAtAsync</c> is a single
+/// chunked lookup for exactly those paths in the latest version — the two queries a repair-sized set of marks
+/// costs, instead of a pass over every entry of every version just to collect the marks.
+/// </para>
 /// </summary>
 public sealed class DeferredRepairs(IServiceScopeFactory scopes, RepairRunner repairs, ILogger<DeferredRepairs>? logger = null)
 {
@@ -42,27 +49,40 @@ public sealed class DeferredRepairs(IServiceScopeFactory scopes, RepairRunner re
                 return;
             var password = sp.GetRequiredService<ISecretReader>().RevealBackupPassword(config);
             var trackedInfo = sp.GetRequiredService<TrackedInfoStore>();
-            var indexCache = sp.GetRequiredService<ILocalIndexCache>();
+            var catalogs = sp.GetRequiredService<IVersionCatalogs>();
             var info = await trackedInfo.LoadAsync(account, config.ContainerName, password, ct);
             if (info is null || info.Versions.Count == 0)
                 return;
 
-            var marked = new HashSet<string>(StringComparer.Ordinal);
-            VersionIndex? latest = null;
+            // A mark can live in any retained version, not just the latest, so every version has to be in the
+            // catalog before the DISTINCT-across-versions query below can see all of them — including a version
+            // nobody has asked the catalog for yet.
+            var identity = info.Backup.CreatedAt.UtcTicks;
             foreach (var v in info.Versions)
-            {
-                var idx = await indexCache.ReadAsync(
-                    account, config.ContainerName, v.Version, info.Backup.CreatedAt.UtcTicks,
-                    v.IndexBlob, password, v.IndexVolumes, ct);
-                foreach (var p in idx.UnrecoverablePaths)
-                    marked.Add(p);
-                if (v.Version == info.Versions[^1].Version)
-                    latest = idx;
-            }
-            if (marked.Count == 0 || latest is null)
-                return;
+                await catalogs.EnsureVersionAsync(account, config.ContainerName, v, identity, password, ct);
 
-            var candidates = HealCandidates(latest, marked, config.LocalRoot);
+            var latest = info.Versions[^1];
+            List<string> candidates;
+            var catalog = await catalogs.OpenAsync(account.Id, config.ContainerName, readOnly: true, ct);
+            try
+            {
+                var marked = new HashSet<string>(StringComparer.Ordinal);
+                await foreach (var p in catalog.UnrecoverableAnyVersionAsync(ct))
+                    marked.Add(p);
+                if (marked.Count == 0)
+                    return;
+
+                var markedEntries = await catalog.EntriesAtAsync(latest.Version, marked, ct);
+                candidates = HealCandidates(markedEntries, config.LocalRoot);
+            }
+            finally
+            {
+                // Closed before RepairRunner.Start: this handle answered exactly the two questions above and
+                // Start schedules the repair onto its own background worker rather than running it inline, so
+                // there is no reason to keep a SQLite connection open across that handoff.
+                await catalog.DisposeAsync();
+            }
+
             if (candidates.Count == 0)
                 return;
 
@@ -76,19 +96,21 @@ public sealed class DeferredRepairs(IServiceScopeFactory scopes, RepairRunner re
     }
 
     /// <summary>
-    /// Which marked paths this backup hands to the deferred repair. The filter is a stat, not a hash — its job is
+    /// Which marked paths this backup hands to the deferred repair, given the latest version's entries at those
+    /// paths (<c>VersionCatalog.EntriesAtAsync</c> — a path marked but absent from the latest version, or never
+    /// marked at all, never appears here in the first place). The filter itself is a stat, not a hash — its job is
     /// convergence, not verification (the repair's own hash gate verifies before anything is uploaded): a path
     /// whose local length matches its recorded length can heal, so it goes; one whose length differs (or is gone,
     /// or escapes the root — the import-oracle rule, as everywhere a cloud path meets the local root) cannot, and
     /// is skipped silently — otherwise every nightly backup would run a repair that re-marks the same unhealable
     /// file and pushes the same notification, forever.
     /// </summary>
-    internal static List<string> HealCandidates(VersionIndex latest, IReadOnlySet<string> marked, string localRoot)
+    internal static List<string> HealCandidates(IReadOnlyList<IndexEntry> markedEntries, string localRoot)
     {
         var candidates = new List<string>();
-        foreach (var e in latest.Entries)
+        foreach (var e in markedEntries)
         {
-            if (!marked.Contains(e.Path) || e.Storage is null || e.FullHash is null)
+            if (e.Storage is null || e.FullHash is null)
                 continue;
             var local = Path.Combine(localRoot, e.Path.Replace('/', Path.DirectorySeparatorChar));
             if (!PathBoundary.IsWithin(localRoot, local))

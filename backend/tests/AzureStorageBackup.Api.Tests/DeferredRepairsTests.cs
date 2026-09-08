@@ -34,14 +34,14 @@ public sealed class DeferredRepairsTests : IDisposable
         File.WriteAllText(Path.Combine(_root, "appended.bin"), "0123456789ABCDEF"); // grew past 10
         // "gone.bin" does not exist locally at all.
 
-        var latest = new VersionIndex
-        {
-            Version = 10,
-            Entries = [Entry("healable.bin", 10), Entry("appended.bin", 10), Entry("gone.bin", 10), Entry("unmarked.bin", 10)],
-        };
-        var marked = new HashSet<string>(StringComparer.Ordinal) { "healable.bin", "appended.bin", "gone.bin", "elsewhere.bin" };
+        // What VersionCatalog.EntriesAtAsync(latest.Version, marked, ct) would hand back: only the latest
+        // version's entries at the marked paths. "unmarked.bin" was never marked, so the catalog query would
+        // never have returned it — it does not appear here either. A path marked but with no entry in the
+        // latest version (renamed away, say) likewise never comes back from that query, so there is nothing to
+        // represent for it here.
+        var markedEntries = new List<IndexEntry> { Entry("healable.bin", 10), Entry("appended.bin", 10), Entry("gone.bin", 10) };
 
-        var candidates = DeferredRepairs.HealCandidates(latest, marked, _root);
+        var candidates = DeferredRepairs.HealCandidates(markedEntries, _root);
 
         Assert.Equal(["healable.bin"], candidates);
     }
@@ -51,9 +51,8 @@ public sealed class DeferredRepairsTests : IDisposable
     [Fact]
     public void An_Escaping_Marked_Path_Is_Never_Statted()
     {
-        var latest = new VersionIndex { Version = 10, Entries = [Entry("../outside.bin", 10)] };
-        var marked = new HashSet<string>(StringComparer.Ordinal) { "../outside.bin" };
+        var markedEntries = new List<IndexEntry> { Entry("../outside.bin", 10) };
 
-        Assert.Empty(DeferredRepairs.HealCandidates(latest, marked, _root));
+        Assert.Empty(DeferredRepairs.HealCandidates(markedEntries, _root));
     }
 }

@@ -27,6 +27,11 @@ public class GracefulSuspendTests : IDisposable
 
     private BackupJournalStore Store() => new(_dir);
 
+    /// <summary>A scratch database for a run that opens its journal. Nothing here reads it back — these cases are
+    /// about the suspend marker — but opening a journal is where the adopted records land, so one has to exist.</summary>
+    private Task<RunWorkDb> WorkAsync() =>
+        new RunWorkDbFactory(Path.Combine(_dir, "work")).CreateAsync(Guid.NewGuid().ToString("N"), default);
+
     [Fact]
     public void No_mark_means_nobody_wrote_one()
     {
@@ -151,8 +156,9 @@ public class GracefulSuspendTests : IDisposable
         using var factory = new TestWebAppFactory();
         var runner = factory.Services.GetRequiredService<BackupRunner>();
         var store = Store();
+        await using var work = await WorkAsync();
         await using var control = new BackupRunControl(store, configId: 7, runId: "run-paused");
-        await control.OpenJournalAsync(1, "c", 0, "/data", "none", DateTimeOffset.UnixEpoch, default);
+        await control.OpenJournalAsync(1, "c", 0, "/data", "none", DateTimeOffset.UnixEpoch, work, default);
         control.Gate.PauseByUser();
 
         // Completion is pre-settled so the shutdown's wait returns at once: what is under test is the reason that
@@ -186,8 +192,9 @@ public class GracefulSuspendTests : IDisposable
         using var factory = new TestWebAppFactory();
         var runner = factory.Services.GetRequiredService<BackupRunner>();
         var store = Store();
+        await using var work = await WorkAsync();
         await using var control = new BackupRunControl(store, configId: 8, runId: "run-going");
-        await control.OpenJournalAsync(1, "c", 0, "/data", "none", DateTimeOffset.UnixEpoch, default);
+        await control.OpenJournalAsync(1, "c", 0, "/data", "none", DateTimeOffset.UnixEpoch, work, default);
 
         var state = new BackupRunState { Status = RunStatus.Running, Control = control };
         state.Completion.TrySetResult();
@@ -726,8 +733,9 @@ public class GracefulSuspendTests : IDisposable
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), uploader, factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor,
-                indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
-            new FileHasher(), authority.IndexCache, authority.Tracked);
+                catalogs: authority.Catalogs, trackedInfo: authority.Tracked),
+            new FileHasher(), authority.Catalogs, authority.Tracked,
+            workFactory: TestWorkDbs.New());
     }
 
     private static BackupRequest Request(Account account, string container, string root) => new()

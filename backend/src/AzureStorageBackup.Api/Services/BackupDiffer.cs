@@ -39,7 +39,7 @@ public sealed record FileChange(
     /// <summary>
     /// Tail hash. The fourth component of content identity, used together with fullHash + length + head for dedup and collision checks.
     /// <para>
-    /// On the single-file blob path it falls out of the compression pass for free (see the orchestrator's tailByPath), so what it is really here
+    /// On the single-file blob path it falls out of the compression pass for free (the run ledger's SetTailAsync), so what it is really here
     /// for is **pack members** — they used to have none of it, so they could only dedup on three components. Since the criterion is four components
     /// everywhere else, it should be four here too; the two paths should not each have their own standard.
     /// </para>
@@ -57,73 +57,152 @@ public sealed record DiffOptions
     public int HeadHashBytes { get; init; } = 4096;
 }
 
-/// <summary>Diff summary. ChangedFiles/ChangedBytes count Added+Modified only (uncompressed, before grouping; deletions/metadata-only excluded, §4).</summary>
-public sealed record DiffResult(
-    IReadOnlyList<FileChange> Changes,
-    int ChangedFiles,
-    long ChangedBytes);
+/// <summary>
+/// What a diff adds up to: it hands back no list of changes at all, only these three numbers — every change it made
+/// went out through the callback as it was decided. ChangedFiles/ChangedBytes count
+/// Added+Modified only (uncompressed, before grouping; deletions/metadata-only excluded, §4); Emitted is how many
+/// changes went through the callback, which is the only remaining way for a caller to know the diff really covered
+/// everything it was given.
+/// </summary>
+public sealed record DiffTotals(int ChangedFiles, long ChangedBytes, int Emitted);
 
 /// <summary>
 /// Version comparison engine (M4 design §4.2): lazy two-level hashing.
 /// Decide on length+mtime+permissions first; only files with "same length but changed mtime/permissions" get a headHash,
 /// and only if that differs is fullHash computed. Avoids re-reading every file on every backup.
+/// <para>
+/// The comparison is a **merge of two path-ordered cursors**: the scan on one side, the previous version's index on the
+/// other, walked in lockstep. It used to load the whole previous index into a dictionary, keep a set of every path seen
+/// and return a list of every change — three structures that each grew with the file count, which is what put a
+/// multi-million-file backup into the swap. The merge holds one entry from each side and pushes every change straight
+/// out through the callback instead.
+/// </para>
 /// </summary>
 public sealed class BackupDiffer(IFileHasher hasher)
 {
-    public async Task<DiffResult> DiffAsync(
+    /// <summary>
+    /// Compares the scan against the previous version, delivering every change to <paramref name="onChange"/> as it is
+    /// decided and returning only the totals.
+    /// <para>
+    /// Both cursors **must** be in <see cref="string.CompareOrdinal(string, string)"/> path order. Neither side
+    /// orders by the path text: the scan cursor reads the work database by <c>path_key</c> and the catalog reads its
+    /// entries by <c>path_key</c> too, both of which are the path's UTF-16 big-endian bytes, whose byte order *is*
+    /// ordinal order (the two part company at the first surrogate pair — see the remarks on <see cref="RunWorkDb"/>).
+    /// So this costs the callers nothing, and it is what lets the diff run in constant memory. A cursor that breaks
+    /// it is refused by name rather than diffed wrongly.
+    /// </para>
+    /// </summary>
+    /// <param name="current">The scanned entries, in ordinal path order.</param>
+    /// <param name="previous">The previous version's entries, in ordinal path order; null on a first run.</param>
+    /// <param name="unreadable">What the scan could not read, from the scan summary.</param>
+    /// <param name="tracker">
+    /// On a first backup this step reads every file end to end to hash it, which can run for hours. Without it the UI is
+    /// a 0% that never moves, and the user has no way to tell whether it is working or hung.
+    /// </param>
+    /// <param name="onChange">
+    /// Invoked once per change, and it is now the **only** way out: the caller sees the scanned entries in scan order as
+    /// they are classified (so the orchestrator can push settled work to the compress/upload side while the diff is
+    /// still running — a first backup's diff takes hours, and during those hours not one byte used to go over the
+    /// network), followed by the Unreadable entries the unreadable pass synthesizes. Deletions arrive in between, as
+    /// soon as the previous cursor passes a path over.
+    /// </param>
+    /// <param name="fullHashDeferred">
+    /// Which entries may skip computing the full-content hash here (the orchestrator passes "everything classified as a
+    /// single-file blob"). On that path the hash falls out of the compression read for free and then overwrites the
+    /// value recorded here — having the diff read it too means reading every large file end to end twice. For a 100 GB
+    /// file, that saves a full 100 GB of reads. Only applies to classifications that are "already known to have
+    /// changed" (Added, and Modified due to a length change); the two-level hashing path for "same length, changed
+    /// mtime" is **unaffected** — the fullHash there is exactly what decides whether it is MetadataOnly or a real
+    /// Modified, and skipping it would re-upload every unchanged file.
+    /// </param>
+    public async Task<DiffTotals> DiffAsync(
         string rootPath,
-        ScanResult current,
-        VersionIndex? previous,
-        DiffOptions? options = null,
-        CancellationToken ct = default,
-        // On a first backup this step reads every file end to end to hash it, which can run for hours. Without it the UI is
-        // a 0% that never moves, and the user has no way to tell whether it is working or hung.
-        StageTracker? tracker = null,
-        // Invoked once per **scanned** entry as soon as it is classified, in scan order (= ordinal path order).
-        // The orchestrator uses this to push settled work to the compress/upload side while the diff is still running instead of waiting
-        // for the whole diff — a first backup's diff takes hours, and during those hours not one byte was going over the network.
-        // The Unreadable/Deleted entries synthesized at the end are not reported: they produce nothing to upload.
-        Func<FileChange, CancellationToken, Task>? onChange = null,
-        // Which paths may skip computing the full-content hash here (the orchestrator passes "everything classified as a single-file blob").
-        // On that path the hash falls out of the compression read for free and then overwrites the value recorded here — having the diff read it
-        // too means reading every large file end to end twice. For a 100 GB file, that saves a full 100 GB of reads.
-        // Only applies to classifications that are "already known to have changed" (Added, and Modified due to a length change);
-        // the two-level hashing path for "same length, changed mtime" is **unaffected** — the fullHash there is exactly what decides
-        // whether it is MetadataOnly or a real Modified, and skipping it would re-upload every unchanged file.
-        Func<string, bool>? fullHashDeferred = null)
+        IAsyncEnumerable<ScannedEntry> current,
+        IAsyncEnumerable<IndexEntry>? previous,
+        IReadOnlyList<UnreadablePath> unreadable,
+        DiffOptions? options,
+        CancellationToken ct,
+        StageTracker? tracker,
+        Func<FileChange, CancellationToken, Task> onChange,
+        Func<ScannedEntry, bool>? fullHashDeferred)
     {
         options ??= new DiffOptions();
         var root = Path.GetFullPath(rootPath);
-        var prevByPath = (previous?.Entries ?? []).ToDictionary(e => e.Path, StringComparer.Ordinal);
-        var seen = new HashSet<string>(StringComparer.Ordinal);
 
-        var changes = new List<FileChange>();
+        var unreadableDirs = new List<string>();
+        var unreadableFiles = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var u in unreadable)
+        {
+            if (u.IsDirectory)
+                unreadableDirs.Add(u.Path);
+            else
+                unreadableFiles.Add(u.Path);
+        }
+
+        // The one structure in here that is not O(1): previous-version entries the scan did not have **and** that lie
+        // under something the scan reported unreadable. They cannot be settled on the spot — a previous entry under an
+        // unreadable directory becomes Unreadable, not Deleted, and that verdict is only reachable once the merge is
+        // done — so they wait here. It is bounded by the size of the unreadable subtrees: empty on a healthy run, and
+        // at its worst (an unreadable root) the whole previous index, which is precisely what the old implementation
+        // held unconditionally on *every* run. So this is strictly smaller than what it replaces.
+        var parkedUnderUnreadable = new List<IndexEntry>();
+        // Both bounded by unreadable.Count — a handful of paths on any run worth finishing.
+        var emittedUnreadable = new HashSet<string>(StringComparer.Ordinal);
+        var scannedUnreadableFiles = new HashSet<string>(StringComparer.Ordinal);
+
         var changedFiles = 0;
         long changedBytes = 0;
+        var emitted = 0;
 
-        foreach (var entry in current.Entries)
+        var currentOrder = new AscendingPaths("scan");
+        var previousOrder = new AscendingPaths("previous version");
+
+        await using var cur = current.GetAsyncEnumerator(ct);
+        await using var prev = previous?.GetAsyncEnumerator(ct);
+
+        var haveCur = await NextCurrentAsync();
+        var havePrev = await NextPreviousAsync();
+
+        while (haveCur)
         {
             ct.ThrowIfCancellationRequested();
-            seen.Add(entry.Path);
+            var entry = cur.Current;
             // Publish the current path **before** processing it: when things hang, "which file is it stuck on" is exactly what you need to know.
             tracker?.Touch(entry.Path);
 
+            // The scanner never emits an entry for a path it also reports unreadable, but the unreadable pass below
+            // would synthesize a second, content-less change for it if it ever did, and that entry would overwrite the
+            // real one's storage in the index. Remembering the overlap costs a set bounded by unreadable.Count.
+            if (unreadableFiles.Contains(entry.Path))
+                scannedUnreadableFiles.Add(entry.Path);
+
+            // Everything in the previous version that sorts before this entry is gone from the scan.
+            while (havePrev && string.CompareOrdinal(prev!.Current.Path, entry.Path) < 0)
+            {
+                await PassedOverAsync(prev.Current);
+                havePrev = await NextPreviousAsync();
+            }
+
+            IndexEntry? match = null;
+            if (havePrev && string.CompareOrdinal(prev!.Current.Path, entry.Path) == 0)
+            {
+                match = prev.Current;
+                havePrev = await NextPreviousAsync();
+            }
+
             var full = Path.Combine(root, entry.Path.Replace('/', Path.DirectorySeparatorChar));
             var kind = entry.Kind == EntryKind.File ? "file" : "symlink";
-            prevByPath.TryGetValue(entry.Path, out var prev);
-
-            var deferFull = fullHashDeferred?.Invoke(entry.Path) ?? false;
-            var change = prev is null
+            var deferFull = fullHashDeferred?.Invoke(entry) ?? false;
+            var change = match is null
                 ? await AddedAsync(entry, full, options, deferFull, tracker, ct)
-                : await CompareAsync(entry, prev, full, kind, options, deferFull, tracker, ct);
+                : await CompareAsync(entry, match, full, kind, options, deferFull, tracker, ct);
 
-            changes.Add(change);
             if (change.Kind is ChangeKind.Added or ChangeKind.Modified)
             {
                 changedFiles++;
                 changedBytes += entry.Length;
             }
-            // The byte ledger is fed by the read itself now (TrackedIdentityAsync's increments), not here:
+            // The byte ledger is fed by the read itself (TrackedIdentityAsync's increments), not here:
             // only classifications that actually read content report, chunk by chunk, so unchanged files and
             // deferred full hashes still contribute nothing (counting a 100 GB deferred file in full would
             // spike the speed to tens of GB/s and turn the remaining time into a joke — pinned by
@@ -131,50 +210,111 @@ public sealed class BackupDiffer(IFileHasher hasher)
             // while it runs instead of landing as one lump at the end. Advance only counts the entry.
             tracker?.Advance(0);
 
-            if (onChange is not null)
-                await onChange(change, ct);
+            await EmitAsync(change);
+            haveCur = await NextCurrentAsync();
         }
 
-        // Paths that were already unreadable during the scan must be registered in seen before the "classify as deleted" pass.
-        // For a directory whose contents cannot be listed, its **entire subtree** went unscanned — without registering them, the loop below
-        // would classify every one of those existing entries as deleted, i.e. one permission failure would wipe a whole subtree out of the index
-        // and nobody would notice until a restore came up short. Unreadable ≠ deleted, and this is the most critical place that rule applies.
-        foreach (var u in current.Unreadable)
+        // Whatever is left on the previous cursor is past the end of the scan.
+        while (havePrev)
         {
-            foreach (var prev in PreviousEntriesUnder(prevByPath, u))
+            ct.ThrowIfCancellationRequested();
+            await PassedOverAsync(prev!.Current);
+            havePrev = await NextPreviousAsync();
+        }
+
+        // Paths that were already unreadable during the scan are classified last, from the parked list.
+        // For a directory whose contents cannot be listed, its **entire subtree** went unscanned — without this pass
+        // every one of those existing entries would be classified as deleted, i.e. one permission failure would wipe a
+        // whole subtree out of the index and nobody would notice until a restore came up short. Unreadable ≠ deleted,
+        // and this is the most critical place that rule applies.
+        // Both loops are O(unreadable.Count × parked.Count): the first factor is a handful of paths, and the second is
+        // zero unless one of them was a directory that actually covered something.
+        foreach (var u in unreadable)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            if (u.IsDirectory)
             {
-                if (seen.Add(prev.Path))
-                    changes.Add(new FileChange(prev.Path, ChangeKind.Unreadable, null, prev, null, null, null, u.Reason));
+                foreach (var p in parkedUnderUnreadable)
+                {
+                    if (PathUnder.IsUnder(u.Path, p.Path) && emittedUnreadable.Add(p.Path))
+                        await EmitAsync(new FileChange(p.Path, ChangeKind.Unreadable, null, p, null, null, null, u.Reason));
+                }
+                continue;
             }
 
-            // An unreadable **file** gets an entry even when the previous version has none (brand new and unreadable from the start):
-            // there is no content to point at so it will not be in the index, but the operator has to know it was not backed up this run.
-            if (!u.IsDirectory && !prevByPath.ContainsKey(u.Path) && seen.Add(u.Path))
-                changes.Add(new FileChange(u.Path, ChangeKind.Unreadable, null, null, null, null, null, u.Reason));
+            var carried = parkedUnderUnreadable.FirstOrDefault(
+                p => string.Equals(p.Path, u.Path, StringComparison.Ordinal));
+            if (carried is not null)
+            {
+                if (emittedUnreadable.Add(carried.Path))
+                    await EmitAsync(new FileChange(carried.Path, ChangeKind.Unreadable, null, carried, null, null, null, u.Reason));
+            }
+            // An unreadable **file** gets an entry even when the previous version has none (brand new and unreadable
+            // from the start): there is no content to point at so it will not be in the index, but the operator has to
+            // know it was not backed up this run.
+            else if (!scannedUnreadableFiles.Contains(u.Path) && emittedUnreadable.Add(u.Path))
+            {
+                await EmitAsync(new FileChange(u.Path, ChangeKind.Unreadable, null, null, null, null, null, u.Reason));
+            }
         }
 
-        foreach (var prev in prevByPath.Values)
+        return new DiffTotals(changedFiles, changedBytes, emitted);
+
+        async ValueTask<bool> NextCurrentAsync()
         {
-            if (!seen.Contains(prev.Path))
-                changes.Add(new FileChange(prev.Path, ChangeKind.Deleted, null, prev, null, null, null));
+            if (!await cur.MoveNextAsync())
+                return false;
+            currentOrder.Require(cur.Current.Path);
+            return true;
         }
 
-        return new DiffResult(changes, changedFiles, changedBytes);
+        async ValueTask<bool> NextPreviousAsync()
+        {
+            if (prev is null || !await prev.MoveNextAsync())
+                return false;
+            previousOrder.Require(prev.Current.Path);
+            return true;
+        }
+
+        // A previous-version entry the scan did not have. It is a deletion unless something the scan could not read
+        // covers it, in which case its real verdict is Unreadable and only the pass after the merge can say so.
+        async Task PassedOverAsync(IndexEntry entry)
+        {
+            if (unreadableFiles.Contains(entry.Path) || unreadableDirs.Exists(d => PathUnder.IsUnder(d, entry.Path)))
+            {
+                parkedUnderUnreadable.Add(entry);
+                return;
+            }
+
+            await EmitAsync(new FileChange(entry.Path, ChangeKind.Deleted, null, entry, null, null, null));
+        }
+
+        async Task EmitAsync(FileChange change)
+        {
+            emitted++;
+            await onChange(change, ct);
+        }
     }
 
-    /// <summary>The previous-version entries covered by an unreadable path: a directory takes its whole subtree, a file takes just itself.</summary>
-    private static IEnumerable<IndexEntry> PreviousEntriesUnder(
-        Dictionary<string, IndexEntry> prevByPath, UnreadablePath unreadable)
+    /// <summary>
+    /// Guards that a cursor really is in ascending ordinal path order. The merge's correctness rests entirely on that
+    /// assumption, and a source that quietly breaks it does not fail — it produces a **wrong diff**: the entries the
+    /// merge walked past come back as an Added/Deleted pair, so a file is re-uploaded and its history is dropped, and
+    /// nothing anywhere says so. One string comparison per entry buys an exception that names the offending path.
+    /// </summary>
+    private sealed class AscendingPaths(string source)
     {
-        if (!unreadable.IsDirectory)
-            return prevByPath.TryGetValue(unreadable.Path, out var one) ? [one] : [];
+        private string? _last;
 
-        // When the root itself is unreadable, Path is "." (what GetRelativePath yields for the root); the entire index then falls under it.
-        if (unreadable.Path is "" or ".")
-            return prevByPath.Values;
-
-        var prefix = unreadable.Path + "/";
-        return prevByPath.Values.Where(e => e.Path.StartsWith(prefix, StringComparison.Ordinal));
+        public void Require(string path)
+        {
+            if (_last is not null && string.CompareOrdinal(path, _last) <= 0)
+                throw new InvalidOperationException(
+                    $"The {source} cursor is not in ascending ordinal path order: '{path}' came after '{_last}'. " +
+                    "The diff walks the scan and the previous version in lockstep and cannot recover from a mis-ordered source.");
+            _last = path;
+        }
     }
 
     private async Task<FileChange> CompareAsync(
@@ -329,7 +469,7 @@ public sealed class BackupDiffer(IFileHasher hasher)
     /// </para>
     /// <para>
     /// When the full hash is deferred (single-file blob) only the head is computed — **the tail is not computed here**: on that path all three
-    /// hash segments fall out of the compression pass for free and overwrite the values from here (see the orchestrator's tailByPath and
+    /// hash segments fall out of the compression pass for free and overwrite the values from here (see the run ledger's SetTailAsync and
     /// StreamAndStageAsync), so computing it here is a wasted read. The head is still computed; it also answers "can this file be opened right now",
     /// so an unreadable file is classified Unreadable here (carrying the old entry forward) instead of falling over inside compression hours later.
     /// </para>

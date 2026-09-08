@@ -45,7 +45,7 @@ public static class BackupConfigEndpoints
         });
 
         // Import an existing backup: read the container's info file to rebuild the config, seed the local authoritative state, and pull every version index into the local cache (roadmap, PRD 1.5, §3.3)
-        group.MapPost("/import", async (ImportRequest req, IAccountService accounts, TrackedInfoStore trackedInfo, IBackupConfigService svc, ILocalIndexCache indexCache, IEncryptionService encryption, IKeyringHealth keyring, IOperationLog log, IGlobalSettingsService settingsSvc, CheckRunner checkRunner, BackupBusyTracker busy, CancellationToken ct) =>
+        group.MapPost("/import", async (ImportRequest req, IAccountService accounts, TrackedInfoStore trackedInfo, IBackupConfigService svc, IVersionCatalogs catalogs, IEncryptionService encryption, IKeyringHealth keyring, IOperationLog log, IGlobalSettingsService settingsSvc, CheckRunner checkRunner, BackupBusyTracker busy, CancellationToken ct) =>
         {
             var account = await accounts.GetAsync(req.AccountId, ct);
             if (account is null)
@@ -135,7 +135,7 @@ public static class BackupConfigEndpoints
                     ct);
             }
 
-            // Download every version index into the local cache (version files are metadata and never in Archive): from now on
+            // Pull every version index into the local catalog (version files are metadata and never in Archive): from now on
             // backup/cleanup/restore all read this local copy and never ask the cloud again — after an import there is no such thing as "no local authority".
             //
             // A version whose index cannot be read **does not abort the whole import**: only that one version is broken, the rest of them
@@ -147,7 +147,7 @@ public static class BackupConfigEndpoints
             {
                 try
                 {
-                    await indexCache.ReadAsync(account, req.ContainerName, v.Version, identity, v.IndexBlob, req.Password, v.IndexVolumes, ct);
+                    await catalogs.EnsureVersionAsync(account, req.ContainerName, v, identity, req.Password, ct);
                 }
                 catch (Exception ex) when (ex is not OperationCanceledException)
                 {
@@ -273,7 +273,7 @@ public static class BackupConfigEndpoints
 
         // deleteContainer=true (default false): delete the whole cloud container along with it (irreversible, §4.3). Delete the cloud side first, then the local config,
         // so a failed cloud deletion does not leave the local record already gone with no way for the user to retry.
-        group.MapDelete("/{id:int}", async (int id, bool? deleteContainer, IBackupConfigService svc, IAccountService accounts, IContainerService containers, IOperationLog log, ILocalIndexCache indexCache, ILocalBackupStateStore localState, BackupJournalStore journals, IKeyringHealth keyring, KeyringRecovery recovery, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, CheckRunner checkRunner, BackupBusyTracker busy, ILoggerFactory loggerFactory, CancellationToken ct) =>
+        group.MapDelete("/{id:int}", async (int id, bool? deleteContainer, IBackupConfigService svc, IAccountService accounts, IContainerService containers, IOperationLog log, IVersionCatalogs catalogs, ILocalBackupStateStore localState, BackupJournalStore journals, IKeyringHealth keyring, KeyringRecovery recovery, BackupRunner backupRunner, RestoreRunner restoreRunner, RepairRunner repairRunner, CheckRunner checkRunner, BackupBusyTracker busy, ILoggerFactory loggerFactory, CancellationToken ct) =>
         {
             var config = await svc.GetAsync(id, ct);
             if (config is null)
@@ -330,8 +330,8 @@ public static class BackupConfigEndpoints
                         () => log.DeleteForContainerAsync(accountId, container, ct)); // delete the audit logs along with it (PRD 3.6)
                     // Purge the local authoritative cache/state along with it (local-authority principle, design §3.3): otherwise rebuilding a backup on the same
                     // account+container hits orphan CachedVersionIndex/LocalBackupState rows whose version identity does not match the new backup.
-                    await BestEffort(logger, "evict local index cache",
-                        () => indexCache.RemoveForContainerAsync(accountId, container, ct));
+                    await BestEffort(logger, "discard the version catalog",
+                        () => catalogs.RemoveContainerAsync(accountId, container, ct));
                     await BestEffort(logger, "remove local backup state",
                         () => localState.RemoveAsync(accountId, container, ct));
 
@@ -501,7 +501,7 @@ public static class BackupConfigEndpoints
         });
 
         // Which versions a given path can be restored from (versions that contain the path, have storage, and are not marked unrecoverable, ordered nearest-first), for per-file substitution during restore.
-        group.MapGet("/{id:int}/file-versions", async (int id, string path, IBackupConfigService svc, IAccountService accounts, ILocalIndexCache indexCache, TrackedInfoStore trackedInfo, ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
+        group.MapGet("/{id:int}/file-versions", async (int id, string path, IBackupConfigService svc, IAccountService accounts, IVersionCatalogs catalogs, TrackedInfoStore trackedInfo, ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
 
@@ -515,19 +515,21 @@ public static class BackupConfigEndpoints
             var password = secrets.RevealBackupPassword(config);
             var info = await trackedInfo.LoadAsync(account, config.ContainerName, password, ct);
             var candidates = new List<object>();
-            // Local authoritative cache first (same as /tree). It matters especially here: the loop reads **one index per version**,
-            // so reading straight from the cloud means downloading N index blobs on every click of "pick a substitute version" — on top of the
-            // latency that is real Azure egress traffic charges, while an authoritative copy is sitting right here locally.
+            // Local authority first (same as /tree). It matters especially here: the loop asks **once per version**, so reading
+            // straight from the cloud means downloading N index blobs on every click of "pick a substitute version" — on top of the
+            // latency that is real Azure egress traffic charges, while an authoritative copy is sitting right here locally. And it
+            // asks the catalog two bounded questions per version rather than materializing each one, so a backup of a million files
+            // costs the same as a backup of ten.
             var fvIdentity = info?.Backup.CreatedAt.UtcTicks ?? 0;
             foreach (var v in (info?.Versions ?? []).OrderByDescending(v => v.Version))
             {
-                var idx = await ReadIndexOrGoneAsync(indexCache, account, config.ContainerName, v, fvIdentity, password, ct);
-                if (idx is null)
+                await using var catalog = await OpenVersionOrGoneAsync(catalogs, account, config.ContainerName, v, fvIdentity, password, ct);
+                if (catalog is null)
                     continue; // retired between the info load and now — not a substitution candidate anymore
-                if (idx.UnrecoverablePaths.Contains(path))
+                if (await catalog.IsUnrecoverableAsync(v.Version, path, ct))
                     continue;
-                var e = idx.Entries.FirstOrDefault(x => x.Path == path && x.Storage is not null);
-                if (e is not null)
+                var e = await catalog.GetEntryAsync(v.Version, path, ct);
+                if (e is { Storage: not null })
                     candidates.Add(new { v.Version, v.CreatedAt, length = e.Length });
             }
             return Results.Ok(candidates);
@@ -538,7 +540,7 @@ public static class BackupConfigEndpoints
         // every problem file is 100 GB. Hashing belongs inside the repair the user then confirms; it must never
         // run before consent, because whatever it answers, the user has not yet agreed to act on it.
         group.MapGet("/{id:int}/repair-plan", async (int id, int? version,
-            IBackupConfigService svc, IAccountService accounts, TrackedInfoStore trackedInfo, ILocalIndexCache indexCache,
+            IBackupConfigService svc, IAccountService accounts, TrackedInfoStore trackedInfo, IVersionCatalogs catalogs,
             ISecretReader secrets, CheckRunner checks, IKeyringHealth keyring, PathBoundary boundary, CancellationToken ct) =>
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
@@ -560,10 +562,13 @@ public static class BackupConfigEndpoints
             var ver = info?.Versions.FirstOrDefault(x => x.Version == report.Version);
             if (info is null || ver is null)
                 return Results.NotFound();
-            var idx = await ReadIndexOrGoneAsync(indexCache, account, config.ContainerName, ver, info.Backup.CreatedAt.UtcTicks, password, ct);
-            if (idx is null)
+            await using var catalog = await OpenVersionOrGoneAsync(catalogs, account, config.ContainerName, ver, info.Backup.CreatedAt.UtcTicks, password, ct);
+            if (catalog is null)
                 return Results.NotFound();
-            var entries = idx.Entries.ToDictionary(e => e.Path, StringComparer.Ordinal);
+            // Only the paths the check flagged: pricing six problem files must not cost a read of every entry in the version.
+            var badPaths = report.Findings.Where(x => x.Cloud == CloudState.MissingOrBad).Select(x => x.Path).ToList();
+            var entries = (await catalog.EntriesAtAsync(ver.Version, badPaths, ct))
+                .ToDictionary(e => e.Path, StringComparer.Ordinal);
 
             long UploadBytesOf(StorageRef s) =>
                 s.Kind == "pack"
@@ -620,7 +625,7 @@ public static class BackupConfigEndpoints
         // of proportion. The length is compared first: an appended file answers "changed" without reading a byte,
         // which matters when the file in question is 100 GB. Only a same-length file pays for a full read.
         group.MapGet("/{id:int}/hash-file", async (int id, int? version, string path,
-            IBackupConfigService svc, IAccountService accounts, TrackedInfoStore trackedInfo, ILocalIndexCache indexCache,
+            IBackupConfigService svc, IAccountService accounts, TrackedInfoStore trackedInfo, IVersionCatalogs catalogs,
             ISecretReader secrets, IFileHasher hasher, IKeyringHealth keyring, PathBoundary boundary, CancellationToken ct) =>
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
@@ -640,10 +645,10 @@ public static class BackupConfigEndpoints
                 : info?.Versions.Count > 0 ? info.Versions[^1] : null;
             if (info is null || ver is null)
                 return Results.NotFound();
-            var idx = await ReadIndexOrGoneAsync(indexCache, account, config.ContainerName, ver, info.Backup.CreatedAt.UtcTicks, password, ct);
-            if (idx is null)
+            await using var catalog = await OpenVersionOrGoneAsync(catalogs, account, config.ContainerName, ver, info.Backup.CreatedAt.UtcTicks, password, ct);
+            if (catalog is null)
                 return Results.NotFound();
-            var entry = idx.Entries.FirstOrDefault(e => e.Path == path);
+            var entry = await catalog.GetEntryAsync(ver.Version, path, ct);
             if (entry is null)
                 return Results.NotFound();
 
@@ -676,7 +681,7 @@ public static class BackupConfigEndpoints
         });
 
         // The file paths marked unrecoverable in a given version (drives per-file substitution during restore).
-        group.MapGet("/{id:int}/unrecoverable", async (int id, int? version, IBackupConfigService svc, IAccountService accounts, ILocalIndexCache indexCache, TrackedInfoStore trackedInfo, ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
+        group.MapGet("/{id:int}/unrecoverable", async (int id, int? version, IBackupConfigService svc, IAccountService accounts, IVersionCatalogs catalogs, TrackedInfoStore trackedInfo, ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
 
@@ -694,16 +699,16 @@ public static class BackupConfigEndpoints
             var ver = version is { } vv ? info.Versions.FirstOrDefault(x => x.Version == vv) : info.Versions[^1];
             if (ver is null)
                 return Results.Ok(Array.Empty<string>());
-            var idx = await ReadIndexOrGoneAsync(indexCache, account, config.ContainerName, ver, info.Backup.CreatedAt.UtcTicks, password, ct);
-            if (idx is null)
+            await using var catalog = await OpenVersionOrGoneAsync(catalogs, account, config.ContainerName, ver, info.Backup.CreatedAt.UtcTicks, password, ct);
+            if (catalog is null)
                 return Results.Ok(Array.Empty<string>());
-            return Results.Ok(idx.UnrecoverablePaths);
+            return Results.Ok(await catalog.UnrecoverableAsync(ver.Version, ct));
         });
 
         // Files in a version whose content was **carried over**: on those backup runs the source file could not be opened, so the index reused an entry from an earlier version.
         // Symmetric with /unrecoverable but different in meaning: there the data is corrupt and there is no content to give; here the content is valid, just old.
         // The user needs to know this before restoring — otherwise they restore this version and unknowingly get content from an earlier point in time.
-        group.MapGet("/{id:int}/unreadable", async (int id, int? version, IBackupConfigService svc, IAccountService accounts, ILocalIndexCache indexCache, TrackedInfoStore trackedInfo, ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
+        group.MapGet("/{id:int}/unreadable", async (int id, int? version, IBackupConfigService svc, IAccountService accounts, IVersionCatalogs catalogs, TrackedInfoStore trackedInfo, ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
 
@@ -721,19 +726,20 @@ public static class BackupConfigEndpoints
             var ver = version is { } vv ? info.Versions.FirstOrDefault(x => x.Version == vv) : info.Versions[^1];
             if (ver is null)
                 return Results.Ok(Array.Empty<object>());
-            var idx = await ReadIndexOrGoneAsync(indexCache, account, config.ContainerName, ver, info.Backup.CreatedAt.UtcTicks, password, ct);
-            if (idx is null)
+            await using var catalog = await OpenVersionOrGoneAsync(catalogs, account, config.ContainerName, ver, info.Backup.CreatedAt.UtcTicks, password, ct);
+            if (catalog is null)
                 return Results.Ok(Array.Empty<object>());
-            return Results.Ok(idx.Entries
-                .Where(e => e.UnreadableAt is not null)
-                .Select(e => new { path = e.Path, unreadableAt = e.UnreadableAt })
+            // An indexed lookup, not a filter over every entry: the carried-over paths are their own column.
+            return Results.Ok((await catalog.UnreadableAsync(ver.Version, ct))
+                .Select(row => new { path = row.Path, unreadableAt = row.UnreadableAt })
                 .ToList());
         });
 
         // Lazily loaded directory tree for restore (§4.1a, decision 1): returns the direct children (subdirectories + files) of the path directory so the frontend can expand level by level
-        // instead of pulling the whole tree at once. The data source is the version index, local authoritative cache first, falling back to the cloud only when it is missing or the identity does not match (handled inside ILocalIndexCache.ReadAsync).
+        // instead of pulling the whole tree at once. The data source is the container's catalog, which the version is migrated into on
+        // first use from whichever older home still holds it, the cloud last of all (handled inside IVersionCatalogs.EnsureVersionAsync).
         group.MapGet("/{id:int}/tree", async (int id, int? version, string? path,
-            IBackupConfigService svc, IAccountService accounts, TrackedInfoStore trackedInfo, ILocalIndexCache indexCache,
+            IBackupConfigService svc, IAccountService accounts, TrackedInfoStore trackedInfo, IVersionCatalogs catalogs,
             ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
@@ -754,16 +760,17 @@ public static class BackupConfigEndpoints
                 return Results.Ok(Array.Empty<TreeNode>()); // the requested version does not exist → empty result, same as /unrecoverable and /file-versions
 
             var identity = info.Backup.CreatedAt.UtcTicks;
-            var idx = await ReadIndexOrGoneAsync(indexCache, account, config.ContainerName, ver, identity, password, ct);
-            if (idx is null)
+            await using var catalog = await OpenVersionOrGoneAsync(catalogs, account, config.ContainerName, ver, identity, password, ct);
+            if (catalog is null)
                 return Results.Ok(Array.Empty<TreeNode>()); // retired mid-request — same answer as a version that never existed
-            return Results.Ok(VersionTreeService.Children(idx, path));
+            var children = await catalog.ChildrenAsync(ver.Version, VersionTreeService.NormalizePrefix(path), ct);
+            return Results.Ok(VersionTreeService.Children(children, path));
         });
 
         // Restore download/uncompressed volume estimate (§4.1b, requirement A + decision 5): for the selected paths, first compute the download volume purely locally (the total size of the
         // deduplicated storage objects, a shared pack/deduplicated blob counted only once) and the uncompressed volume, then HEAD the first volume of each deduplicated object for its rehydration state (Archive / pending).
         group.MapPost("/{id:int}/restore-estimate", async (int id, RestoreEstimateRequestBody body,
-            IBackupConfigService svc, IAccountService accounts, TrackedInfoStore trackedInfo, ILocalIndexCache indexCache,
+            IBackupConfigService svc, IAccountService accounts, TrackedInfoStore trackedInfo, IVersionCatalogs catalogs,
             IBlobClientFactory factory, IGlobalSettingsService settingsSvc, ISecretReader secrets, IKeyringHealth keyring, CancellationToken ct) =>
         {
             if (KeyringGuard.Blocked(keyring) is { } blocked) return blocked;
@@ -784,14 +791,17 @@ public static class BackupConfigEndpoints
                 return Results.NotFound(new { error = "Version not found." });
 
             var identity = info.Backup.CreatedAt.UtcTicks;
-            var idx = await ReadIndexOrGoneAsync(indexCache, account, config.ContainerName, ver, identity, password, ct);
-            if (idx is null)
+            await using var catalog = await OpenVersionOrGoneAsync(catalogs, account, config.ContainerName, ver, identity, password, ct);
+            if (catalog is null)
                 return Results.NotFound(new { error = "Version not found." }); // retired mid-request
-            var estimate = RestoreEstimator.Compute(idx, info, body.Paths ?? []);
+            var selected = await catalog.EntriesAtAsync(ver.Version, body.Paths ?? [], ct);
+            var estimate = RestoreEstimator.Compute(selected, info);
 
             // First-volume blob name + volume count for each deduplicated storage object (packs use PackInfo.Volumes; blobs use StorageRef.Volumes from the first entry with that Ref).
+            // Built from the selection rather than from the whole version: every key probed below came out of that same list,
+            // so a wider scan could only ever add entries nothing asks about.
             var volumesByKey = new Dictionary<string, int>(StringComparer.Ordinal);
-            foreach (var e in idx.Entries)
+            foreach (var e in selected)
             {
                 if (e.Storage is null) continue;
                 var key = e.Storage.Kind == "pack" ? "pack:" + e.Storage.Ref : "blob:" + e.Storage.Ref;
@@ -1112,17 +1122,17 @@ public static class BackupConfigEndpoints
         // while apply's confirmation semantics are independently identifiable in the log. The same shape already exists in restore-estimate and restore.
         group.MapPost("/{id:int}/local-root/preview", async (
             int id, LocalRootPreviewRequest req, IBackupConfigService svc, IAccountService accounts,
-            ILocalIndexCache indexCache, TrackedInfoStore trackedInfo, ISecretReader secrets,
+            IVersionCatalogs catalogs, TrackedInfoStore trackedInfo, ISecretReader secrets,
             IKeyringHealth keyring, PathBoundary boundary, BackupBusyTracker busy, CancellationToken ct) =>
         {
             var prepared = await PrepareLocalRootAsync(
-                id, req.NewRoot, svc, accounts, indexCache, trackedInfo, secrets, keyring, boundary, busy, ct);
+                id, req.NewRoot, svc, accounts, catalogs, trackedInfo, secrets, keyring, boundary, busy, ct);
             return prepared.Failure ?? Results.Ok(prepared.Preview);
         });
 
         group.MapPost("/{id:int}/local-root", async (
             int id, LocalRootChangeRequest req, IBackupConfigService svc, IAccountService accounts,
-            ILocalIndexCache indexCache, TrackedInfoStore trackedInfo, ISecretReader secrets,
+            IVersionCatalogs catalogs, TrackedInfoStore trackedInfo, ISecretReader secrets,
             IKeyringHealth keyring, PathBoundary boundary, BackupBusyTracker busy, IOperationLog log,
             IGlobalSettingsService settingsSvc, CancellationToken ct) =>
         {
@@ -1144,7 +1154,7 @@ public static class BackupConfigEndpoints
                 // has to be a pure query that is safe to re-enter. The new root being unplugged after the preview, or the backup starting
                 // between the two calls, are both caught by this second pass.
                 var prepared = await PrepareLocalRootAsync(
-                    id, req.NewRoot, svc, accounts, indexCache, trackedInfo, secrets, keyring, boundary, busy, ct,
+                    id, req.NewRoot, svc, accounts, catalogs, trackedInfo, secrets, keyring, boundary, busy, ct,
                     busyHeldByCaller: true);
                 if (prepared.Failure is { } failure)
                     return failure;
@@ -1348,7 +1358,7 @@ public static class BackupConfigEndpoints
     /// </summary>
     private static async Task<PreparedLocalRoot> PrepareLocalRootAsync(
         int id, string newRoot, IBackupConfigService svc, IAccountService accounts,
-        ILocalIndexCache indexCache, TrackedInfoStore trackedInfo, ISecretReader secrets,
+        IVersionCatalogs catalogs, TrackedInfoStore trackedInfo, ISecretReader secrets,
         IKeyringHealth keyring, PathBoundary boundary, BackupBusyTracker busy, CancellationToken ct,
         bool busyHeldByCaller = false)
     {
@@ -1393,7 +1403,7 @@ public static class BackupConfigEndpoints
                 Results.BadRequest(new { error = $"'{newRoot}' cannot be listed: {ex.Message}" }), null, null, null);
         }
 
-        var baseline = await LoadBaselineAsync(config, accounts, indexCache, trackedInfo, secrets, ct);
+        var baseline = await LoadBaselineAsync(config, accounts, catalogs, trackedInfo, secrets, ct);
         if (baseline.Error is { } error)
         {
             // This backup does have history, it is just that this one index cannot be read — it must not fall into the NoBaseline branch of
@@ -1406,26 +1416,29 @@ public static class BackupConfigEndpoints
             return new PreparedLocalRoot(null, config, newRoot, unreadable);
         }
 
-        var preview = LocalRootMigration.Inspect(newRoot, baseline.Index);
+        var preview = LocalRootMigration.Inspect(newRoot, baseline.Sample);
         return new PreparedLocalRoot(null, config, newRoot, preview);
     }
 
     /// <summary>
-    /// The three outcomes of loading the latest version index as a comparison baseline: <c>Index</c> non-null = we got it; both null = there
-    /// genuinely is no baseline (no account / no info file / no versions, which Inspect judges as NoBaseline); <c>Error</c> non-null = there is
-    /// history but the read itself failed — these three must stay apart, and the third must never be treated as the second and let straight through (see the comment on LoadBaselineAsync below).
+    /// The three outcomes of loading a sample of the latest version as a comparison baseline: <c>Sample</c> non-null = we got it (possibly
+    /// empty, which Inspect reads as "nothing comparable in it"); both null = there genuinely is no baseline (no account / no info file / no
+    /// versions, which Inspect judges as NoBaseline); <c>Error</c> non-null = there is history but the read itself failed — these three must stay
+    /// apart, and the third must never be treated as the second and let straight through (see the comment on LoadBaselineAsync below).
     /// </summary>
-    private readonly record struct BaselineLoad(VersionIndex? Index, string? Error);
+    private readonly record struct BaselineLoad(IReadOnlyList<IndexEntry>? Sample, string? Error);
 
     /// <summary>
-    /// Load the latest version's index as a comparison baseline. Goes through the local authoritative cache (the same set of dependencies as /tree and /file-versions).
+    /// Load a stratified sample of the latest version as a comparison baseline — the sample, not the index: the verdict only ever looked at a
+    /// couple of hundred entries, so reading a million of them to throw all but 200 away was pure waste, and the catalog can pick those 200 directly.
+    /// Goes through the local catalog (the same set of dependencies as /tree and /file-versions).
     /// No account / no info file / no versions at all — that is "there really is no baseline", handed to Inspect to judge as NoBaseline.
     /// But a corrupt info file, a password that will not decrypt, or a failed index blob read — that is "there is a baseline but it cannot be read", and it **must not**
     /// be lumped into NoBaseline either: that branch gets let straight through, whereas this is precisely the case that most deserves a second look from the user and requires force
     /// (see Finding 1 for details).
     /// </summary>
     private static async Task<BaselineLoad> LoadBaselineAsync(
-        BackupConfig config, IAccountService accounts, ILocalIndexCache indexCache,
+        BackupConfig config, IAccountService accounts, IVersionCatalogs catalogs,
         TrackedInfoStore trackedInfo, ISecretReader secrets, CancellationToken ct)
     {
         try
@@ -1440,10 +1453,11 @@ public static class BackupConfigEndpoints
             if (info is null || latest is null)
                 return default;
 
-            var index = await indexCache.ReadAsync(
-                account, config.ContainerName, latest.Version,
-                info.Backup.CreatedAt.UtcTicks, latest.IndexBlob, password, latest.IndexVolumes, ct);
-            return new BaselineLoad(index, null);
+            await catalogs.EnsureVersionAsync(
+                account, config.ContainerName, latest, info.Backup.CreatedAt.UtcTicks, password, ct);
+            await using var catalog = await catalogs.OpenAsync(config.AccountId, config.ContainerName, readOnly: true, ct);
+            var sample = await catalog.SampleAsync(latest.Version, LocalRootMigration.DefaultSampleSize, ct);
+            return new BaselineLoad(sample, null);
         }
         // Cancellation is not a "failure", it means the whole request should stop — as always, do not intercept it.
         catch (Exception ex) when (ex is not OperationCanceledException)
@@ -1453,26 +1467,31 @@ public static class BackupConfigEndpoints
     }
 
     /// <summary>
-    /// A version's index read for the metadata-browse endpoints (/tree, /file-versions, /unrecoverable,
-    /// /unreadable, /hash-file, /repair-plan, /restore-estimate). These endpoints read without registering
-    /// as busy-tracker readers — deliberately: a browse must not stand a nightly cleanup down — which means
-    /// retention can retire the very version being browsed mid-request: the info file still listed it when
-    /// this request loaded, and the index blob is gone by the time this read reaches the cloud. That is not
-    /// an internal error, it is a state one refresh old, so the 404 comes back as null and each endpoint
-    /// answers exactly the way it answers a version that never existed. Every other failure still throws.
+    /// The container's catalog, with <paramref name="ver"/> guaranteed to be in it, for the metadata-browse endpoints
+    /// (/tree, /file-versions, /unrecoverable, /unreadable, /hash-file, /repair-plan, /restore-estimate). These endpoints
+    /// read without registering as busy-tracker readers — deliberately: a browse must not stand a nightly cleanup down —
+    /// which means retention can retire the very version being browsed mid-request: the info file still listed it when
+    /// this request loaded, and the index blob is gone by the time the migration reaches the cloud for it. That is not
+    /// an internal error, it is a state one refresh old, so the 404 comes back as null and each endpoint answers exactly
+    /// the way it answers a version that never existed. Every other failure still throws.
+    /// <para>
+    /// The catalog is opened read-only, after the version is in it: a browse must never be the thing that creates or
+    /// rewrites a container's catalog file behind the writer's back.
+    /// </para>
     /// </summary>
-    private static async Task<VersionIndex?> ReadIndexOrGoneAsync(
-        ILocalIndexCache indexCache, Account account, string container, BackupVersion ver, long identityTicks,
+    private static async Task<VersionCatalog?> OpenVersionOrGoneAsync(
+        IVersionCatalogs catalogs, Account account, string container, BackupVersion ver, long identityTicks,
         string? password, CancellationToken ct)
     {
         try
         {
-            return await indexCache.ReadAsync(
-                account, container, ver.Version, identityTicks, ver.IndexBlob, password, ver.IndexVolumes, ct);
+            await catalogs.EnsureVersionAsync(account, container, ver, identityTicks, password, ct);
         }
         catch (RequestFailedException ex) when (ex.Status == 404)
         {
             return null;
         }
+
+        return await catalogs.OpenAsync(account.Id, container, readOnly: true, ct);
     }
 }

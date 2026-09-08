@@ -50,18 +50,23 @@ public sealed class StreamingCheckTests : IDisposable
     private static bool SevenZip() => SevenZipArchiveCodec.TryResolveExecutable() is not null;
     private static string RandomName(string p) => p + Guid.NewGuid().ToString("N")[..8];
 
+    /// <summary>The local-authority wiring the last <see cref="Build"/> handed to both sides, for the tests that
+    /// have to rewrite a version index out of band and let the catalog see it.</summary>
+    private TestLocalAuthority? _authority;
+
     private (BackupOrchestrator Backup, BackupChecker Checker, BlobClientFactory Factory, BackupInfoStore Store) Build()
     {
         var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), () => 200_000_000);
-        var authority = new TestLocalAuthority(store);
+        var authority = _authority = new TestLocalAuthority(store);
         var backup = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked);
+            new RetentionCleaner(factory, store, new RetentionEvaluator(), catalogs: authority.Catalogs, trackedInfo: authority.Tracked), new FileHasher(), authority.Catalogs, authority.Tracked,
+            workFactory: TestWorkDbs.New());
         var checker = new BackupChecker(
-            factory, store, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check"));
+            factory, store, authority.Catalogs, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check"));
         return (backup, checker, factory, store);
     }
 
@@ -200,6 +205,10 @@ public sealed class StreamingCheckTests : IDisposable
             var entry = Assert.Single(index.Entries);
             index.Entries[0] = entry with { FullHash = null, Length = entry.Length + 1 };
             await store.WriteIndexAsync(account, name, version.Version, index, null);
+            // The version index was rewritten out of band. The check reads the version out of the container's
+            // catalog now, so the catalog's copy has to be dropped for the doctored index to be the one it reads:
+            // a version is re-imported on demand, from the cloud.
+            await _authority!.Catalogs.RemoveVersionAsync(account.Id, name, version.Version);
 
             var report = await checker.CheckAsync(
                 account, name, null, null, new CheckOptions { Cloud = CloudCheckLevel.Content });

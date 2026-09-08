@@ -436,6 +436,21 @@ journal is consulted at three points, cheapest first:
    file may have been modified after the interruption.
 3. **`FindPack(members)`** — matched on the member set.
 
+Opening the journal streams its records into the run's own work database
+(`{tempPath}/work/{runId}.db`, see [storage-format.md](storage-format.md)), so the three lookups
+above are indexed queries rather than dictionaries whose size grows with what the interrupted run
+had already uploaded. That database is scratch: it is deleted when the run ends, whichever way it
+ends, **Suspended included**. The journal is the only thing a resume reads back — it is the record
+of what is already in the cloud but not yet in any index, and it lives beside `app.db` precisely so
+that it survives what `/temp` does not.
+
+**A journal outlives the build that wrote it.** Its format, the directory it lives in and the order
+its records are written in are held stable across releases, so a run suspended by one build is
+resumed by the next — and commits the index the interrupted run would have committed, in the same
+entry order, referencing the objects it had already uploaded. What keeps that true is a fixture
+recorded on the previous release and replayed to completion by the suite. [history.md](history.md)
+records what the move to the index catalog had to leave untouched to pass it.
+
 All three tiers — and cross-version dedup behind them — refuse a hit whose ref is damage-marked
 (`IsDamagedRef`): a resume must not adopt a reference to a blob a check condemned, so the item falls
 through to the ordinary compress-and-upload, which heals the family in passing
@@ -446,8 +461,8 @@ through to the ordinary compress-and-upload, which heals the family in passing
 > needed to be sent — and a resume happens after something already went wrong, with the operator
 > watching a progress bar crawl through the whole dataset again before reaching the part that failed.
 
-The journal's confirmed blocks are also fed into `LocalDedupResolver.Build`, not merely to save an
-upload.
+The journal's confirmed blocks are also fed to the run's dedup resolver, alongside the catalog and
+this run's own reservations, not merely to save an upload.
 
 > **Rationale.** Resume accounts by **path**. Suppose the previous run finished uploading A and
 > suspended before reaching B, which has the same content. This run reuses A directly, but B does not

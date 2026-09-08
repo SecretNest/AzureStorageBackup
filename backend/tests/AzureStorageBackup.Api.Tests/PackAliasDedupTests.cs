@@ -91,7 +91,7 @@ public sealed class PackAliasDedupTests : IDisposable
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         var staging = new StagingArea(
             Path.Combine(_temp, "compress"), Path.Combine(_temp, "staged"), () => 200_000_000);
-        var indexCache = new LocalIndexCache(_db, store, TestIndexFiles.New());
+        var catalogs = TestCatalogs.New(_db, store);
         var tracked = new TrackedInfoStore(store, new LocalBackupStateStore(_db));
         var compactor = deadWeightCompaction
             ? new DeadWeightCompactor(
@@ -101,10 +101,12 @@ public sealed class PackAliasDedupTests : IDisposable
         var backup = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             compressor ?? new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor, indexCache, tracked),
-            new FileHasher(), indexCache: indexCache, trackedInfo: tracked);
+            new RetentionCleaner(factory, store, new RetentionEvaluator(), compactor, catalogs, tracked),
+            new FileHasher(), catalogs: catalogs, trackedInfo: tracked,
+            workFactory: TestWorkDbs.New());
         var restore = new RestoreOrchestrator(
-            factory, store, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "restore"));
+            factory, store, TestCatalogs.New(_db, store), new SevenZipCompressor(), new FileHasher(),
+            Path.Combine(_temp, "restore"));
         return (backup, restore, store);
     }
 
@@ -494,8 +496,9 @@ public sealed class PackAliasDedupTests : IDisposable
             Write("c/second.txt", payload);
             await backup.RunAsync(Request(account, name));
 
+            var checkStore = new BackupInfoStore(factory, new SevenZipArchiveCodec());
             var checker = new BackupChecker(
-                factory, new BackupInfoStore(factory, new SevenZipArchiveCodec()),
+                factory, checkStore, TestCatalogs.New(_db, checkStore),
                 new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check"));
             var report = await checker.CheckAsync(account, name, null, null, new CheckOptions());
 

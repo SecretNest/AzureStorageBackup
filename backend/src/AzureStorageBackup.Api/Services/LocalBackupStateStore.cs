@@ -41,9 +41,9 @@ public sealed class LocalBackupStateStore(AppDbContext db) : ILocalBackupStateSt
             {
                 // Two scopes cold-missed the same (account, container) — an ETag conflict had just cleared
                 // the row, both of LoadAsync's backfills read "no row", and the loser's insert hit the unique
-                // index. A harmless race on a locally cached copy, not an error (the same discipline as
-                // LocalIndexCache.UpsertAsync): fall back to updating the winner's row rather than throwing
-                // a bare 500 out of whatever read path happened to be backfilling.
+                // index. A harmless race on a locally cached copy, not an error: fall back to updating the
+                // winner's row rather than throwing a bare 500 out of whatever read path happened to be
+                // backfilling.
                 db.Entry(added).State = EntityState.Detached;
                 var existing = await db.LocalBackupStates.FirstOrDefaultAsync(
                     x => x.AccountId == accountId && x.Container == container, ct);

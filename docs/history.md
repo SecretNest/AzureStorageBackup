@@ -61,6 +61,49 @@ interruptibility under real data volumes. All of it is merged into `main`.
 | 09-07 | A pause that takes effect within a volume rather than a file, reaches the pack loop's every group and the wrap-up, and reads "Pausing…" until it has taken effect | [run-lifecycle.md](run-lifecycle.md), [progress-display.md](progress-display.md) |
 | 09-07 | The prober's hand-off into a full probed queue steps out of the pause accounting: "Pausing…" no longer stands for good when the pool is full and the compressor is waiting for room | [run-lifecycle.md](run-lifecycle.md) |
 | 09-07 | A pause stops the file under 7z where it is (SIGSTOP/SIGCONT) instead of waiting for it, and the time a run stands paused comes off the remaining-time estimate's clock | [run-lifecycle.md](run-lifecycle.md), [progress-display.md](progress-display.md) |
+| 09-08 | Version indexes moved from files read whole into memory to a SQLite catalog per container, and a run's own bookkeeping into a scratch database, so neither grows with the file count | [storage-format.md](storage-format.md), [architecture.md](architecture.md), [operations.md](operations.md) |
+
+### The index catalog (2026.9.8)
+
+A backup of several million files drove the container to 8.4 GB resident, and it stayed there after
+the run was suspended: an idle process never collects. Almost all of it was live data whose size was
+the file count — two deserialised version indexes, the scan's list, the new version's entries and
+the dictionaries built from them, the journal's records on a resume.
+
+Those are all gone. Each container now keeps a SQLite catalog of every retained version's index
+entries under `data/index-cache/`, and each run keeps a scratch database under `{tempPath}/work/`
+for its scan, its draft and its resume records. Dedup, browsing, retention, restore and check ask
+queries instead of holding indexes; the diff merges two cursors; the new index is serialised
+straight to a file. Nothing durable changed — the cloud index bytes, the info file, the journal and
+its suspend marks, `app.db` — and a run suspended by 2026.9.7 resumes on this release and commits an
+index with the same entries, in the same order, referencing the packs the interrupted run had
+already uploaded. That is what the cross-release fixture test in the suite exists to prove: it
+replays a half-finished run recorded on the old build, `.idx` cache and all, and finishes it here.
+
+What an operator needs to know:
+
+- **Downgrading past this release is not supported once a container's indexes have been migrated.**
+  A version is pulled into the catalog the first time something reads it, and the source it came
+  from goes: an `.idx` file once its import commits (or straight away if its body turns out to be
+  unparsable), a legacy `app.db` row as soon as it has been looked at. An older image would have to
+  re-download every index from the cloud, which for an Archive-tier index means rehydration.
+- **`Backup__IndexCacheSize` is retired.** It sized the in-memory index cache, which no longer
+  exists. If it is still set, one startup log line says it is ignored.
+- **`/temp` needs a little more room**: roughly 500 bytes per scanned file for the run's work
+  database — and about **twice that while the run is in flight**, because the diff holds a cursor
+  over the scan and that cursor pins a read snapshot, so the draft rows written beside it pile up in
+  the write-ahead log instead of being folded back into the file. All of it is released when the run
+  ends. [operations.md](operations.md) § *Temp space*.
+- The process runs workstation GC rather than server GC, and does one compacting, decommitting
+  collection at the end of every run, so a machine that has just finished a backup gets the memory
+  back instead of seeing the high-water mark until the next one.
+
+Measured over a 200,000-file run: peak managed heap fell from 550.0 MB to 94.3 MB, and the heap the
+run genuinely holds — read after a forced collection — to 47.0 MB, and then to 39 MB once the work
+database's write queue was bounded, while the working set left behind after the run rose from
+191.4 MB to about 380 MB, live managed data traded for native residue, with no change in how long
+the run took. [operations.md](operations.md) § *Memory* has both tables, the remaining ~70 bytes per
+file, and the budget to watch.
 
 ## Working conventions
 

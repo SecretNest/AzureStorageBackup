@@ -9,9 +9,10 @@ using Microsoft.EntityFrameworkCore;
 namespace AzureStorageBackup.Api.Tests;
 
 /// <summary>
-/// Regression: a repair (§3.2) must write the info file / version indexes through the local-authoritative state
-/// machine (TrackedInfoStore + ILocalIndexCache), otherwise the locally cached ETag falls out of step with the cloud
-/// and the next backup's conditional write hits a 412 once.
+/// Regression: a repair (§3.2) must write the info file through the local-authoritative state machine
+/// (TrackedInfoStore), otherwise the locally cached ETag falls out of step with the cloud and the next backup's
+/// conditional write hits a 412 once — and it must record its verdicts in the container catalog the next backup
+/// reads its dedup facts out of, so that a damaged address is excluded and healed in passing.
 /// </summary>
 [Trait("Category", "Integration")]
 public sealed class BackupRepairerTests : IDisposable
@@ -88,28 +89,39 @@ public sealed class BackupRepairerTests : IDisposable
         public Task TrimAsync(int? maxAgeDays, DateTimeOffset now, CancellationToken ct = default) => Task.CompletedTask;
     }
 
-    private (BackupOrchestrator Backup, BackupChecker Checker, BackupRepairer Repairer, TrackedInfoStore Tracked, ILocalIndexCache IndexCache, BlobClientFactory Factory) Build(
-        IOperationLog? opLog = null, IFileHasher? repairHasher = null, IBlobUploader? repairUploader = null)
+    /// <param name="repairIndexVolumeBytes">Lowers the split threshold of the store the REPAIR writes through, so
+    /// a rewritten index comes back as several volumes where the backup wrote one — the only way to exercise "the
+    /// volume count the rewrite actually took is what gets recorded" without a hundreds-of-MB index.</param>
+    private (BackupOrchestrator Backup, BackupChecker Checker, BackupRepairer Repairer, TrackedInfoStore Tracked, VersionCatalogs Catalogs, BlobClientFactory Factory) Build(
+        IOperationLog? opLog = null, IFileHasher? repairHasher = null, IBlobUploader? repairUploader = null,
+        int? repairIndexVolumeBytes = null)
     {
         var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         var state = new LocalBackupStateStore(_db);
         var tracked = new TrackedInfoStore(store, state);
-        var indexCache = new LocalIndexCache(_db, store, TestIndexFiles.New());
+        // ONE catalog store for the backup and the repair alike, as production has it: the marks a repair records
+        // are what the next backup's dedup reads to exclude a damaged address and heal it in passing, and two
+        // catalogs over the same container would leave each blind to the other's half of the story.
+        var catalogs = TestCatalogs.New(_db, store);
         var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), () => 200_000_000);
         var backup = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
-            indexCache: indexCache, trackedInfo: tracked);
+            catalogs: catalogs, trackedInfo: tracked,
+            workFactory: TestWorkDbs.New());
         var checker = new BackupChecker(
-            factory, store, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check"),
+            factory, store, catalogs, new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "check"),
             trackedInfo: tracked, journals: _journals);
+        var repairStore = repairIndexVolumeBytes is { } volumeBytes
+            ? new BackupInfoStore(factory, new SevenZipArchiveCodec()) { IndexVolumeBytes = volumeBytes }
+            : store;
         var repairer = new BackupRepairer(
-            factory, store, new SevenZipCompressor(), repairHasher ?? new FileHasher(), repairUploader ?? new BlobUploader(factory),
-            Path.Combine(_temp, "repair"), staging,
-            opLog: opLog, checker: checker, trackedInfo: tracked, indexCache: indexCache, journals: _journals);
-        return (backup, checker, repairer, tracked, indexCache, factory);
+            factory, repairStore, new SevenZipCompressor(), repairHasher ?? new FileHasher(), repairUploader ?? new BlobUploader(factory),
+            Path.Combine(_temp, "repair"), staging, catalogs,
+            opLog: opLog, checker: checker, trackedInfo: tracked, journals: _journals);
+        return (backup, checker, repairer, tracked, catalogs, factory);
     }
 
     private BackupRequest Req(Account a, string c, IgnoreRuleSet? dontCompress = null, string? password = null) => new()
@@ -131,7 +143,7 @@ public sealed class BackupRepairerTests : IDisposable
         Skip.IfNot(AzuriteReachable(), "Azurite is not running");
         Skip.IfNot(SevenZip(), "7z not found");
 
-        var (backup, _, repairer, tracked, indexCache, factory) = Build();
+        var (backup, _, repairer, tracked, catalogs, factory) = Build();
         var account = AzuriteAccount();
         var name = RandomName("reps-");
         var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
@@ -190,9 +202,10 @@ public sealed class BackupRepairerTests : IDisposable
             Assert.Equal(["two.txt"], report.Unrecoverable);
 
             var info = await tracked.LoadAsync(account, name, null);
-            var v1 = info!.Versions.Single(x => x.Version == 1);
-            var index = await indexCache.ReadAsync(account, name, 1, info.Backup.CreatedAt.UtcTicks, v1.IndexBlob, null);
-            Assert.Contains("two.txt", index.UnrecoverablePaths);
+            Assert.NotNull(info);
+            // In the catalog too, not only in the cloud: the catalog is what the next backup's dedup reads.
+            await using var catalog = await catalogs.OpenAsync(account.Id, name, readOnly: true);
+            Assert.Contains("two.txt", await catalog.UnrecoverableAsync(1, CancellationToken.None));
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
@@ -756,7 +769,7 @@ public sealed class BackupRepairerTests : IDisposable
         Skip.IfNot(AzuriteReachable(), "Azurite is not running");
         Skip.IfNot(SevenZip(), "7z not found");
 
-        var (backup, checker, repairer, tracked, indexCache, factory) = Build();
+        var (backup, checker, repairer, tracked, catalogs, factory) = Build();
         var account = AzuriteAccount();
         var name = RandomName("heal-");
         var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
@@ -797,11 +810,9 @@ public sealed class BackupRepairerTests : IDisposable
             Assert.Contains("a.txt", deferred.Repaired);
 
             var info = await tracked.LoadAsync(account, name, null);
+            await using var catalog = await catalogs.OpenAsync(account.Id, name, readOnly: true);
             foreach (var v in info!.Versions)
-            {
-                var idx = await indexCache.ReadAsync(account, name, v.Version, info.Backup.CreatedAt.UtcTicks, v.IndexBlob, null, v.IndexVolumes);
-                Assert.DoesNotContain("a.txt", idx.UnrecoverablePaths);
-            }
+                Assert.DoesNotContain("a.txt", await catalog.UnrecoverableAsync(v.Version, CancellationToken.None));
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
@@ -902,7 +913,7 @@ public sealed class BackupRepairerTests : IDisposable
         Skip.IfNot(AzuriteReachable(), "Azurite is not running");
         Skip.IfNot(SevenZip(), "7z not found");
 
-        var (backup, _, repairer, tracked, indexCache, factory) = Build();
+        var (backup, _, repairer, tracked, catalogs, factory) = Build();
         var account = AzuriteAccount();
         var name = RandomName("repu-");
         var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
@@ -932,9 +943,9 @@ public sealed class BackupRepairerTests : IDisposable
             Assert.Contains("a.txt", second.Repaired);
 
             var info = await tracked.LoadAsync(account, name, null);
-            var v1 = info!.Versions.Single(x => x.Version == 1);
-            var index = await indexCache.ReadAsync(account, name, 1, info.Backup.CreatedAt.UtcTicks, v1.IndexBlob, null);
-            Assert.DoesNotContain("a.txt", index.UnrecoverablePaths);
+            Assert.NotNull(info);
+            await using var catalog = await catalogs.OpenAsync(account.Id, name, readOnly: true);
+            Assert.DoesNotContain("a.txt", await catalog.UnrecoverableAsync(1, CancellationToken.None));
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
@@ -945,7 +956,8 @@ public sealed class BackupRepairerTests : IDisposable
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
 
-        var (backup, _, repairer, tracked, indexCache, factory) = Build();
+        var (backup, _, repairer, tracked, catalogs, factory) = Build();
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         var account = AzuriteAccount();
         var name = RandomName("rep2-");
         var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
@@ -968,14 +980,20 @@ public sealed class BackupRepairerTests : IDisposable
             Assert.Contains("a.txt", report.Repaired);
             Assert.Empty(report.Unrecoverable);
 
-            // The repair must go through the local-authoritative state machine: version 1 in the index cache should
-            // have been refreshed (its identity matching this info file).
+            // The repair must go through the local-authoritative state machine: version 1 is in the catalog under
+            // this info file's identity, carrying the repaired entry's new volume sizes.
             var info = await tracked.LoadAsync(account, name, null);
             Assert.NotNull(info);
-            var v1 = info!.Versions.Single(x => x.Version == 1);
-            var identity = info.Backup.CreatedAt.UtcTicks;
-            var cachedIndex = await indexCache.ReadAsync(account, name, 1, identity, v1.IndexBlob, null);
-            Assert.NotNull(cachedIndex);
+            var identity = info!.Backup.CreatedAt.UtcTicks;
+            await using var catalog = await catalogs.OpenAsync(account.Id, name, readOnly: true);
+            var row = await catalog.GetVersionAsync(1, CancellationToken.None);
+            Assert.NotNull(row);
+            Assert.Equal(identity, row!.Identity);
+            var patched = await catalog.GetEntryAsync(1, "a.txt", CancellationToken.None);
+            Assert.NotNull(patched);
+            Assert.Equal(
+                (await store.ReadIndexAsync(account, name, info.Versions[0].IndexBlob, null)).Entries.Single(e => e.Path == "a.txt").Storage!.VolumeSizes,
+                patched!.Storage!.VolumeSizes);
 
             // The next backup's finalize info write (a tracked ETag conditional write) must not hit a 412 because the repair bypassed the local cache.
             var ex = await Record.ExceptionAsync(() =>
@@ -1073,15 +1091,14 @@ public sealed class BackupRepairerTests : IDisposable
     }
 
     /// <summary>
-    /// A1: refs spans every referencing version, and their order depends on dictionary enumeration order — an
-    /// undocumented BCL implementation detail, and precisely the property the production code (see the comment in
-    /// BackupRepairer.cs) itself calls out as "unreliable", so a test must not turn around and depend on it.
-    /// Hence a [Theory] covering both directions: once stripping v1's head/tail (v2 intact), once stripping v2's
-    /// (v1 intact). The dictionary insertion order is the same across both runs, only "which version is intact"
-    /// swaps, so whether the actual enumeration order is [v1,v2] or [v2,v1], one of the two directions is bound to
-    /// land the "entry missing head/tail" at refs[0] — and if the production code falls back to entry0, that
-    /// direction fails for certain, with no guessing about enumeration order.
-    /// <para>Before the fix (using refs[0]): in at least one direction refs[0] happened to be the stripped entry, the
+    /// A1: refs spans every referencing version, and the repair must take its collision metadata from whichever
+    /// entry still HAS head/tail, not from whichever one happens to come first. Hence a [Theory] covering both
+    /// directions: once stripping v1's head/tail (v2 intact), once stripping v2's (v1 intact). One of the two is
+    /// bound to land the "entry missing head/tail" first in refs — and if the production code falls back to
+    /// entry0, that direction fails for certain. Written this way when the order came out of dictionary
+    /// enumeration and could not be reasoned about; it is now the catalog's (oldest version first), and the theory
+    /// is kept because covering both directions is what makes the assertion independent of that order at all.
+    /// <para>Before the fix (using refs[0]): in at least one direction refs[0] was the stripped entry, the
     /// metadata written out carried only len, and that direction's head/tail assertions failed.</para>
     /// </summary>
     [SkippableTheory]
@@ -1092,7 +1109,7 @@ public sealed class BackupRepairerTests : IDisposable
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
 
-        var (backup, _, repairer, _, _, factory) = Build();
+        var (backup, _, repairer, _, catalogs, factory) = Build();
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         var account = AzuriteAccount();
         var name = RandomName("rep-meta-");
@@ -1121,8 +1138,11 @@ public sealed class BackupRepairerTests : IDisposable
             Assert.NotNull(goodEntry.HeadHash);
             Assert.NotNull(goodEntry.TailHash);
 
-            // The same entry in the other version is degraded into a "legacy index entry".
+            // The same entry in the other version is degraded into a "legacy index entry". Written straight to the
+            // cloud behind the catalog's back, so the catalog's copy of that version has to be dropped for the
+            // doctored index to be the one the repair reads (a version is re-imported on demand, from the cloud).
             var blobRef = await StripHashesAsync(store, account, name, stripVersion, stripTarget.IndexBlob, "a.txt");
+            await catalogs.RemoveVersionAsync(account.Id, name, stripVersion);
             Assert.Equal(goodEntry.Storage!.Ref, blobRef);
 
             await container.GetBlobClient(blobRef).DeleteIfExistsAsync();
@@ -1151,7 +1171,7 @@ public sealed class BackupRepairerTests : IDisposable
         Skip.IfNot(SevenZip(), "7z not found");
 
         var opLog = new RecordingOperationLog();
-        var (backup, _, repairer, _, _, factory) = Build(opLog);
+        var (backup, _, repairer, _, catalogs, factory) = Build(opLog);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         var account = AzuriteAccount();
         var name = RandomName("rep-degr-");
@@ -1165,7 +1185,10 @@ public sealed class BackupRepairerTests : IDisposable
 
             var info = await store.ReadInfoAsync(account, name, null);
             var v1 = info!.Versions.Single();
+            // Straight to the cloud behind the catalog's back, so the catalog's copy is dropped and re-imported
+            // from the doctored index (see the sibling test above).
             var blobRef = await StripHashesAsync(store, account, name, 1, v1.IndexBlob, "a.txt");
+            await catalogs.RemoveVersionAsync(account.Id, name, 1);
             await container.GetBlobClient(blobRef).DeleteIfExistsAsync();
 
             var report = await repairer.RepairAsync(
@@ -1380,6 +1403,207 @@ public sealed class BackupRepairerTests : IDisposable
             // v1's copy references R_A, which nobody touched: no verdict may land on it — this healthy
             // copy is precisely what version substitution needs to recover the file.
             Assert.Empty(idx1.UnrecoverablePaths);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// The rewrite contract of a repair, now that a version is serialized out of the catalog rather than out of a
+    /// whole index held in memory: a version the repair did not change must not be rewritten **at all** — its index
+    /// blob is the very same bytes afterwards, not the same content re-encoded — and a version it did change must
+    /// come back out of the catalog as it went in, entry for entry in the same order, with nothing but the mark
+    /// added.
+    /// <para>
+    /// Both halves guard the same class of failure: serializing from a row store makes it easy to lose the source
+    /// order (the <c>seq</c> column is the only thing preserving it) or to persist a version merely because a patch
+    /// was aimed at it, and either one silently rewrites history a restore reads back.
+    /// </para>
+    /// </summary>
+    [SkippableFact]
+    public async Task Repair_rewrites_only_versions_it_changed_and_keeps_entry_order()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, _, repairer, _, _, factory) = Build();
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var account = AzuriteAccount();
+        var name = RandomName("rep-order-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            // Three entries, so there is an order to lose — and not written in sorted order either.
+            await File.WriteAllTextAsync(Path.Combine(_src, "gamma.txt"), "gamma, the same in both versions");
+            await File.WriteAllTextAsync(Path.Combine(_src, "alpha.txt"), "alpha, the same in both versions");
+            await File.WriteAllTextAsync(Path.Combine(_src, "beta.txt"), "beta, as version one wrote it");
+            await backup.RunAsync(Req(account, name));
+            var afterV1 = new HashSet<string>(StringComparer.Ordinal);
+            await foreach (var b in container.GetBlobsAsync(BlobTraits.None, BlobStates.None, "data/", CancellationToken.None))
+                afterV1.Add(b.Name);
+
+            // Only beta.txt changes, so the object v2 is about to lose is referenced by v2 alone — v1 is a pure
+            // bystander, and the repair has no business rewriting its index.
+            await File.WriteAllTextAsync(Path.Combine(_src, "beta.txt"), "beta, rewritten for version two");
+            await backup.RunAsync(Req(account, name));
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var v1 = info!.Versions.Single(x => x.Version == 1);
+            var v2 = info.Versions.Single(x => x.Version == 2);
+            Assert.Equal(1, v1.IndexVolumes); // the byte comparison below reads the single-blob layout
+            var beforeV1Bytes = (await container.GetBlobClient(v1.IndexBlob).DownloadContentAsync()).Value.Content.ToArray();
+            var beforeV2 = await store.ReadIndexAsync(account, name, v2.IndexBlob, null, v2.IndexVolumes);
+
+            // v2's copy of beta.txt is gone from the cloud, and gone locally too: the repair can only mark it.
+            await foreach (var b in container.GetBlobsAsync(BlobTraits.None, BlobStates.None, "data/", CancellationToken.None))
+                if (!afterV1.Contains(b.Name))
+                    await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
+            File.Delete(Path.Combine(_src, "beta.txt"));
+
+            var report = await repairer.RepairAsync(
+                account, name, null, _src, 2, new CheckOptions(), AccessTier.Hot, null,
+                dontCompress: null, onlyPaths: ["beta.txt"]);
+            Assert.Equal(["beta.txt"], report.Unrecoverable);
+
+            // The bystander's index blob is untouched — byte for byte, which says more than "reads back the same":
+            // a rewrite re-encodes it and changes these bytes even when the content is identical.
+            var afterV1Bytes = (await container.GetBlobClient(v1.IndexBlob).DownloadContentAsync()).Value.Content.ToArray();
+            Assert.Equal(beforeV1Bytes, afterV1Bytes);
+
+            // The version that did change is itself plus exactly one mark: same entries, same order, same fields.
+            var afterV2 = await store.ReadIndexAsync(account, name, v2.IndexBlob, null, v2.IndexVolumes);
+            Assert.Contains("beta.txt", afterV2.UnrecoverablePaths);
+            beforeV2.UnrecoverablePaths.Add("beta.txt");
+            Assert.Equal(LegacyIndexSerializer.SerializeIndex(beforeV2), LegacyIndexSerializer.SerializeIndex(afterV2));
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// A rewritten index is not the same length as the one it replaces — a mark makes it longer, a repaired entry's
+    /// new volume sizes longer still — so it can cross the split threshold and land as several volumes where the
+    /// info file still records one. Every reader takes <c>versions[].indexVolumes</c> as authoritative (restore, the
+    /// checker, the lazy catalog migration, retention's volume deletion), so a stale 1 has them read the first
+    /// volume and call it the whole index. The count the write returns is what the info file must carry.
+    /// </summary>
+    [SkippableFact]
+    public async Task Repair_records_the_volume_count_of_the_index_it_rewrote()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        // A threshold only the repair's store is held to: the backup writes its index as one blob, exactly as a
+        // real one would, and only the rewrite splits.
+        var (backup, _, repairer, tracked, _, factory) = Build(repairIndexVolumeBytes: 1024);
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var account = AzuriteAccount();
+        var name = RandomName("rep-vol-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            // Enough entries (each with its own random content hashes) that the encoded index is comfortably past
+            // 1 KiB even after 7z has had a go at it.
+            const int files = 40;
+            for (var i = 0; i < files; i++)
+                await File.WriteAllTextAsync(Path.Combine(_src, $"file{i:D3}.txt"), $"content number {i} of {files}, unique per file");
+            await backup.RunAsync(Req(account, name));
+
+            var before = await store.ReadInfoAsync(account, name, null);
+            Assert.Equal(1, before!.Versions.Single().IndexVolumes); // the backup wrote one blob
+
+            // One file's blob is gone from the cloud and gone locally: the repair can only mark it, and rewrites
+            // the index to say so.
+            var idx = await store.ReadIndexAsync(account, name, before.Versions[0].IndexBlob, null);
+            var victim = idx.Entries.Single(e => e.Path == "file007.txt");
+            await container.GetBlobClient(victim.Storage!.Ref).DeleteIfExistsAsync();
+            File.Delete(Path.Combine(_src, "file007.txt"));
+
+            var report = await repairer.RepairAsync(
+                account, name, null, _src, null, new CheckOptions(), AccessTier.Hot, null,
+                dontCompress: null, onlyPaths: ["file007.txt"]);
+            Assert.Equal(["file007.txt"], report.Unrecoverable);
+
+            var after = await tracked.LoadAsync(account, name, null);
+            var v1 = after!.Versions.Single();
+            Assert.True(v1.IndexVolumes > 1, $"expected the rewritten index to split, got {v1.IndexVolumes} volume(s)");
+            foreach (var volume in VolumeBlobIO.VolumeNames(v1.IndexBlob, v1.IndexVolumes))
+                Assert.True((await container.GetBlobClient(volume).ExistsAsync()).Value, $"{volume} is missing");
+
+            // And the recorded count is the one that reads the whole index back — every entry, plus the mark that
+            // caused the rewrite in the first place.
+            var dest = Path.Combine(_base, "readback.idx");
+            await store.ReadIndexToFileAsync(account, name, v1.IndexBlob, null, v1.IndexVolumes, dest);
+            await using var readback = File.OpenRead(dest);
+            using var reader = new IndexStreamReader(readback);
+            Assert.Equal(1, reader.Version);
+            Assert.Equal(files, reader.EntryCount);
+            Assert.Equal(files, reader.Entries().Count());
+            reader.ReadEmptyDirs();
+            Assert.Equal(["file007.txt"], reader.ReadUnrecoverable());
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>
+    /// The catalog can hold a version the info file no longer lists — a retired one whose removal never reached it,
+    /// or one imported against an older info file. The repair's reads are keyed by storage REF, not by version, so
+    /// such a version's entries come back from the very same query as the live ones; marking them would write an
+    /// index blob into the cloud for a version nothing claims and report paths no retained version has. The old
+    /// whole-index dictionary was bounded by the info file, and the catalog reads must be too.
+    /// </summary>
+    [SkippableFact]
+    public async Task Repair_leaves_a_version_the_info_file_no_longer_lists_alone()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (backup, _, repairer, _, catalogs, factory) = Build();
+        var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
+        var account = AzuriteAccount();
+        var name = RandomName("rep-stale-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(_src, "a.txt"), "the one file the info file knows about");
+            await backup.RunAsync(Req(account, name));
+
+            var info = await store.ReadInfoAsync(account, name, null);
+            var v1 = info!.Versions.Single();
+            var idx = await store.ReadIndexAsync(account, name, v1.IndexBlob, null, v1.IndexVolumes);
+
+            // A version 99 nothing lists, referencing the SAME damaged object under a path of its own — so that
+            // "did the repair touch it" is directly visible in the report rather than inferred.
+            var stale = idx with
+            {
+                Version = 99,
+                Entries = [idx.Entries.Single(e => e.Path == "a.txt") with { Path = "stale.txt" }],
+            };
+            using (var writeLock = await catalogs.LockForWriteAsync(account.Id, name))
+            {
+                await using var writable = await catalogs.OpenForWriteAsync(writeLock, account.Id, name);
+                using var import = new IndexStreamReader(new MemoryStream(LegacyIndexSerializer.SerializeIndex(stale)));
+                await writable.ImportVersionAsync(99, info.Backup.CreatedAt.UtcTicks, import, CancellationToken.None);
+            }
+
+            // The object is gone from the cloud and gone locally: a.txt is unrepairable and gets marked.
+            await foreach (var b in container.GetBlobsAsync(BlobTraits.None, BlobStates.None, "data/", CancellationToken.None))
+                await container.GetBlobClient(b.Name).DeleteIfExistsAsync();
+            File.Delete(Path.Combine(_src, "a.txt"));
+
+            var report = await repairer.RepairAsync(
+                account, name, null, _src, null, new CheckOptions(), AccessTier.Hot, null, dontCompress: null);
+            Assert.Contains("a.txt", report.Unrecoverable);
+            Assert.DoesNotContain("stale.txt", report.Unrecoverable);
+
+            await using var catalog = await catalogs.OpenAsync(account.Id, name, readOnly: true);
+            Assert.Empty(await catalog.UnrecoverableAsync(99, CancellationToken.None));
+
+            var indexBlobs = new List<string>();
+            await foreach (var b in container.GetBlobsAsync(BlobTraits.None, BlobStates.None, "indexes/", CancellationToken.None))
+                indexBlobs.Add(b.Name);
+            Assert.DoesNotContain(indexBlobs, n => n.Contains("v99", StringComparison.Ordinal));
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

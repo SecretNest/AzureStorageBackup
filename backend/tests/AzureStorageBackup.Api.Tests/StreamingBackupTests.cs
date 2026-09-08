@@ -108,7 +108,8 @@ public sealed class StreamingBackupTests : IDisposable
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked);
+            new RetentionCleaner(factory, store, new RetentionEvaluator(), catalogs: authority.Catalogs, trackedInfo: authority.Tracked), new FileHasher(), authority.Catalogs, authority.Tracked,
+            workFactory: TestWorkDbs.New());
 
         var account = AzuriteAccount();
         var name = RandomName("sbk-");
@@ -192,8 +193,9 @@ public sealed class StreamingBackupTests : IDisposable
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             compressor, new BlobUploader(factory), factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator()), new FileHasher(),
-            indexCache: new LocalIndexCache(db, store, TestIndexFiles.New()),
-            trackedInfo: new TrackedInfoStore(store, new LocalBackupStateStore(db)));
+            catalogs: TestCatalogs.New(db, store),
+            trackedInfo: new TrackedInfoStore(store, new LocalBackupStateStore(db)),
+            workFactory: TestWorkDbs.New());
 
         var account = AzuriteAccount();
         var name = RandomName("sbkd-");
@@ -505,8 +507,9 @@ public sealed class StreamingBackupTests : IDisposable
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), uploader ?? new BlobUploader(factory), cloud ?? factory, store, staging,
             new RetentionCleaner(factory, store, new RetentionEvaluator(),
-                indexCache: authority.IndexCache, trackedInfo: authority.Tracked),
-            new FileHasher(), authority.IndexCache, authority.Tracked, notifier: null, opLog: opLog);
+                catalogs: authority.Catalogs, trackedInfo: authority.Tracked),
+            new FileHasher(), authority.Catalogs, authority.Tracked,
+            workFactory: TestWorkDbs.New(), notifier: null, opLog: opLog);
         var request = new BackupRequest
         {
             Account = AzuriteAccount(),

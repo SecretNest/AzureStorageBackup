@@ -117,7 +117,8 @@ public sealed class UnreadableWarningTests : IDisposable
         var orchestrator = new BackupOrchestrator(
             new LocalFileScanner(), differ ?? new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
-            new RetentionCleaner(factory, store, new RetentionEvaluator(), indexCache: authority.IndexCache, trackedInfo: authority.Tracked), new FileHasher(), authority.IndexCache, authority.Tracked,
+            new RetentionCleaner(factory, store, new RetentionEvaluator(), catalogs: authority.Catalogs, trackedInfo: authority.Tracked), new FileHasher(), authority.Catalogs, authority.Tracked,
+            workFactory: TestWorkDbs.New(),
             notifier: notifier, opLog: opLog);
         return (orchestrator, store, factory);
     }

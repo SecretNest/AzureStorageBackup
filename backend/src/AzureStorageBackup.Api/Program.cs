@@ -18,6 +18,10 @@ var builder = WebApplication.CreateBuilder(args);
 
 const string CorsPolicy = "frontend";
 
+// Messages that belong at startup but are decided before app.Logger exists (during Services registration,
+// where several of them are). Flushed once the host is built — see the loop beside ioPriorityOutcome below.
+var startupNotes = new List<string>();
+
 // --- Data layer: SQLite ---
 var sqliteConn = builder.Configuration.GetConnectionString("Sqlite");
 if (string.IsNullOrWhiteSpace(sqliteConn))
@@ -74,24 +78,28 @@ static Func<ProcessPriorityClass> SevenZipPriority(IServiceProvider sp) => () =>
     }
 };
 
+// Where every intermediate this process writes to disk goes. Resolved here, before the first service that needs it:
+// the 7z codec's extraction root is the first of them (StagingArea, the info store, the work databases and the
+// catalogs' cloud import all take a directory under it further down).
+var tempPath = builder.Configuration["Backup:TempPath"];
+if (string.IsNullOrWhiteSpace(tempPath))
+    tempPath = Path.Combine(Path.GetTempPath(), "azurestoragebackup");
+
 // Backup engine (M4): 7z codec + info file/index reading and writing. The codec is constructed on demand (7z is probed on the first resolve).
-builder.Services.AddSingleton<IArchiveCodec>(sp => new SevenZipArchiveCodec(priority: SevenZipPriority(sp)));
-builder.Services.AddScoped<IBackupInfoStore, BackupInfoStore>();
-builder.Services.AddScoped<ILocalIndexCache, LocalIndexCache>();
-// Cache of deserialized version indexes (singleton, shared across requests). The default of 2 entries favours responsiveness: tree browsing in the
-// restore dialog and version comparison hit the same index, so a click no longer rebuilds the whole index (measured at about 0.9 s / 350 MB for 500k entries).
-// The cost is resident memory (about 190 MB per index @ 500k entries); on a low-memory machine set Backup__IndexCacheSize=0 to turn it off entirely.
-builder.Services.AddSingleton(new VersionIndexMemoryCache(
-    int.TryParse(builder.Configuration["Backup:IndexCacheSize"], out var indexCacheSize) && indexCacheSize >= 0
-        ? indexCacheSize
-        : 2));
+// Its temp root is Backup:TempPath too, for exactly the reason BackupInfoStore's is (see there): decoding a
+// multi-million-entry index extracts hundreds of MB before the result is moved to its destination, and the default
+// — the system temp dir — is a small tmpfs on a good number of NAS boxes.
+var sevenZipTemp = Path.Combine(tempPath, "7z");
+builder.Services.AddSingleton<IArchiveCodec>(sp =>
+    new SevenZipArchiveCodec(tempRoot: sevenZipTemp, priority: SevenZipPriority(sp)));
+// Version indexes are read from the SQLite catalog on demand, so the in-memory index cache the setting below used
+// to size is gone along with the cache itself. The setting is still read, only to say so.
+if (builder.Configuration["Backup:IndexCacheSize"] is { } retiredIndexCacheSize)
+    startupNotes.Add($"Backup__IndexCacheSize={retiredIndexCacheSize} is no longer used: version indexes are read from the SQLite catalog on demand.");
 builder.Services.AddScoped<ILocalBackupStateStore, LocalBackupStateStore>();
 builder.Services.AddScoped<TrackedInfoStore>();
 
 // Engine components (singletons where stateless; StagingArea is a singleton so that compression is globally non-concurrent, across backups too).
-var tempPath = builder.Configuration["Backup:TempPath"];
-if (string.IsNullOrWhiteSpace(tempPath))
-    tempPath = Path.Combine(Path.GetTempPath(), "azurestoragebackup");
 builder.Services.AddSingleton(sp =>
 {
     var compress = Path.Combine(tempPath, "compress");
@@ -108,6 +116,14 @@ builder.Services.AddSingleton(sp =>
 // File backend for the verbose per-file debug log (text files per backup and per date, PRD 3.6).
 builder.Services.AddSingleton(new VerboseFileLog(Path.Combine(tempPath, "verbose-logs")));
 
+// Registered here rather than up with the other stores because of its temp root, which is the one argument it takes:
+// the file-shaped index members encode the archive to a file and read it back to verify, and at a few million
+// entries that file is hundreds of MB. The default is the system temp dir, which on a NAS is quite often a small
+// tmpfs — this points it at the volume the operator sized for the job instead.
+builder.Services.AddScoped<IBackupInfoStore>(sp => new BackupInfoStore(
+    sp.GetRequiredService<IBlobClientFactory>(), sp.GetRequiredService<IArchiveCodec>(),
+    Path.Combine(tempPath, "index")));
+
 // The journal lives **next to the database file**, not under tempPath: without Backup:TempPath the latter is /tmp, which is gone
 // as soon as the container is recreated — and the entire reason the journal exists is to "still know where the last run got to after the container is recreated". Following the
 // database, it naturally lands on the same persistent volume, and the user does not have to set an extra environment variable just to make crash recovery work.
@@ -122,6 +138,22 @@ builder.Services.AddSingleton(new BackupJournalStore(Path.Combine(dbDir, "journa
 // It is a **cache**, not authority — deleting the directory costs downloads, never data.
 builder.Services.AddSingleton(new VersionIndexFileStore(Path.Combine(dbDir, "index-cache")));
 
+// The container catalogs, in **the same directory** as the .idx files above and for the same reasons — they must
+// survive a container being recreated, and they migrate a version out of the .idx file beside them, so splitting the
+// two across volumes would mean the migration reads one mount and writes another. VersionCatalogStore mirrors
+// VersionIndexFileStore's container-name sanitising verbatim precisely so the two agree on the directory.
+// A catalog is likewise a **cache**, not authority: deleting the directory costs downloads, never data.
+builder.Services.AddSingleton(sp => new VersionCatalogStore(
+    Path.Combine(dbDir, "index-cache"), sp.GetService<ILogger<VersionCatalogStore>>()));
+// Scoped, because migrating a version into a catalog reads the app database (the pre-.idx rows) and the cloud, and
+// both of those come from the scope. Its temp root is the very same {tempPath}/index the info store stages under:
+// the cloud import writes the decoded index there before streaming it into the catalog, which is the same hundreds
+// of MB for the same reason, and sharing the directory means one ClearStale sweeps both.
+builder.Services.AddScoped<IVersionCatalogs>(sp => new VersionCatalogs(
+    sp.GetRequiredService<VersionCatalogStore>(), sp.GetRequiredService<VersionIndexFileStore>(),
+    sp.GetRequiredService<AppDbContext>(), sp.GetRequiredService<IBackupInfoStore>(),
+    sp.GetService<ILogger<VersionCatalogs>>(), Path.Combine(tempPath, "index")));
+
 // Spill area for the diff→upload queue. The write side never blocks: whatever memory cannot hold spills here, so diff can run all the way to the end —
 // which is the precondition for showing a remaining time during the upload stage (the denominator, SetTotal, is only fixed once diff finishes, see StageProgress.Eta).
 var spillDir = Path.Combine(tempPath, "diff-spill");
@@ -129,9 +161,21 @@ var spillDir = Path.Combine(tempPath, "diff-spill");
 // This has to happen at **process startup**, not at the start of every backup: several backups can be running at once,
 // and clearing per run would delete files someone else is writing. A normal finish deletes its own (DiffWorkQueue.Dispose).
 DiffWorkQueue.ClearStale(spillDir);
+// The per-run scratch databases, cleared for exactly the same reason and at exactly the same moment: a run names its
+// file after its runId and deletes it on the way out, so anything still here is the residue of a killed process.
+var workDbDir = Path.Combine(tempPath, "work");
+RunWorkDbFactory.ClearStale(workDbDir);
 // Same reasoning: compression intermediates and staged volumes left by the last abnormal exit are cleared here too.
 // Recovery leans on the journal (content confirmed in the cloud), not on these local half-products.
 StagingArea.ClearStale(Path.Combine(tempPath, "compress"), Path.Combine(tempPath, "staged"));
+// Same reasoning again: BackupInfoStore hands out one work directory per call (encode + read-back verification) and
+// deletes its own on a normal finish, so anything still under its temp root is residue from a killed process. The
+// catalogs' cloud import stages into the same directory, in the same one-directory-per-call shape, so this one
+// sweep covers both.
+BackupInfoStore.ClearStale(Path.Combine(tempPath, "index"));
+// And the codec's extraction root, which has exactly the same shape (one directory per encode/decode, deleted on a
+// normal finish) — so the same sweep, rather than a second one that would only differ in its name.
+BackupInfoStore.ClearStale(sevenZipTemp);
 // The two packing limits that are set **per machine**. GroupCapBytes is each backup's own setting and does not belong here —
 // these two constrain the memory and the argv ceiling of the 7z process on this machine, and a different machine wants different values.
 builder.Services.AddSingleton(new PackLimits(
@@ -150,6 +194,8 @@ int DiffQueueInt(string key, int fallback) =>
     int.TryParse(builder.Configuration[$"Backup:DiffQueue{key}"], out var v) && v > 0 ? v : fallback;
 long DiffQueueLong(string key, long fallback) =>
     long.TryParse(builder.Configuration[$"Backup:DiffQueue{key}"], out var v) && v > 0 ? v : fallback;
+
+builder.Services.AddSingleton(new RunWorkDbFactory(workDbDir));
 
 builder.Services.AddSingleton(new DiffWorkQueueFactory(spillDir, new DiffQueueLimits(
     // The r stage (in memory, waiting to be picked up): the item count is the main dial, the bytes are the backstop, whichever hits first wins.
@@ -201,6 +247,7 @@ builder.Services.AddSingleton(sp => new BackupRunner(
 builder.Services.AddScoped(sp => new RestoreOrchestrator(
     sp.GetRequiredService<IBlobClientFactory>(),
     sp.GetRequiredService<IBackupInfoStore>(),
+    sp.GetRequiredService<IVersionCatalogs>(),
     sp.GetRequiredService<IFileCompressor>(),
     sp.GetRequiredService<IFileHasher>(),
     Path.Combine(tempPath, "restore"),
@@ -213,6 +260,7 @@ builder.Services.AddSingleton<OrphanSweeper>(); // the sweep owed when a check r
 builder.Services.AddScoped(sp => new BackupChecker(
     sp.GetRequiredService<IBlobClientFactory>(),
     sp.GetRequiredService<IBackupInfoStore>(),
+    sp.GetRequiredService<IVersionCatalogs>(),  // the version's index is read out of (and marked in) the container's catalog
     sp.GetRequiredService<IFileCompressor>(),
     sp.GetRequiredService<IFileHasher>(),
     Path.Combine(tempPath, "check"),
@@ -228,11 +276,11 @@ builder.Services.AddScoped(sp => new BackupRepairer(
     sp.GetRequiredService<IBlobUploader>(),
     Path.Combine(tempPath, "repair"),
     sp.GetRequiredService<StagingArea>(),
+    sp.GetRequiredService<IVersionCatalogs>(),  // repair reads entries from the catalog and patches its verdicts back, after the rewritten index is in the cloud
     sp.GetRequiredService<INotifier>(),
     sp.GetRequiredService<IOperationLog>(),
     sp.GetRequiredService<BackupChecker>(),
-    sp.GetRequiredService<TrackedInfoStore>(),
-    sp.GetRequiredService<ILocalIndexCache>(),  // repair goes through the local-authority state machine, so the next backup does not hit a 412 (§3.2)
+    sp.GetRequiredService<TrackedInfoStore>(),  // repair goes through the local-authority state machine, so the next backup does not hit a 412 (§3.2)
     journals: sp.GetRequiredService<BackupJournalStore>())); // active journals protect a suspended run's uploads from the orphan sweep
 
 // Operation log (M8) + global settings
@@ -342,6 +390,10 @@ var app = builder.Build();
 // application — nothing it does can tell whether the kernel is acting on the value — so the startup log is the only
 // place an operator can find out that it was asked for at all, let alone that it was refused or ignored.
 app.Logger.LogInformation("{IoPriority}", ioPriorityOutcome);
+
+// Notes gathered during Services registration, before app.Logger existed — see startupNotes above.
+foreach (var note in startupNotes)
+    app.Logger.LogInformation("{StartupNote}", note);
 
 // Make sure the directory holding the SQLite file exists (the connection string looks like "Data Source=data/app.db").
 var dataSource = new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder(sqliteConn).DataSource;

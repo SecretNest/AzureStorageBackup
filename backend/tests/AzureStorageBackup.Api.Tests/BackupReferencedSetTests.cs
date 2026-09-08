@@ -11,7 +11,7 @@ namespace AzureStorageBackup.Api.Tests;
 public sealed class BackupReferencedSetTests
 {
     [Fact]
-    public void Referenced_Set_Includes_Info_Indexes_And_All_Volumes_Across_Versions()
+    public async Task Referenced_Set_Includes_Info_Indexes_And_All_Volumes_Across_Versions()
     {
         // 2 versions: v1 IndexBlob=idx/1 (references a member of the 3-volume pack p1), v2 IndexBlob=idx/2 (references the single-volume data/h).
         var info = new BackupInfoFile
@@ -25,33 +25,15 @@ public sealed class BackupReferencedSetTests
             Packs = { ["p1"] = new PackInfo { Blob = "packs/p1.7z", Volumes = 3, Members = { "hh" } } },
         };
 
-        var v1 = new VersionIndex
+        // What the catalog hands the pure function: one row per storage object, kind and volume count included.
+        // data/h appears twice on purpose: one version records it as a single blob, another as three volumes.
+        // The two spellings occupy DIFFERENT names, so both have to end up protected.
+        var objects = new[]
         {
-            Version = 1,
-            Entries =
-            {
-                new IndexEntry
-                {
-                    Path = "foo.txt", Kind = "file", Permissions = "0644", FullHash = "hh",
-                    Storage = new StorageRef { Kind = "pack", Ref = "p1", EntryName = "foo.txt" },
-                },
-            },
-        };
-        var v2 = new VersionIndex
-        {
-            Version = 2,
-            Entries =
-            {
-                new IndexEntry
-                {
-                    Path = "bar.bin", Kind = "file", Permissions = "0644", FullHash = "h",
-                    Storage = new StorageRef { Kind = "blob", Ref = "data/h", Volumes = 1 },
-                },
-            },
-        };
-        var indexes = new Dictionary<int, VersionIndex> { [1] = v1, [2] = v2 };
+            ("pack", "p1", 1), ("blob", "data/h", 1), ("blob", "data/h", 3), ("blob", "data/big", 2),
+        }.ToAsyncEnumerable();
 
-        var refs = BackupChecker.ReferencedBlobNames(info, indexes);
+        var refs = await BackupChecker.ReferencedBlobNamesAsync(info, objects);
 
         // The info file (both namings are protected, never deleted).
         Assert.Contains(BackupDiscovery.IndexBlobName, refs);
@@ -63,12 +45,21 @@ public sealed class BackupReferencedSetTests
         Assert.Contains("packs/p1.7z.001", refs);
         Assert.Contains("packs/p1.7z.002", refs);
         Assert.Contains("packs/p1.7z.003", refs);
-        // The single-volume data blob (referenced by v2).
+        // The single-volume data blob (referenced by v2) — and, because another version records the same ref as
+        // three volumes, its suffixed names too. One volume is the bare name and three are .001..003: the sets are
+        // disjoint, so taking only the larger count would leave the live bare name unprotected.
         Assert.Contains("data/h", refs);
+        Assert.Contains("data/h.001", refs);
+        Assert.Contains("data/h.002", refs);
+        Assert.Contains("data/h.003", refs);
+        // Both volumes of a split single-file blob. The volume count for these lives on the entry, not in the info
+        // file, so it has to travel with the ref — miss it and the .002 is swept as an orphan and the file is gone.
+        Assert.Contains("data/big.001", refs);
+        Assert.Contains("data/big.002", refs);
     }
 
     [Fact]
-    public void Referenced_Set_Throws_When_Pack_Metadata_Missing()
+    public async Task Referenced_Set_Throws_When_Pack_Metadata_Missing()
     {
         // The pack is referenced but info.Packs holds no metadata for it → the volume count cannot be determined → throw, forcing the caller to abandon the deletion (safety first).
         var info = new BackupInfoFile
@@ -76,20 +67,7 @@ public sealed class BackupReferencedSetTests
             Backup = new BackupMeta { Name = "t", CreatedAt = DateTimeOffset.UtcNow },
             Versions = { new BackupVersion { Version = 1, IndexBlob = "idx/1", CreatedAt = default, Stats = new VersionStats(0, 0, 0, 0) } },
         };
-        var idx = new VersionIndex
-        {
-            Version = 1,
-            Entries =
-            {
-                new IndexEntry
-                {
-                    Path = "foo.txt", Kind = "file", Permissions = "0644",
-                    Storage = new StorageRef { Kind = "pack", Ref = "ghost", EntryName = "foo.txt" },
-                },
-            },
-        };
-
-        Assert.Throws<InvalidOperationException>(() =>
-            BackupChecker.ReferencedBlobNames(info, new Dictionary<int, VersionIndex> { [1] = idx }));
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            BackupChecker.ReferencedBlobNamesAsync(info, new[] { ("pack", "ghost", 1) }.ToAsyncEnumerable()));
     }
 }
