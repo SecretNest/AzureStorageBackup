@@ -59,24 +59,28 @@ export function windDownFromServer(stop: StopRequested | string | null | undefin
  * answer success and show "Paused" over a run that went on to Completed, and Suspend hung for its cap and
  * then handed back a Completed run labelled "Suspending…". At a few million entries the index write is
  * minutes, a whole stage rather than a race window. Stop stays live: it still skips the cleanup.
- * @param loadingVersions The run is between its scan and its diff, making sure every retained version is in
- * the catalog — on the first run after an upgrade, the migration of the container's whole history, hours
- * for a big one. The pass consults no gate: an import is one transaction per version, so a Pause pressed
- * against it would read "Pausing…" for the rest of the stage. Pause alone goes grey; Suspend and Stop stay
- * live, since both end the run here and keep every version already imported.
+ * @param catalogPass The run is between its scan and its diff, in one of the two catalog passes that consult
+ * no gate. `LoadingVersions`: making sure every retained version is in the catalog — on the first run after an
+ * upgrade, the migration of the container's whole history, hours for a big one; an import is one transaction
+ * per version, so a Pause pressed against it would read "Pausing…" for the rest of the stage. `CheckingCatalog`:
+ * the once-per-process full read of the catalog file, one SQL statement with nothing to park in. In both,
+ * Pause alone goes grey; Suspend and Stop stay live, since both end the run here (the check is interrupted,
+ * the load keeps every version already imported).
  */
+export type CatalogPass = 'LoadingVersions' | 'CheckingCatalog'
+
 export function windDownControls(
   kind: WindDownKind | undefined,
   wrappingUp = false,
-  loadingVersions = false,
+  catalogPass: CatalogPass | undefined = undefined,
 ): {
   /** Stop stays pressable while anything weaker than StopNow is winding down. */
   canStop: boolean
   /** Retry now / Resume / Pause / Suspend — none of them can act once a wind-down is under way. */
   canActOnGate: boolean
-  /** Pause specifically: everything canActOnGate says, and not while the versions are loading. */
+  /** Pause specifically: everything canActOnGate says, and not during a catalog pass. */
   canPause: boolean
-  /** The Pause button's tooltip: the gate's reason when there is one, else the version-loading one. */
+  /** The Pause button's tooltip: the gate's reason when there is one, else the catalog pass's. */
   pauseHint: string | undefined
   /** Why the gate controls are disabled when it is the wrap-up and not a wind-down that disabled them, for
    * the buttons' tooltip: a wind-down was the operator's own doing, the wrap-up is not, and a button that
@@ -97,12 +101,14 @@ export function windDownControls(
     canStop: kind !== 'now',
     canActOnGate,
     gateHint,
-    canPause: canActOnGate && !loadingVersions,
+    canPause: canActOnGate && catalogPass === undefined,
     pauseHint:
       gateHint ??
-      (canActOnGate && loadingVersions
+      (canActOnGate && catalogPass === 'LoadingVersions'
         ? 'The backup is loading its version history and cannot pause until the diff starts. Suspend or Stop end it now and keep every version already loaded.'
-        : undefined),
+        : canActOnGate && catalogPass === 'CheckingCatalog'
+          ? 'The backup is checking its catalog file and cannot pause until the diff starts. Suspend or Stop end it now; the check simply runs again next time.'
+          : undefined),
     // 'Stopping…' is claimed only where it is the whole truth. Under 'finish' a stop is indeed running,
     // but the button is still live and pressing it still does something, and a disabled-looking label on
     // a live button is the same lie in the other direction.

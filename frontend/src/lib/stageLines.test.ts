@@ -770,3 +770,13 @@ describe('versionItemLabel', () => {
     expect(versionItemLabel('version 7 @garbage→garbage')).toBe('version 7 @garbage→garbage')
   })
 })
+
+describe('the catalog check stage', () => {
+  test('is named for the reader, and shows the catalog it is reading', () => {
+    const lines = stageLines(
+      progress({ stage: 'CheckingCatalog', processed: 0, total: 1, currentItem: 'catalog.db (1.8 GB)' }),
+    )
+    expect(lines.label).toBe('Checking catalog')
+    expect(lines.counts).toBe('one full read of the catalog file')
+  })
+})

@@ -26,20 +26,23 @@ export const retentionModeLabels: Record<number, string> = {
 }
 
 // Stages of the backup pipeline
+// Numeric, in lockstep with the backend's BackupStage enum: a member inserted there renumbers everything after it here.
 export const BackupStage = {
   Scanning: 0,
   LoadingVersions: 1,
-  Diffing: 2,
-  Uploading: 3,
-  WritingIndex: 4,
-  Finalizing: 5,
-  CleaningUp: 6,
-  Completed: 7,
+  CheckingCatalog: 2,
+  Diffing: 3,
+  Uploading: 4,
+  WritingIndex: 5,
+  Finalizing: 6,
+  CleaningUp: 7,
+  Completed: 8,
 } as const
 
 export const backupStageLabels: Record<number, string> = {
   [BackupStage.Scanning]: 'Scanning',
   [BackupStage.LoadingVersions]: 'Loading versions',
+  [BackupStage.CheckingCatalog]: 'Checking catalog',
   [BackupStage.Diffing]: 'Diffing',
   [BackupStage.Uploading]: 'Uploading',
   [BackupStage.WritingIndex]: 'Writing index',

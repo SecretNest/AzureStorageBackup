@@ -299,4 +299,37 @@ public sealed class VersionCatalogStoreTests : IDisposable
         Assert.False(File.Exists(path + "-shm"));
         Assert.False(Directory.Exists(Path.GetDirectoryName(path)));
     }
+
+    // ---- The once-per-process quick_check has a face: the run asks whether it is due and pays for it on its own stage --
+
+    /// <summary>The full-file <c>quick_check</c> runs on the first write open per process per path and nowhere else,
+    /// and it is exactly as long as the catalog is big — so the run wants to know **beforehand** whether the write
+    /// open it is about to do will pay for it (to show a stage line), and wants to pay for it in a step of its own.
+    /// <see cref="VersionCatalogStore.NeedsCheck"/> answers, <see cref="VersionCatalogStore.EnsureCheckedAsync"/> pays,
+    /// and the write open that follows finds the path already checked.</summary>
+    [Fact]
+    public async Task NeedsCheck_is_due_until_the_check_has_run_and_due_again_once_forgotten()
+    {
+        var store = new VersionCatalogStore(_root);
+        Assert.True(store.NeedsCheck(AccountId, Container));
+
+        await store.EnsureCheckedAsync(AccountId, Container, CancellationToken.None);
+        Assert.False(store.NeedsCheck(AccountId, Container));
+        Assert.True(File.Exists(store.PathFor(AccountId, Container))); // a missing catalog is created, checked, and left in place
+
+        store.ForgetChecked(AccountId, Container);
+        Assert.True(store.NeedsCheck(AccountId, Container));
+    }
+
+    /// <summary>The bytes the check is about to read — what the stage line shows so a 20-second wait reads as
+    /// "2 GB of catalog", not as a hang. The WAL counts: quick_check reads through it.</summary>
+    [Fact]
+    public async Task CatalogBytes_is_the_file_size_and_zero_for_a_catalog_nobody_wrote_yet()
+    {
+        var store = new VersionCatalogStore(_root);
+        Assert.Equal(0, store.CatalogBytes(AccountId, Container));
+
+        await store.EnsureCheckedAsync(AccountId, Container, CancellationToken.None);
+        Assert.True(store.CatalogBytes(AccountId, Container) > 0);
+    }
 }

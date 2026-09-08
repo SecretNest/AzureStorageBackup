@@ -22,7 +22,7 @@ import { showsInterruptedNotice } from '../lib/interruptedNotice'
 import { latestWins, type LatestWins } from '../lib/latestWins'
 import { pauseDisplay } from '../lib/pauseDisplay'
 import { isInScope, parseScope, scopeToText } from '../lib/scopeRules'
-import { windDownControls, type WindDownKind } from '../lib/windDownControls'
+import { windDownControls, type CatalogPass, type WindDownKind } from '../lib/windDownControls'
 import { runTotals } from '../lib/runSummary'
 import { pipelineHold, preparingRowLabelOf, stageLines, type PipelineHold } from '../lib/stageLines'
 import { windDownFromServer } from '../lib/windDownControls'
@@ -1874,7 +1874,7 @@ function RunButtons({
   onResumePause,
   stopping,
   wrappingUp,
-  loadingVersions,
+  catalogPass,
 }: {
   onStop: () => void
   onSuspend: () => void
@@ -1889,9 +1889,9 @@ function RunButtons({
   // Past the uploads (index write onwards): the same four controls go quiet as during a wind-down, and the
   // tooltip says why, since this time it was not the operator who pressed anything. See windDownControls.
   wrappingUp?: boolean
-  // Between the scan and the diff, loading the version history: Pause alone goes quiet (the pass cannot park),
-  // Suspend and Stop stay live. See windDownControls.
-  loadingVersions?: boolean
+  // Between the scan and the diff, in a catalog pass (loading the version history, or the once-per-process
+  // catalog check): Pause alone goes quiet (the pass cannot park), Suspend and Stop stay live. See windDownControls.
+  catalogPass?: CatalogPass
 }) {
   // Which of these stay live once a wind-down is under way, and why Stop is not one of the ones that goes
   // quiet: see windDownControls. The short of it is that the backend's stop kinds form a ladder and
@@ -1900,7 +1900,7 @@ function RunButtons({
   const { canStop, canActOnGate, gateHint, canPause, pauseHint, stopLabel, suspendLabel } = windDownControls(
     stopping,
     wrappingUp,
-    loadingVersions,
+    catalogPass,
   )
   const pending = !canActOnGate
   return (
@@ -2256,7 +2256,13 @@ function RunStatus({
         // Mirrors the backend's BackupRunState.WrappingUp, which refuses Pause and Suspend from here on;
         // disabling them here is the half that keeps the operator from meeting that conflict at all.
         wrappingUp={p.stage >= BackupStage.WritingIndex}
-        loadingVersions={p.stage === BackupStage.LoadingVersions}
+        catalogPass={
+          p.stage === BackupStage.LoadingVersions
+            ? 'LoadingVersions'
+            : p.stage === BackupStage.CheckingCatalog
+              ? 'CheckingCatalog'
+              : undefined
+        }
       />
       {/* Details are folded into an expandable area: the path being processed can be very long and would
           distort the table if laid out in the row. One line of overall progress by default, expanded when
