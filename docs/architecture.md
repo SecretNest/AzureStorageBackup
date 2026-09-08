@@ -146,7 +146,7 @@ what makes a resume cheap.
 | Version indexes | a SQLite catalog per container in `data/index-cache/…`, decrypted, rebuilt from the cloud on demand (see storage-format.md) | authoritative for recovery |
 | Data blobs and packs | — | the backup itself |
 | Journals | `data/journal/…`, plain text | — |
-| Temp (compress, staged, verbose logs, per-run work databases, index staging) | `{tempPath}/…`, cleared at startup | — |
+| Temp (compress, staged, verbose logs, per-run work databases, index staging, 7z extraction) | `{tempPath}/…`, cleared at startup | — |
 
 **Device-local configuration is deliberately not written to the cloud**: the local root, the ignore
 rules and the scope rules describe *this machine*, and a recovery on another machine will have

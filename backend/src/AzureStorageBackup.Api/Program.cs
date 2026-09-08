@@ -78,8 +78,20 @@ static Func<ProcessPriorityClass> SevenZipPriority(IServiceProvider sp) => () =>
     }
 };
 
+// Where every intermediate this process writes to disk goes. Resolved here, before the first service that needs it:
+// the 7z codec's extraction root is the first of them (StagingArea, the info store, the work databases and the
+// catalogs' cloud import all take a directory under it further down).
+var tempPath = builder.Configuration["Backup:TempPath"];
+if (string.IsNullOrWhiteSpace(tempPath))
+    tempPath = Path.Combine(Path.GetTempPath(), "azurestoragebackup");
+
 // Backup engine (M4): 7z codec + info file/index reading and writing. The codec is constructed on demand (7z is probed on the first resolve).
-builder.Services.AddSingleton<IArchiveCodec>(sp => new SevenZipArchiveCodec(priority: SevenZipPriority(sp)));
+// Its temp root is Backup:TempPath too, for exactly the reason BackupInfoStore's is (see there): decoding a
+// multi-million-entry index extracts hundreds of MB before the result is moved to its destination, and the default
+// — the system temp dir — is a small tmpfs on a good number of NAS boxes.
+var sevenZipTemp = Path.Combine(tempPath, "7z");
+builder.Services.AddSingleton<IArchiveCodec>(sp =>
+    new SevenZipArchiveCodec(tempRoot: sevenZipTemp, priority: SevenZipPriority(sp)));
 // Version indexes are read from the SQLite catalog on demand, so the in-memory index cache the setting below used
 // to size is gone along with the cache itself. The setting is still read, only to say so.
 if (builder.Configuration["Backup:IndexCacheSize"] is { } retiredIndexCacheSize)
@@ -88,9 +100,6 @@ builder.Services.AddScoped<ILocalBackupStateStore, LocalBackupStateStore>();
 builder.Services.AddScoped<TrackedInfoStore>();
 
 // Engine components (singletons where stateless; StagingArea is a singleton so that compression is globally non-concurrent, across backups too).
-var tempPath = builder.Configuration["Backup:TempPath"];
-if (string.IsNullOrWhiteSpace(tempPath))
-    tempPath = Path.Combine(Path.GetTempPath(), "azurestoragebackup");
 builder.Services.AddSingleton(sp =>
 {
     var compress = Path.Combine(tempPath, "compress");
@@ -137,8 +146,13 @@ builder.Services.AddSingleton(new VersionIndexFileStore(Path.Combine(dbDir, "ind
 builder.Services.AddSingleton(sp => new VersionCatalogStore(
     Path.Combine(dbDir, "index-cache"), sp.GetService<ILogger<VersionCatalogStore>>()));
 // Scoped, because migrating a version into a catalog reads the app database (the pre-.idx rows) and the cloud, and
-// both of those come from the scope.
-builder.Services.AddScoped<IVersionCatalogs, VersionCatalogs>();
+// both of those come from the scope. Its temp root is the very same {tempPath}/index the info store stages under:
+// the cloud import writes the decoded index there before streaming it into the catalog, which is the same hundreds
+// of MB for the same reason, and sharing the directory means one ClearStale sweeps both.
+builder.Services.AddScoped<IVersionCatalogs>(sp => new VersionCatalogs(
+    sp.GetRequiredService<VersionCatalogStore>(), sp.GetRequiredService<VersionIndexFileStore>(),
+    sp.GetRequiredService<AppDbContext>(), sp.GetRequiredService<IBackupInfoStore>(),
+    sp.GetService<ILogger<VersionCatalogs>>(), Path.Combine(tempPath, "index")));
 
 // Spill area for the diff→upload queue. The write side never blocks: whatever memory cannot hold spills here, so diff can run all the way to the end —
 // which is the precondition for showing a remaining time during the upload stage (the denominator, SetTotal, is only fixed once diff finishes, see StageProgress.Eta).
@@ -155,8 +169,13 @@ RunWorkDbFactory.ClearStale(workDbDir);
 // Recovery leans on the journal (content confirmed in the cloud), not on these local half-products.
 StagingArea.ClearStale(Path.Combine(tempPath, "compress"), Path.Combine(tempPath, "staged"));
 // Same reasoning again: BackupInfoStore hands out one work directory per call (encode + read-back verification) and
-// deletes its own on a normal finish, so anything still under its temp root is residue from a killed process.
+// deletes its own on a normal finish, so anything still under its temp root is residue from a killed process. The
+// catalogs' cloud import stages into the same directory, in the same one-directory-per-call shape, so this one
+// sweep covers both.
 BackupInfoStore.ClearStale(Path.Combine(tempPath, "index"));
+// And the codec's extraction root, which has exactly the same shape (one directory per encode/decode, deleted on a
+// normal finish) — so the same sweep, rather than a second one that would only differ in its name.
+BackupInfoStore.ClearStale(sevenZipTemp);
 // The two packing limits that are set **per machine**. GroupCapBytes is each backup's own setting and does not belong here —
 // these two constrain the memory and the argv ceiling of the 7z process on this machine, and a different machine wants different values.
 builder.Services.AddSingleton(new PackLimits(
