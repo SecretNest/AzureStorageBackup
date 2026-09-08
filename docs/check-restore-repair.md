@@ -100,6 +100,28 @@ root" case.
 A pack is checked once per archive, not once per file, so the unit on screen is objects rather than
 files.
 
+### The local catalog
+
+The check opens by checking the one local thing it depends on: the container's catalog
+([storage-format.md](storage-format.md)), on its own stage, "Checking catalog". Two questions. Does the
+file pass a full `PRAGMA quick_check`? A backup only pays that read after an unclean exit; the check is
+where an operator asks on purpose, so it runs it every time, owed or not. And does the catalog's
+version list agree with the backup's info file? A retention cleanup interrupted between deleting blobs
+and removing rows leaves versions in the catalog that the info file no longer has, and a backup drops
+them before its diff for the same reason.
+
+Neither answer is a finding, and neither touches the report's `Ok`: the catalog is a cache. A catalog
+that fails its integrity check is **replaced on the spot** — deleted, recreated empty — and the check
+goes on against the version it re-imports from the cloud; stale versions are dropped. The report
+carries what was done in `CatalogNote` ("The local catalog failed its integrity check and was rebuilt…"),
+the row says "local catalog rebuilt", and the closing log line repeats it. There is deliberately no
+repair item for this: a broken cache has no decision in it, and a button would only add a wait. The one
+cost the note stands for is the next backup's "Loading versions", which re-imports every retained
+version's index from the cloud once.
+
+The stage shows no figures — no percentage, no bytes, no speed — because `quick_check` reports no
+progress; it names the file and its size, and on a multi-gigabyte catalog it is minutes.
+
 ### The unreferenced-blob scan
 
 Optional, and reported apart from the per-file verdicts: the container is listed and every blob name

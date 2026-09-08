@@ -123,6 +123,12 @@ public sealed record CheckReport(int Version, IReadOnlyList<FileFinding> Finding
     /// </summary>
     public string? OrphanScanIssue { get; init; }
 
+    /// <summary>What the check did to the local catalog, when it did anything: replaced a catalog that failed its
+    /// integrity check, or dropped versions the backup's info file no longer lists. The catalog is a cache, so neither
+    /// is a finding and neither touches <see cref="Ok"/> — it is rebuilt from the cloud on next use. Null when the
+    /// catalog was sound and in step.</summary>
+    public string? CatalogNote { get; init; }
+
     /// <summary>Names of the broken blobs (deduplicated; kept for the old frontend).</summary>
     public IReadOnlyList<string> MissingRefs =>
         Findings.Where(f => f.Cloud == CloudState.MissingOrBad && f.Ref is not null)

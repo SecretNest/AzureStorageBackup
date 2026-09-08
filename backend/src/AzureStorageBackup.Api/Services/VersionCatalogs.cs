@@ -44,6 +44,9 @@ public sealed class VersionCatalogs(
 
     public long CatalogBytes(int accountId, string container) => catalogs.CatalogBytes(accountId, container);
 
+    public Task<bool> VerifyCatalogAsync(int accountId, string container, CancellationToken ct = default) =>
+        catalogs.VerifyNowAsync(accountId, container, ct);
+
     public async Task EnsureVersionAsync(
         Account account, string container, BackupVersion version, long identityTicks, string? password, CancellationToken ct = default)
     {

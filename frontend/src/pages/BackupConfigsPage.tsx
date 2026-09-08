@@ -13,7 +13,7 @@ import { StopBackupDialog } from '../components/StopBackupDialog'
 import { formatBytes, formatDuration, formatVersionSpan } from '../constants/format'
 import { Field } from '../components/Field'
 import { EmptyRow } from '../components/EmptyRow'
-import { orphanSummary, repairabilitySummary, resolutionSummary } from '../lib/checkSummary'
+import { catalogSummary, orphanSummary, repairabilitySummary, resolutionSummary } from '../lib/checkSummary'
 import { stageLabelOf, versionItemLabel } from '../lib/stageLines'
 import { checkLocalSkipNotice, runSkipNotice } from '../lib/sentinelNotice'
 import { errorBadgeLabel } from '../lib/errorBadge'
@@ -2625,6 +2625,7 @@ function CheckStatus({ run, onStop }: { run: CheckRun; onStop: () => void }) {
           ? `Check completed — all checked objects OK (version ${r.version})`
           : `Check completed — ${repairabilitySummary(r)} (version ${r.version})`}
         {orphans && <span className={orphansWarn ? 'text-warn' : undefined}>{orphans}</span>}
+        {catalogSummary(r) && <span className="text-warn">{catalogSummary(r)}</span>}
         {/* Its own line, and always amber whatever the verdict above says: a column of "not checked"
             reads as a clean bill of health, which is the same false reassurance in a different costume.
             See checkLocalSkipNotice. */}
@@ -3233,6 +3234,11 @@ function CheckModal({
             <div className="text-warn" style={{ margin: '0.4rem 0' }}>
               Unreferenced-blob scan abandoned: {report.orphanScanIssue}. Nothing was listed, and nothing would be
               deleted by a repair — this is not a statement that the container is clean.
+            </div>
+          )}
+          {report.catalogNote && (
+            <div className="text-warn" style={{ margin: '0.4rem 0' }}>
+              Local catalog: {report.catalogNote}
             </div>
           )}
           {report.orphansChecked && (

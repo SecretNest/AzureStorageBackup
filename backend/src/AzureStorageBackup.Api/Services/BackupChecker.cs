@@ -108,6 +108,7 @@ public sealed class BackupChecker(
             var orphanNote = report.OrphanScanIssue is { } issue
                 ? $"; unreferenced-blob scan abandoned: {issue}"
                 : report.OrphansChecked ? $"; {report.OrphanBlobs.Count} unreferenced blob(s)" : "";
+            var catalogNote = report.CatalogNote is { } cn ? $"; {cn}" : "";
             if (notify)
                 await Record(
                 report.Ok ? NotificationEvents.CheckSuccess : NotificationEvents.CheckFailure, source,
@@ -116,6 +117,7 @@ public sealed class BackupChecker(
                     ? $"{report.Findings.Count} file(s) OK"
                     : ProblemsSummary(report))
                 + orphanNote
+                + catalogNote
                 // Repeated on the closing line and not only on the opening one, because these two lines are read
                 // in completely different circumstances: the opening one scrolls away, and the closing one is what
                 // a notification carries and what anyone auditing "did this backup verify?" months later reads.
@@ -221,6 +223,18 @@ public sealed class BackupChecker(
         // check. The identity stamp is the backup's creation timestamp — the same value every other cache in this
         // codebase keys on — so a container deleted and rebuilt under the same version numbers is never mistaken
         // for the one already in the file.
+        // The local catalog is checked before it is asked anything: the full-file quick_check, owed or not (the
+        // backup only pays it after an unclean exit; the check is where an operator asks on purpose), and the version
+        // list against the info file. It is a cache, so there is nothing to decide when it is broken — it is replaced
+        // here and the EnsureVersionAsync below re-imports the version this check needs — and the report says so
+        // without it being a finding. Its own stage, figureless like the backup's (quick_check reports no progress).
+        var checkingCatalog = Track(onProgress, "CheckingCatalog", 0);
+        checkingCatalog?.Touch($"catalog.db ({ByteSize.Human(catalogs.CatalogBytes(account.Id, container))})");
+        var catalogHealthy = await catalogs.VerifyCatalogAsync(account.Id, container, ct);
+        var droppedVersions = await DropStaleVersionsAsync(account, container, info, ct);
+        checkingCatalog?.Complete();
+        var catalogNote = CatalogNote(catalogHealthy, droppedVersions);
+
         await catalogs.EnsureVersionAsync(account, container, ver, info.Backup.CreatedAt.UtcTicks, password, ct);
 
         CheckReport report;
@@ -375,7 +389,41 @@ public sealed class BackupChecker(
             }
         }
 
-        return report;
+        return report with { CatalogNote = catalogNote };
+    }
+
+    /// <summary>Versions the local catalog holds that the backup's info file no longer lists — dropped, as the backup
+    /// does before its own diff (a retention cleanup interrupted between deleting blobs and removing rows leaves
+    /// exactly these), and returned so the report can name them. None for a catalog nobody has written yet.</summary>
+    private async Task<IReadOnlyList<int>> DropStaleVersionsAsync(
+        Account account, string container, BackupInfoFile info, CancellationToken ct)
+    {
+        var keep = info.Versions.Select(v => v.Version).ToHashSet();
+        List<int> stale;
+        try
+        {
+            await using var catalog = await catalogs.OpenAsync(account.Id, container, readOnly: true, ct);
+            stale = (await catalog.ListVersionsAsync(ct)).Select(v => v.Version).Where(v => !keep.Contains(v)).Order().ToList();
+        }
+        catch (FileNotFoundException)
+        {
+            return [];
+        }
+        if (stale.Count > 0)
+            await catalogs.ReconcileAsync(account.Id, container, keep, ct);
+        return stale;
+    }
+
+    /// <summary>The report's word on the local catalog: null when it was sound and in step, otherwise what was done.
+    /// Neither is a finding — the catalog is a cache, rebuilt from the cloud on next use.</summary>
+    internal static string? CatalogNote(bool healthy, IReadOnlyList<int> droppedVersions)
+    {
+        var parts = new List<string>();
+        if (!healthy)
+            parts.Add("The local catalog failed its integrity check and was rebuilt; it is filled from the cloud again on use.");
+        if (droppedVersions.Count > 0)
+            parts.Add($"Version(s) {string.Join(", ", droppedVersions)} were in the local catalog but not in the backup's info file and were dropped from it.");
+        return parts.Count == 0 ? null : string.Join(" ", parts);
     }
 
     /// <summary>Writes the version out with the findings applied, ready to be uploaded, and returns the file's path.
