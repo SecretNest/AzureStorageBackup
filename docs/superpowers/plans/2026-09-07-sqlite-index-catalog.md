@@ -1807,3 +1807,25 @@ git commit -m "docs: describe the SQLite index catalog and the work database; ve
 - Spec §Storage layout → Tasks 2, 3, 7. §Backup pipeline → 8–13. §Browsing and maintenance → 15–20. §Serialization, migration, compatibility → 1, 5, 6, 21, 22. §Error handling → 3 (corruption), 13 step 7 (catalog write after cloud), 7 (`FlushAsync` faults). §Concurrency → 3 (lock), 7 (writer channel). §Testing → every task's step 1, plus 22 and 23. §Delivery → 24.
 - Spec item not carried over verbatim: "version compare" — the repository has no such endpoint; `/file-versions` (Task 15) is the cross-version query. The spec file should be corrected to say so (one line) in Task 24.
 - Known bounded-by-something-other-than-file-count structures left in memory, by design: `ScanSummary.EmptyDirs` and `Unreadable`, `dirRemaining`, `aliasTable`, `dirPending`, `crossPending`, `pendingUnreadablePrev` (Task 9), the check report's `List<FileFinding>` (Task 18), restore substitutions and selections.
+
+---
+
+## Added during execution
+
+### Task 25: The pack alias table's leader map leaves memory
+
+Found by Task 23's benchmark: with unique file contents the live managed heap (forced collection) still grows
+by ~56 MB per 100 000 files. `PackAliasTable._leaderByContent` records the first path for EVERY pack member's
+content key (`PackAliasTable.cs:97`), not only for duplicates, so it is one entry per small file. The spec's
+non-goal ("`aliasTable` … bounded by duplicates") was wrong about this half of the table; `_aliasesByLeader`
+(one list per leader that actually has aliases) is the half that is bounded by duplicates and stays in memory.
+
+**Files:**
+- Create: `backend/src/AzureStorageBackup.Api/Services/PackLeaderStore.cs`
+- Modify: `backend/src/AzureStorageBackup.Api/Services/PackAliasTable.cs`, `Services/BackupOrchestrator.cs` (the `TryClaim` call and construction), `Services/RunWorkDbFactory.cs` (side-file path + `ClearStale` glob), tests `PackAliasTableTests.cs`, `PackAliasDedupTests.cs`, `MemoryBenchmarkTests.cs` (no change expected), `docs/superpowers/plans/2026-09-07-sqlite-index-catalog-benchmark.md` (round 3), `docs/storage-format.md` (one sentence on the side file).
+
+**Interfaces:**
+- `PackLeaderStore : IAsyncDisposable` — its own SQLite file `{tempPath}/work/{runId}.aliases.db` (so its write transaction never contends with `work.db`'s writer), table `pack_leaders(content_key TEXT PRIMARY KEY, path TEXT NOT NULL) WITHOUT ROWID`, pragmas `journal_mode=OFF`, `synchronous=OFF`, `cache_size=-16384`; one connection; `ValueTask<string?> ClaimAsync(string contentKey, string path, CancellationToken ct)` returns the existing leader's path or null after inserting the caller as leader (`INSERT OR IGNORE` + `SELECT` on the same connection inside one long transaction committed every 2 000 claims and on dispose — the connection sees its own uncommitted rows, so a duplicate arriving inside the batch window still finds its leader). File deleted on dispose.
+- `PackAliasTable` becomes `PackAliasTable(PackLeaderStore leaders)` with `ValueTask<bool> TryClaimAsync(fullHash, length, headHash, tailHash, path, ct)`; `AliasesByLeader` unchanged.
+
+**Steps:** (1) `PackAliasTableTests` rewritten to the async API over a temp store (same cases) plus one test that 200 000 distinct claims leave the table's managed footprint flat (assert `_aliasesByLeader.Count == 0` and that the store file holds 200 000 rows); (2) implement; (3) orchestrator: construct the store from the factory next to the work db, `await using`, call `TryClaimAsync`; (4) `RunWorkDbFactory.ClearStale` also removes `*.aliases.db`; (5) full suite; (6) re-run the AFTER benchmark (`ASB_BENCH=1`) at 100 k / 200 k with unique contents, update the benchmark doc's primary table and the acceptance verdict (and correct the round-2 attribution to `diff.Changes`, which no longer exists — the structure was the leader map); (7) commit `feat(pack): keep the alias table's leader map in a per-run SQLite file` with the numbers in the body.
