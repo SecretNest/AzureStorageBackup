@@ -223,6 +223,35 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
         await using var catalog = await OpenForWriteAsync(held, accountId, container, ct);
     }
 
+    /// <summary>
+    /// The check's entry point: runs the full-file <see cref="VersionCatalog.QuickCheckAsync"/> now, owed or not, under
+    /// the container's write lock. True: the catalog is sound, and counts as checked for this process. False: it was
+    /// corrupt and has been replaced with a fresh, empty one — it is a cache, and the next use (the check itself, a
+    /// backup) re-imports the versions from the cloud. A catalog nobody has written yet is not created for this;
+    /// there is nothing to check.
+    /// </summary>
+    public async Task<bool> VerifyNowAsync(int accountId, string container, CancellationToken ct)
+    {
+        var path = PathFor(accountId, container);
+        using var held = await LockForWriteAsync(accountId, container, ct);
+        if (!File.Exists(path))
+            return true;
+        try
+        {
+            await using var catalog = await VersionCatalog.OpenAsync(path, readOnly: false, ct);
+            await catalog.QuickCheckAsync(ct);
+        }
+        catch (SqliteException ex) when (ex.SqliteErrorCode is 11 /* SQLITE_CORRUPT */ or 26 /* SQLITE_NOTADB */)
+        {
+            await using var _ = await RecoverAsync(path, ex, ct);
+            return false;
+        }
+        _checkedPaths.TryAdd(path, 0);
+        _damageSeen.TryRemove(path, out _);
+        MarkOpen(path);
+        return true;
+    }
+
     /// <summary>The bytes <see cref="VersionCatalog.QuickCheckAsync"/> is about to read — the main file plus its WAL,
     /// which the check reads through. 0 for a catalog nobody wrote yet.</summary>
     public long CatalogBytes(int accountId, string container)

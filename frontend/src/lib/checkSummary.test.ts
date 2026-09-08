@@ -2,7 +2,7 @@ import { describe, expect, test } from 'vitest'
 
 import type { CheckReport, FileFinding } from '../api/backupConfigs'
 import { CloudState, LocalState } from '../api/backupConfigs'
-import { orphanSummary, repairabilitySummary, resolutionSummary } from './checkSummary'
+import { catalogSummary, orphanSummary, repairabilitySummary, resolutionSummary } from './checkSummary'
 
 function report(over: Partial<CheckReport> = {}): CheckReport {
   return {
@@ -53,6 +53,20 @@ describe('orphanSummary', () => {
         report({ orphansChecked: false, orphanScanIssue: 'reference set incomplete', orphanBlobs: [] }),
       ),
     ).toBe(' · unreferenced-blob scan abandoned')
+  })
+})
+
+describe('catalogSummary', () => {
+  /** The local catalog is a cache: a check that had to replace it says so on the row, and Ok stays what it was. */
+  test('a replaced catalog is stated on the row', () => {
+    expect(catalogSummary(report({ catalogNote: 'The local catalog failed its integrity check and was rebuilt.' }))).toBe(
+      ' · local catalog rebuilt',
+    )
+  })
+
+  test('a healthy catalog says nothing', () => {
+    expect(catalogSummary(report())).toBe('')
+    expect(catalogSummary(report({ catalogNote: null }))).toBe('')
   })
 })
 

@@ -55,7 +55,7 @@ public sealed class VersionCatalogStoreTests : IDisposable
     /// invalid value. That byte is not "some random corruption that quick_check might or might not notice" — it is
     /// the b-tree page's own type flag, which quick_check reliably reports regardless of which table or index the
     /// page happens to belong to.</summary>
-    private static void CorruptPage2(string path)
+    internal static void CorruptPage2(string path)
     {
         using var stream = new FileStream(path, FileMode.Open, FileAccess.ReadWrite);
         Assert.True(stream.Length > 8192, "fixture did not produce a second page to corrupt");
@@ -356,5 +356,30 @@ public sealed class VersionCatalogStoreTests : IDisposable
 
         await store.EnsureCheckedAsync(AccountId, Container, CancellationToken.None);
         Assert.True(store.CatalogBytes(AccountId, Container) > 0);
+    }
+
+    /// <summary>The check's entry point: run the full-file quick_check now, owed or not, and say whether the catalog
+    /// survived. A corrupt one is replaced on the spot (it is a cache; the next use re-imports from the cloud) and
+    /// reported as such; a catalog nobody has written yet is not conjured up just to be checked.</summary>
+    [Fact]
+    public async Task VerifyNow_reports_a_healthy_catalog_and_replaces_a_corrupt_one()
+    {
+        var logger = Substitute.For<ILogger<VersionCatalogStore>>();
+        var store = new VersionCatalogStore(_root, logger);
+        var path = store.PathFor(AccountId, Container);
+
+        Assert.True(await store.VerifyNowAsync(AccountId, Container, CancellationToken.None));
+        Assert.False(File.Exists(path)); // nothing to check, nothing created
+
+        await BuildMultiPageCatalogAsync(path);
+        Assert.True(await store.VerifyNowAsync(AccountId, Container, CancellationToken.None));
+        Assert.Empty(WarningCalls(logger));
+
+        CorruptPage2(path);
+        Assert.False(await store.VerifyNowAsync(AccountId, Container, CancellationToken.None));
+        Assert.Single(WarningCalls(logger));
+        using (var held = await store.LockForWriteAsync(AccountId, Container, CancellationToken.None))
+        await using (var catalog = await store.OpenForWriteAsync(held, AccountId, Container, CancellationToken.None))
+            Assert.Empty(await catalog.ListVersionsAsync(CancellationToken.None)); // a fresh, empty catalog in its place
     }
 }

@@ -76,6 +76,12 @@ export function orphanSummary(report: CheckReport): string {
  * cloud and hashes locally per bad object on its own; it never trusted this report's flag).
  * Mirrors BackupChecker.ProblemsSummary on the notification side.
  */
+/** The local catalog's line on the row: only when the check had to do something to it. It is a cache, so this is
+ * information, not a problem — the row's tone does not change for it. */
+export function catalogSummary(report: CheckReport): string {
+  return report.catalogNote ? ' · local catalog rebuilt' : ''
+}
+
 export function repairabilitySummary(report: CheckReport): string {
   const problems = report.findings.filter((f) => f.cloud === CloudState.MissingOrBad)
   const unassessed = problems.filter((f) => f.local === LocalState.NotChecked).length

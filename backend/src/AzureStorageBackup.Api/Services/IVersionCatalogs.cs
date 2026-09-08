@@ -96,6 +96,11 @@ public interface IVersionCatalogs
 
     /// <summary>The bytes the check will read (main file plus WAL), for the stage line; 0 when unknown.</summary>
     long CatalogBytes(int accountId, string container) => 0;
+
+    /// <summary>The check's integrity pass over the local catalog, owed or not: true when sound, false when it was
+    /// corrupt and has been replaced (<see cref="VersionCatalogStore.VerifyNowAsync"/>). Defaults to sound for test
+    /// doubles that keep no file.</summary>
+    Task<bool> VerifyCatalogAsync(int accountId, string container, CancellationToken ct = default) => Task.FromResult(true);
 }
 
 /// <summary>What happened to one version during <see cref="IVersionCatalogs.EnsureVersionsAsync"/>.</summary>

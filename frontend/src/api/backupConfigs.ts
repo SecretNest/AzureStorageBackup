@@ -556,6 +556,9 @@ export interface CheckReport {
   // Set when the scan was asked for but abandoned (the full reference set could not be built). Shown rather than
   // swallowed: silence is indistinguishable from "never ticked", which is the confusion being fixed.
   orphanScanIssue: string | null
+  // What the check did to the local catalog (replaced a corrupt one, dropped versions the info file no longer
+  // lists), or null when it was sound. A cache, so never a finding and never part of ok.
+  catalogNote?: string | null
   // The sentinel that was missing, which is why every finding's local state reads "not checked"; null when
   // the local axis ran. Carried on the report for the same reason orphansChecked is — the check dialog is
   // long closed by the time anyone reads this, and a column of "not checked" cannot tell "nobody asked" from

@@ -58,12 +58,12 @@ public sealed class BackupCheckerTests : IDisposable
     /// see the comment on <see cref="BackupChecker.Clock"/> — it only defeats the throttle window, it does not affect
     /// the download/extraction themselves.</param>
     private (BackupOrchestrator Backup, BackupChecker Checker, BlobClientFactory Factory) Build(
-        IFileCompressor? checkCompressor = null, Func<long>? checkerClock = null)
+        IFileCompressor? checkCompressor = null, Func<long>? checkerClock = null, VersionCatalogStore? catalogStore = null)
     {
         var factory = new BlobClientFactory(TestSecrets.Reader);
         var store = new BackupInfoStore(factory, new SevenZipArchiveCodec());
         var staging = new StagingArea(Path.Combine(_temp, "c"), Path.Combine(_temp, "s"), () => 200_000_000);
-        var authority = _authority = new TestLocalAuthority(store);
+        var authority = _authority = new TestLocalAuthority(store, catalogStore);
         var backup = new BackupOrchestrator(
             new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
             new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging, new RetentionCleaner(factory, store, new RetentionEvaluator(), catalogs: authority.Catalogs, trackedInfo: authority.Tracked), new FileHasher(), authority.Catalogs, authority.Tracked,
@@ -1293,5 +1293,54 @@ public sealed class BackupCheckerTests : IDisposable
             Assert.DoesNotContain("a.txt", await catalog.UnrecoverableAsync(v1.Version, CancellationToken.None));
         }
         finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>The check owns the local catalog too: it runs the full-file quick_check on its own figureless stage,
+    /// and a catalog that fails it is a cache, so the check replaces it on the spot and says so in the report —
+    /// rebuilt from the cloud on next use, which the check itself is (it re-imports the version it checks). Not a
+    /// finding, not a repair item: there is no decision to be had over a broken cache, and Ok is untouched.</summary>
+    [SkippableFact]
+    public async Task A_Corrupt_Local_Catalog_Is_Replaced_By_The_Check_And_Noted_In_The_Report()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var catalogStore = new VersionCatalogStore(Path.Combine(_temp, "catalogs"));
+        var (backup, checker, factory) = Build(catalogStore: catalogStore);
+        var account = AzuriteAccount();
+        var name = RandomName("chkcat-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            await File.WriteAllTextAsync(Path.Combine(_src, "a.txt"), "alpha");
+            await backup.RunAsync(Req(account, name));
+
+            var stages = new List<string>();
+            var clean = await checker.CheckAsync(account, name, null, null, new CheckOptions(),
+                onProgress: d => { lock (stages) stages.Add(d.Stage); });
+            Assert.True(clean.Ok);
+            Assert.Null(clean.CatalogNote);
+            lock (stages) Assert.Contains("CheckingCatalog", stages);
+
+            VersionCatalogStoreTests.CorruptPage2(catalogStore.PathFor(account.Id, name));
+
+            var result = await checker.CheckAsync(account, name, null, null, new CheckOptions());
+            Assert.True(result.Ok); // the backup itself is fine; a broken cache is not a finding
+            Assert.NotEmpty(result.Findings); // the check went on, against the version re-imported into the fresh catalog
+            Assert.Contains("rebuilt", result.CatalogNote);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    [Fact]
+    public void The_Catalog_Note_Names_What_Was_Done_And_Is_Silent_When_Nothing_Was()
+    {
+        Assert.Null(BackupChecker.CatalogNote(healthy: true, droppedVersions: []));
+        Assert.Contains("rebuilt", BackupChecker.CatalogNote(healthy: false, droppedVersions: []));
+        var both = BackupChecker.CatalogNote(healthy: false, droppedVersions: [3, 4])!;
+        Assert.Contains("rebuilt", both);
+        Assert.Contains("3, 4", both);
+        Assert.DoesNotContain("rebuilt", BackupChecker.CatalogNote(healthy: true, droppedVersions: [7]));
     }
 }
