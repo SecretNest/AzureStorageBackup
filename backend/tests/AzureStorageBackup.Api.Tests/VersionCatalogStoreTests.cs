@@ -140,6 +140,7 @@ public sealed class VersionCatalogStoreTests : IDisposable
         // Unlike Test 3's random bytes, this file passes ApplyPragmas' own statements (its header is intact) — only
         // a full quick_check scan finds the damage, which is the path this test exists to exercise.
         await BuildMultiPageCatalogAsync(path);
+        await LeaveUncleanExitBehindAsync(); // the check is only owed after an unclean exit
         CorruptPage2(path);
 
         using (var held = await store.LockForWriteAsync(AccountId, Container, CancellationToken.None))
@@ -160,6 +161,7 @@ public sealed class VersionCatalogStoreTests : IDisposable
         var store = new VersionCatalogStore(_root);
         var path = store.PathFor(AccountId, Container);
         await BuildMultiPageCatalogAsync(path);
+        await LeaveUncleanExitBehindAsync(); // the check is only owed after an unclean exit
 
         // First open through the store: the path is unchecked, so quick_check runs — and, correctly, finds nothing
         // wrong yet — and marks the path checked.
@@ -196,6 +198,7 @@ public sealed class VersionCatalogStoreTests : IDisposable
         var path = store.PathFor(AccountId, Container);
 
         await BuildMultiPageCatalogAsync(path);
+        await LeaveUncleanExitBehindAsync(); // the check is only owed after an unclean exit
         CorruptPage2(path);
 
         // EVERY production write open happens inside this lock — the import at the end of a run, the checker's and
@@ -300,25 +303,47 @@ public sealed class VersionCatalogStoreTests : IDisposable
         Assert.False(Directory.Exists(Path.GetDirectoryName(path)));
     }
 
-    // ---- The once-per-process quick_check has a face: the run asks whether it is due and pays for it on its own stage --
+    // ---- quick_check runs only after an unclean exit, and the run asks beforehand so it can show a stage ------------
 
-    /// <summary>The full-file <c>quick_check</c> runs on the first write open per process per path and nowhere else,
-    /// and it is exactly as long as the catalog is big — so the run wants to know **beforehand** whether the write
-    /// open it is about to do will pay for it (to show a stage line), and wants to pay for it in a step of its own.
-    /// <see cref="VersionCatalogStore.NeedsCheck"/> answers, <see cref="VersionCatalogStore.EnsureCheckedAsync"/> pays,
-    /// and the write open that follows finds the path already checked.</summary>
+    /// <summary>A write open leaves an "open" marker beside the catalog that a clean shutdown (disposing the store)
+    /// removes. The full-file <c>quick_check</c> is owed only when the marker is still there at the next start — the
+    /// last process that wrote this catalog did not exit cleanly — or when a reader found damage (<see cref="VersionCatalogStore.ForgetChecked"/>).
+    /// A catalog nobody has opened, or one the last process closed cleanly, is not re-read: for an 8 GB catalog that
+    /// read is minutes at the start of every backup after a restart, and a clean exit is exactly the case it guards nothing against.</summary>
     [Fact]
-    public async Task NeedsCheck_is_due_until_the_check_has_run_and_due_again_once_forgotten()
+    public async Task QuickCheck_is_owed_only_after_an_unclean_exit_or_when_damage_was_seen()
     {
-        var store = new VersionCatalogStore(_root);
-        Assert.True(store.NeedsCheck(AccountId, Container));
+        var first = new VersionCatalogStore(_root);
+        Assert.False(first.NeedsCheck(AccountId, Container)); // never opened: nothing to distrust
 
-        await store.EnsureCheckedAsync(AccountId, Container, CancellationToken.None);
-        Assert.False(store.NeedsCheck(AccountId, Container));
-        Assert.True(File.Exists(store.PathFor(AccountId, Container))); // a missing catalog is created, checked, and left in place
+        using (var held = await first.LockForWriteAsync(AccountId, Container, CancellationToken.None))
+        await using (var catalog = await first.OpenForWriteAsync(held, AccountId, Container, CancellationToken.None))
+            Assert.Empty(await catalog.ListVersionsAsync(CancellationToken.None));
+        Assert.False(first.NeedsCheck(AccountId, Container)); // its own open is not a reason
 
-        store.ForgetChecked(AccountId, Container);
-        Assert.True(store.NeedsCheck(AccountId, Container));
+        // A second process while the first never exited cleanly (never disposed): the check is owed once.
+        var next = new VersionCatalogStore(_root);
+        Assert.True(next.NeedsCheck(AccountId, Container));
+        await next.EnsureCheckedAsync(AccountId, Container, CancellationToken.None);
+        Assert.False(next.NeedsCheck(AccountId, Container));
+
+        // A reader that saw damage puts it back on the table, marker or not.
+        next.ForgetChecked(AccountId, Container);
+        Assert.True(next.NeedsCheck(AccountId, Container));
+
+        // A clean shutdown takes the marker with it: the process after that owes nothing.
+        next.Dispose();
+        first.Dispose();
+        Assert.False(new VersionCatalogStore(_root).NeedsCheck(AccountId, Container));
+    }
+
+    /// <summary>What a process that dies with the catalog open leaves behind: the marker a write open creates and only
+    /// a clean shutdown removes. The store is deliberately not disposed.</summary>
+    private async Task LeaveUncleanExitBehindAsync()
+    {
+        var crashed = new VersionCatalogStore(_root);
+        using var held = await crashed.LockForWriteAsync(AccountId, Container, CancellationToken.None);
+        await using var catalog = await crashed.OpenForWriteAsync(held, AccountId, Container, CancellationToken.None);
     }
 
     /// <summary>The bytes the check is about to read — what the stage line shows so a 20-second wait reads as

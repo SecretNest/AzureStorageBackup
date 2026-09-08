@@ -773,10 +773,13 @@ describe('versionItemLabel', () => {
 
 describe('the catalog check stage', () => {
   test('is named for the reader, and shows the catalog it is reading', () => {
+    // No total, no in-flight item, no bytes: a read that cannot report progress must not print a 0% or a 0 B/s.
     const lines = stageLines(
-      progress({ stage: 'CheckingCatalog', processed: 0, total: 1, currentItem: 'catalog.db (1.8 GB)' }),
+      progress({ stage: 'CheckingCatalog', processed: 0, total: 0, currentItem: 'catalog.db (1.8 GB)' }),
     )
     expect(lines.label).toBe('Checking catalog')
     expect(lines.counts).toBe('one full read of the catalog file')
+    expect(lines.speed).toBe('')
+    expect(lines.done).toBe('')
   })
 })

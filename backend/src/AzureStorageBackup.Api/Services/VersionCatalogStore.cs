@@ -16,7 +16,7 @@ namespace AzureStorageBackup.Api.Services;
 /// same "safe to lose, will re-download" contract with the deployment's backup story.
 /// </para>
 /// </summary>
-public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogStore>? logger = null)
+public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogStore>? logger = null) : IDisposable
 {
     /// <summary>One <see cref="SemaphoreSlim"/> per container path, created on first use and kept for the process's
     /// lifetime — cheap (a handful of bytes each), and simpler than tearing one down while a caller might still be
@@ -29,6 +29,21 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
     /// A corrupt-recovery removes its path so the freshly recreated file gets checked once too (trivially, since it
     /// is empty) rather than being trusted purely because the old, bad file at that path once passed.</summary>
     private readonly ConcurrentDictionary<string, byte> _checkedPaths = new();
+
+    /// <summary>Paths a reader found damage on (<see cref="ForgetChecked"/>): the check is owed regardless of the marker.</summary>
+    private readonly ConcurrentDictionary<string, byte> _damageSeen = new();
+
+    /// <summary>Paths this process has opened for writing — the ones whose "open" marker (<see cref="OpenMarkerFor"/>)
+    /// it wrote and takes away again in <see cref="Dispose"/>, the clean shutdown.</summary>
+    private readonly ConcurrentDictionary<string, byte> _openedHere = new();
+
+    /// <summary>
+    /// The file a write open leaves beside the catalog and only a clean shutdown removes. Found at the next start, it
+    /// says the last process that wrote this catalog did not exit cleanly — a kill, a crash, a power cut — and that is
+    /// the one case the full-file <c>quick_check</c> is for. A catalog closed cleanly is not re-read: for an 8 GB
+    /// catalog that read is minutes at the start of every backup after a restart, spent guarding against nothing.
+    /// </summary>
+    private static string OpenMarkerFor(string path) => path + ".open";
 
     /// <summary>Mirrors <see cref="VersionIndexFileStore"/>'s character-safety rules verbatim: the two stores share a
     /// directory, so a container name that is unsafe for one filename must be made unsafe the same way for the
@@ -124,7 +139,7 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
     private async Task<VersionCatalog> OpenCheckedAsync(string path, CancellationToken ct)
     {
         var catalog = await VersionCatalog.OpenAsync(path, readOnly: false, ct);
-        if (_checkedPaths.TryAdd(path, 0))
+        if (NeedsCheck(path))
         {
             try
             {
@@ -132,13 +147,48 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
             }
             catch
             {
-                _checkedPaths.TryRemove(path, out _);
                 await catalog.DisposeAsync();
                 throw;
             }
         }
-
+        // Decided and settled before the marker goes down: this process's own open must not read as a reason to
+        // check on its own next write open.
+        _checkedPaths.TryAdd(path, 0);
+        _damageSeen.TryRemove(path, out _);
+        MarkOpen(path);
         return catalog;
+    }
+
+    private bool NeedsCheck(string path) =>
+        !_checkedPaths.ContainsKey(path) && (_damageSeen.ContainsKey(path) || File.Exists(OpenMarkerFor(path)));
+
+    private void MarkOpen(string path)
+    {
+        if (!_openedHere.TryAdd(path, 0))
+            return;
+        try
+        {
+            using var _ = new FileStream(OpenMarkerFor(path), FileMode.OpenOrCreate, FileAccess.Write, FileShare.ReadWrite | FileShare.Delete);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Without the marker the next start will not check this catalog. Said in the log rather than failing the
+            // open: the catalog is a cache, and a read that finds damage still recovers it (ForgetChecked).
+            _openedHere.TryRemove(path, out _);
+            logger?.LogWarning(ex, "Could not write the open marker beside catalog {Path}; the next start will not re-check it.", path);
+        }
+    }
+
+    /// <summary>The clean shutdown: takes away the "open" marker of every catalog this process wrote, so the next start
+    /// trusts them. Registered as a singleton, the host disposes it on the way down; a process that dies before this
+    /// runs leaves the markers, and the next start pays the check for exactly those catalogs.</summary>
+    public void Dispose()
+    {
+        foreach (var path in _openedHere.Keys)
+        {
+            DeleteIfExists(OpenMarkerFor(path));
+            _openedHere.TryRemove(path, out _);
+        }
     }
 
     /// <summary>The corrupt-file path: delete the file and its WAL siblings and open a fresh, empty catalog in its
@@ -151,15 +201,18 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
             "Catalog {Path} is unreadable; deleting it. It is a cache and will be rebuilt from the cloud on demand.", path);
         DeleteContainerFiles(path);
         _checkedPaths.TryRemove(path, out _);
+        _damageSeen.TryRemove(path, out _);
+        _openedHere.TryRemove(path, out _); // the marker went with the files; the fresh file gets its own
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
         return await OpenCheckedAsync(path, ct);
     }
 
     /// <summary>Whether the next write open of this container's catalog will run the full-file
-    /// <see cref="VersionCatalog.QuickCheckAsync"/> — true until the first write open in this process, and again after
-    /// <see cref="ForgetChecked"/>. The run asks this **before** it opens, so the check can be shown on a stage line of
-    /// its own instead of running unannounced inside whatever open happens to come first.</summary>
-    public bool NeedsCheck(int accountId, string container) => !_checkedPaths.ContainsKey(PathFor(accountId, container));
+    /// <see cref="VersionCatalog.QuickCheckAsync"/>: not yet this process, and either the last process that wrote it
+    /// did not exit cleanly (<see cref="OpenMarkerFor"/>) or a reader saw damage (<see cref="ForgetChecked"/>). The run
+    /// asks this **before** it opens, so the check can be shown on a stage line of its own instead of running
+    /// unannounced inside whatever open happens to come first.</summary>
+    public bool NeedsCheck(int accountId, string container) => NeedsCheck(PathFor(accountId, container));
 
     /// <summary>Runs the check now, under the container's write lock, if it is still due — the write open that follows
     /// finds the path checked. A catalog nobody wrote yet is created (and trivially passes), as any write open would.
@@ -185,8 +238,12 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
     /// path for writing, and without this the locked write open that follows would trust the stale "already
     /// checked" marker, skip the scan, and hand back a catalog whose first real query throws the same error
     /// uncaught instead of the write path recovering it.</summary>
-    internal void ForgetChecked(int accountId, string container) =>
-        _checkedPaths.TryRemove(PathFor(accountId, container), out _);
+    internal void ForgetChecked(int accountId, string container)
+    {
+        var path = PathFor(accountId, container);
+        _checkedPaths.TryRemove(path, out _);
+        _damageSeen.TryAdd(path, 0);
+    }
 
     /// <summary>
     /// Reserves the container's single write slot. The catalog's own writes (import, patch) go through one
@@ -240,6 +297,7 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
         DeleteIfExists(path);
         DeleteIfExists(path + "-wal");
         DeleteIfExists(path + "-shm");
+        DeleteIfExists(OpenMarkerFor(path));
 
         var dir = Path.GetDirectoryName(path)!;
         if (Directory.Exists(dir) && !Directory.EnumerateFileSystemEntries(dir).Any())
