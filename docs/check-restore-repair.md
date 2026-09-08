@@ -100,6 +100,29 @@ root" case.
 A pack is checked once per archive, not once per file, so the unit on screen is objects rather than
 files.
 
+### The unreferenced-blob scan
+
+Optional, and reported apart from the per-file verdicts: the container is listed and every blob name
+compared against the set of names this backup can account for — the info file under both its
+plaintext and encrypted names, every volume of every version's second-level index, and every volume
+of every object any retained version references (`BackupChecker.ReferencedBlobNamesAsync`). What is
+left over is reported as reclaimable. Deleting is not this scan's job: collection is the retention
+cleaner's, and it compares base names rather than volume names
+([backup-engine.md](backup-engine.md)).
+
+**Every distinct volume count a reference is recorded under contributes its names, not just the
+largest.** A one-volume family occupies the bare `data/{hash}`; a three-volume one occupies
+`.001`–`.003`. The two name sets are **disjoint rather than nested**, so where one version records a
+ref as one volume and another records it as three, collapsing them onto the larger count leaves the
+live bare name out of the protected set — and the scan then reports a blob that is in use as
+reclaimable.
+
+**A referenced pack with no metadata in the info file abandons the scan** rather than being guessed
+at. Its volume count is unknowable, and an incomplete protected set is a licence to delete live data,
+so the run reports why it could not answer instead of answering wrongly.
+
+Blobs held by an **active journal** are protected as well — see § *Repair beside a suspended backup*.
+
 ### The check is a background job
 
 `POST /backup-configs/{id}/check` returns **202** with a run state and you poll `GET` on the same
