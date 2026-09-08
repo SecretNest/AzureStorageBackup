@@ -1,5 +1,6 @@
 using AzureStorageBackup.Api.Data;
 using AzureStorageBackup.Api.Models;
+using Microsoft.Data.Sqlite;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Logging;
 
@@ -16,14 +17,24 @@ namespace AzureStorageBackup.Api.Services;
 /// first read-write open of a path), and off the lock every other writer of the same container contends for.
 /// </para>
 /// </summary>
+/// <param name="tempRoot">Where the cloud import's decoded index is written before it is streamed into the catalog.
+/// It is the same directory <see cref="BackupInfoStore"/> stages its own decode under (<c>{tempPath}/index</c>), and
+/// for the same reason: a multi-million-entry index is hundreds of MB decoded, and the system temp dir on a NAS is
+/// quite often a small tmpfs. <c>BackupInfoStore.ClearStale</c> already sweeps it at startup.</param>
 public sealed class VersionCatalogs(
     VersionCatalogStore catalogs, VersionIndexFileStore legacyFiles, AppDbContext db, IBackupInfoStore store,
-    ILogger<VersionCatalogs>? logger = null) : IVersionCatalogs
+    ILogger<VersionCatalogs>? logger = null, string? tempRoot = null) : IVersionCatalogs
 {
+    private readonly string _tempRoot = tempRoot ?? Path.Combine(Path.GetTempPath(), "asb-index");
+
     public Task<VersionCatalog> OpenAsync(int accountId, string container, bool readOnly, CancellationToken ct = default) =>
         catalogs.OpenAsync(accountId, container, readOnly, ct);
 
-    public Task<IDisposable> LockForWriteAsync(int accountId, string container, CancellationToken ct = default) =>
+    public Task<VersionCatalog> OpenForWriteAsync(
+        CatalogWriteLock held, int accountId, string container, CancellationToken ct = default) =>
+        catalogs.OpenForWriteAsync(held, accountId, container, ct);
+
+    public Task<CatalogWriteLock> LockForWriteAsync(int accountId, string container, CancellationToken ct = default) =>
         catalogs.LockForWriteAsync(accountId, container, ct);
 
     public async Task EnsureVersionAsync(
@@ -42,9 +53,21 @@ public sealed class VersionCatalogs(
         {
             // No catalog yet; fall through to the locked path, which creates one.
         }
+        catch (SqliteException ex) when (ex.SqliteErrorCode is 11 /* SQLITE_CORRUPT */ or 26 /* SQLITE_NOTADB */)
+        {
+            // The file on disk is not something SQLite can read: a page torn by a power loss, or bytes that are not
+            // a database at all. A read-only handle is never the one to fix that (it must not delete a file a
+            // writer may be holding), so this is a miss, not a failure — the locked path below opens the same file
+            // for writing, which is where the recovery lives. Without this the container would be unusable until an
+            // operator deleted the file by hand: every backup, check, restore, retention round and UI browse of it
+            // goes through this probe.
+            logger?.LogWarning(ex,
+                "The catalog for account {AccountId} container {Container} is unreadable; rebuilding it from the cloud.",
+                account.Id, container);
+        }
 
-        using var _ = await catalogs.LockForWriteAsync(account.Id, container, ct);
-        await using var catalog = await catalogs.OpenAsync(account.Id, container, readOnly: false, ct);
+        using var held = await catalogs.LockForWriteAsync(account.Id, container, ct);
+        await using var catalog = await catalogs.OpenForWriteAsync(held, account.Id, container, ct);
 
         // Either the catalog always had it, or another caller imported it while this one waited for the lock.
         if (await catalog.GetVersionAsync(version.Version, ct) is { } again && again.Identity == identityTicks)
@@ -73,8 +96,12 @@ public sealed class VersionCatalogs(
         }
 
         // 3. the cloud — the source of truth every other branch above exists only to avoid re-downloading from.
-        var temp = Path.Combine(Path.GetTempPath(), "asb-index", Guid.NewGuid().ToString("N") + ".idx");
-        Directory.CreateDirectory(Path.GetDirectoryName(temp)!);
+        // In its own directory under the temp root, not a bare file beside it: that is the shape
+        // BackupInfoStore.ClearStale sweeps at startup (one directory per call, deleted whole), so a process killed
+        // mid-download does not leave a hundreds-of-MB decoded index behind forever.
+        var work = Path.Combine(_tempRoot, "catalog-import-" + Guid.NewGuid().ToString("N"));
+        var temp = Path.Combine(work, "index.idx");
+        Directory.CreateDirectory(work);
         try
         {
             await store.ReadIndexToFileAsync(account, container, version.IndexBlob, password, version.IndexVolumes, temp, ct);
@@ -84,7 +111,7 @@ public sealed class VersionCatalogs(
         }
         finally
         {
-            try { File.Delete(temp); } catch { /* temp space; nothing further to do about a failed cleanup */ }
+            try { Directory.Delete(work, recursive: true); } catch { /* temp space; nothing further to do about a failed cleanup */ }
         }
     }
 
@@ -122,11 +149,86 @@ public sealed class VersionCatalogs(
 
     public async Task RemoveVersionAsync(int accountId, string container, int version, CancellationToken ct = default)
     {
-        using var _ = await catalogs.LockForWriteAsync(accountId, container, ct);
-        await using var catalog = await catalogs.OpenAsync(accountId, container, readOnly: false, ct);
+        using var held = await catalogs.LockForWriteAsync(accountId, container, ct);
+        await using var catalog = await catalogs.OpenForWriteAsync(held, accountId, container, ct);
+        await RemoveVersionCoreAsync(catalog, accountId, container, version, ct);
+    }
+
+    public async Task ReconcileAsync(
+        int accountId, string container, IReadOnlyCollection<int> keepVersions, CancellationToken ct = default)
+    {
+        var keep = keepVersions as IReadOnlySet<int> ?? new HashSet<int>(keepVersions);
+
+        using var held = await catalogs.LockForWriteAsync(accountId, container, ct);
+        await using var catalog = await catalogs.OpenForWriteAsync(held, accountId, container, ct);
+
+        // Listed first, then removed: RemoveVersionCoreAsync writes to the same connection the listing streams off,
+        // and one handle cannot be doing both at once.
+        var stale = (await catalog.ListVersionsAsync(ct)).Select(v => v.Version).Where(v => !keep.Contains(v)).ToList();
+        foreach (var version in stale)
+        {
+            logger?.LogWarning(
+                "Version {Version} of container {Container} is in the local catalog but not in the backup's info file; "
+                + "dropping it. Its blobs may already have been deleted from the cloud by an interrupted cleanup.",
+                version, container);
+            await RemoveVersionCoreAsync(catalog, accountId, container, version, ct);
+        }
+    }
+
+    /// <summary>The removal itself, on a catalog already open for writing under a held lock — the one place that
+    /// knows a version leaves the catalog and both of its older homes together, shared by
+    /// <see cref="RemoveVersionAsync"/> (which opens for one) and <see cref="ReconcileAsync"/> (which opens once for
+    /// however many the info file has stopped listing).</summary>
+    private async Task RemoveVersionCoreAsync(
+        VersionCatalog catalog, int accountId, string container, int version, CancellationToken ct)
+    {
         await catalog.RemoveVersionAsync(version, ct);
         legacyFiles.Remove(accountId, container, version);
         await DropLegacyRowAsync(accountId, container, version, ct);
+    }
+
+    public async Task ApplyPatchesOrInvalidateAsync(
+        int accountId, string container, IReadOnlyList<CatalogPatch> patches, ILogger? log,
+        CancellationToken ct = default)
+    {
+        if (patches.Count == 0)
+            return;
+
+        try
+        {
+            using var held = await catalogs.LockForWriteAsync(accountId, container, ct);
+            await using var catalog = await catalogs.OpenForWriteAsync(held, accountId, container, ct);
+            await catalog.ApplyPatchesAsync(patches, ct);
+        }
+        catch (Exception ex) when (ex is not OperationCanceledException)
+        {
+            var versions = patches.Select(p => p.Version).Distinct().Order().ToList();
+            (log ?? logger)?.LogError(ex,
+                "Could not record the check/repair marks for version(s) {Versions} of container {Container} in the local "
+                + "catalog ({Message}). The rewritten index is already in the cloud, so those versions are dropped from "
+                + "the catalog and will be re-imported from the cloud on first use.",
+                string.Join(", ", versions), container, ex.Message);
+
+            try
+            {
+                foreach (var version in versions)
+                    await RemoveVersionAsync(accountId, container, version, ct);
+            }
+            catch (Exception removal) when (removal is not OperationCanceledException)
+            {
+                // Whatever stopped the patch from being written — a read-only file, a full disk, an I/O error — is
+                // just as likely to stop the row from being deleted, and then the stale rows would survive exactly
+                // as if nothing had been attempted. So the last resort is the bluntest one available and the one
+                // that cannot fail for the same reason: drop the container's catalog file outright. It is a cache
+                // of what the cloud holds, deleting it costs downloads and never data, and it is one directory
+                // entry rather than a write into a file SQLite has just refused.
+                (log ?? logger)?.LogError(removal,
+                    "The affected versions of container {Container} could not be dropped from the local catalog either "
+                    + "({Message}); deleting the container's catalog file so nothing reads the pre-repair rows again.",
+                    container, removal.Message);
+                await RemoveContainerAsync(accountId, container, ct);
+            }
+        }
     }
 
     public async Task RemoveContainerAsync(int accountId, string container, CancellationToken ct = default)

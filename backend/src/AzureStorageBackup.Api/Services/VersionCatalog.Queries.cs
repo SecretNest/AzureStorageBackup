@@ -19,11 +19,6 @@ public sealed partial class VersionCatalog
     /// order for a surrogate pair to land in the same place on each side. See <see cref="CatalogSql.PathKey"/>.</summary>
     private const string SelectEntriesByPathSql = $"SELECT {EntryRowMapper.Columns} FROM entries WHERE version=@v ORDER BY path_key";
 
-    /// <summary>A range scan over the (version, path) primary key, not <c>LIKE</c>: "d" must take in "d/x" without
-    /// also taking in "dd/x", and the bound is the byte right after '/'.</summary>
-    private const string SelectEntriesUnderSql =
-        $"SELECT {EntryRowMapper.Columns} FROM entries WHERE version=@v AND (path=@prefix OR (path>=@lo AND path<@hi)) ORDER BY seq";
-
     private const string SelectEntriesByStorageSql =
         $"SELECT {EntryRowMapper.Columns} FROM entries WHERE version=@v ORDER BY storage_kind, storage_ref, seq";
 
@@ -189,25 +184,6 @@ public sealed partial class VersionCatalog
     /// See <see cref="CatalogSql.PathKey"/>.</summary>
     public IAsyncEnumerable<IndexEntry> EntriesAsync(int version, CancellationToken ct) =>
         QueryEntriesAsync(SelectEntriesByPathSql, version, ct);
-
-    /// <summary>The directory itself and everything beneath it, in source order. An empty prefix means the whole version.</summary>
-    public IAsyncEnumerable<IndexEntry> EntriesUnderAsync(int version, string dirPrefix, CancellationToken ct) =>
-        dirPrefix.Length == 0
-            ? QueryEntriesAsync(SelectEntriesBySeqSql, version, ct)
-            : EntriesUnderCoreAsync(version, dirPrefix, ct);
-
-    private async IAsyncEnumerable<IndexEntry> EntriesUnderCoreAsync(
-        int version, string dirPrefix, [EnumeratorCancellation] CancellationToken ct)
-    {
-        using var command = Command(SelectEntriesUnderSql);
-        Set(command, "@v", version);
-        Set(command, "@prefix", dirPrefix);
-        Set(command, "@lo", dirPrefix + "/");
-        Set(command, "@hi", dirPrefix + "0");   // '0' is the byte right after '/'
-        await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
-        while (await reader.ReadAsync(ct))
-            yield return EntryRowMapper.Read(reader);
-    }
 
     /// <summary>Entries grouped by the blob or pack they live in, so a consumer can finish one download before the next
     /// group starts instead of buffering the whole version to sort it.</summary>

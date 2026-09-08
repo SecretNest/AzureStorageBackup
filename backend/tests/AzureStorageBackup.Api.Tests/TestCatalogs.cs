@@ -27,8 +27,14 @@ internal static class TestCatalogs
 
     internal static VersionCatalogStore NewStore() => new(Path.Combine(Root, Guid.NewGuid().ToString("N")));
 
+    /// <summary>The temp root the cloud-import branch stages its decoded index under. Given explicitly, and under
+    /// this class's own per-process directory, for the same reason production points it at <c>Backup:TempPath</c>:
+    /// nothing of ours should be writing hundreds of MB into the system temp dir behind the operator's back — and in
+    /// a test, a leftover under our own root is swept with everything else on exit.</summary>
+    internal static string NewTempRoot() => Path.Combine(Root, "import", Guid.NewGuid().ToString("N"));
+
     internal static VersionCatalogs New(AppDbContext db, IBackupInfoStore store, VersionIndexFileStore? legacyFiles = null) =>
-        new(NewStore(), legacyFiles ?? TestIndexFiles.New(), db, store);
+        new(NewStore(), legacyFiles ?? TestIndexFiles.New(), db, store, logger: null, NewTempRoot());
 
     /// <summary>
     /// A throwaway catalog holding exactly one imported version — the shortest path from a hand-written

@@ -75,7 +75,8 @@ public sealed class VersionCatalogStoreTests : IDisposable
     {
         var store = new VersionCatalogStore(_root);
 
-        await using (var catalog = await store.OpenAsync(AccountId, Container, readOnly: false, CancellationToken.None))
+        using (var held = await store.LockForWriteAsync(AccountId, Container, CancellationToken.None))
+        await using (var catalog = await store.OpenForWriteAsync(held, AccountId, Container, CancellationToken.None))
         {
             Assert.Empty(await catalog.ListVersionsAsync(CancellationToken.None));
         }
@@ -110,7 +111,8 @@ public sealed class VersionCatalogStoreTests : IDisposable
         Random.Shared.NextBytes(garbage);
         await File.WriteAllBytesAsync(path, garbage);
 
-        await using (var catalog = await store.OpenAsync(AccountId, Container, readOnly: false, CancellationToken.None))
+        using (var held = await store.LockForWriteAsync(AccountId, Container, CancellationToken.None))
+        await using (var catalog = await store.OpenForWriteAsync(held, AccountId, Container, CancellationToken.None))
         {
             Assert.Empty(await catalog.ListVersionsAsync(CancellationToken.None));
         }
@@ -140,7 +142,8 @@ public sealed class VersionCatalogStoreTests : IDisposable
         await BuildMultiPageCatalogAsync(path);
         CorruptPage2(path);
 
-        await using (var catalog = await store.OpenAsync(AccountId, Container, readOnly: false, CancellationToken.None))
+        using (var held = await store.LockForWriteAsync(AccountId, Container, CancellationToken.None))
+        await using (var catalog = await store.OpenForWriteAsync(held, AccountId, Container, CancellationToken.None))
         {
             // Rebuilt empty rather than holding the version the fixture imported before corruption.
             Assert.Empty(await catalog.ListVersionsAsync(CancellationToken.None));
@@ -160,7 +163,8 @@ public sealed class VersionCatalogStoreTests : IDisposable
 
         // First open through the store: the path is unchecked, so quick_check runs — and, correctly, finds nothing
         // wrong yet — and marks the path checked.
-        await using (var catalog = await store.OpenAsync(AccountId, Container, readOnly: false, CancellationToken.None))
+        using (var held = await store.LockForWriteAsync(AccountId, Container, CancellationToken.None))
+        await using (var catalog = await store.OpenForWriteAsync(held, AccountId, Container, CancellationToken.None))
             Assert.NotNull(await catalog.GetVersionAsync(1, CancellationToken.None));
 
         // Corrupt the file directly — not through the store — so its recovery path never runs and the path stays
@@ -170,14 +174,70 @@ public sealed class VersionCatalogStoreTests : IDisposable
         // Same store instance: the path is already in the checked set, so quick_check is skipped, and the open
         // succeeds even though the file underneath it is now damaged (neither ApplyPragmas nor EnsureSchema touches
         // the corrupted data page — only a query against it, or quick_check's own full scan, would).
-        await using (var catalog = await store.OpenAsync(AccountId, Container, readOnly: false, CancellationToken.None))
+        using (var held = await store.LockForWriteAsync(AccountId, Container, CancellationToken.None))
+        await using (var catalog = await store.OpenForWriteAsync(held, AccountId, Container, CancellationToken.None))
             Assert.NotNull(catalog);
 
         // A fresh store instance starts with an empty checked set: it runs quick_check again against the same path,
         // catches the same corruption, and rebuilds the file.
         var freshStore = new VersionCatalogStore(_root);
-        await using (var catalog = await freshStore.OpenAsync(AccountId, Container, readOnly: false, CancellationToken.None))
+        using (var held = await freshStore.LockForWriteAsync(AccountId, Container, CancellationToken.None))
+        await using (var catalog = await freshStore.OpenForWriteAsync(held, AccountId, Container, CancellationToken.None))
             Assert.Empty(await catalog.ListVersionsAsync(CancellationToken.None));
+    }
+
+    // ---- Test 3d: recovery runs with the caller's write lock held, which is how production opens for writing -----
+
+    [Fact]
+    public async Task Corrupt_page_is_recovered_while_the_write_lock_is_held()
+    {
+        var logger = Substitute.For<ILogger<VersionCatalogStore>>();
+        var store = new VersionCatalogStore(_root, logger);
+        var path = store.PathFor(AccountId, Container);
+
+        await BuildMultiPageCatalogAsync(path);
+        CorruptPage2(path);
+
+        // EVERY production write open happens inside this lock — the import at the end of a run, the checker's and
+        // the repairer's patching, retention's removal. The timeout is the assertion: while recovery took the same
+        // (non-reentrant) semaphore its caller was already holding, this waited forever, and a torn page in a
+        // catalog hung the next run at Finalizing. It has to come back, and it has to come back rebuilt.
+        using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var held = await store.LockForWriteAsync(AccountId, Container, timeout.Token);
+        await using (var catalog = await store.OpenForWriteAsync(held, AccountId, Container, timeout.Token))
+            Assert.Empty(await catalog.ListVersionsAsync(timeout.Token));
+
+        Assert.Single(WarningCalls(logger));
+
+        // And the lock is still the caller's afterwards: recovery neither released it nor took a second one.
+        using var contender = new CancellationTokenSource(TimeSpan.FromMilliseconds(100));
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(
+            () => store.LockForWriteAsync(AccountId, Container, contender.Token));
+    }
+
+    // ---- Test 3e: the handle has to be this container's ----------------------------------------------------------
+
+    [Fact]
+    public async Task OpenForWrite_refuses_a_lock_taken_for_another_container()
+    {
+        var store = new VersionCatalogStore(_root);
+
+        using var held = await store.LockForWriteAsync(AccountId, "other", CancellationToken.None);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(
+            () => store.OpenForWriteAsync(held, AccountId, Container, CancellationToken.None));
+        Assert.False(File.Exists(store.PathFor(AccountId, Container)));
+    }
+
+    // ---- Test 3f: a write open cannot be smuggled through the reader's door ---------------------------------------
+
+    [Fact]
+    public async Task Open_refuses_a_write_open()
+    {
+        var store = new VersionCatalogStore(_root);
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => store.OpenAsync(AccountId, Container, readOnly: false, CancellationToken.None));
     }
 
     // ---- Test 4: one writer at a time per container -------------------------------------------------------------
@@ -207,7 +267,8 @@ public sealed class VersionCatalogStoreTests : IDisposable
         var store = new VersionCatalogStore(_root);
         var path = store.PathFor(AccountId, Container);
 
-        await using (await store.OpenAsync(AccountId, Container, readOnly: false, CancellationToken.None))
+        using (var held = await store.LockForWriteAsync(AccountId, Container, CancellationToken.None))
+        await using (await store.OpenForWriteAsync(held, AccountId, Container, CancellationToken.None))
         {
             // Opened under WAL, so -wal and -shm exist alongside the main file while the connection is live.
         }

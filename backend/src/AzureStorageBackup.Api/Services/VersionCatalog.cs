@@ -159,6 +159,9 @@ public sealed partial class VersionCatalog : IAsyncDisposable
         using var command = _connection.CreateCommand();
         command.CommandText = "PRAGMA quick_check";
         await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
+        // Only the first row is read, and that is the whole answer: quick_check returns exactly one row, the single
+        // string "ok", for a healthy file, and one row per problem otherwise — so a first row that is not "ok" (or
+        // no row at all) already means damage, and the rest of the rows would only be more detail about it.
         var ok = await reader.ReadAsync(ct) && reader.GetString(0) == "ok";
         if (!ok)
             throw new SqliteException("Catalog failed PRAGMA quick_check.", 11 /* SQLITE_CORRUPT */);

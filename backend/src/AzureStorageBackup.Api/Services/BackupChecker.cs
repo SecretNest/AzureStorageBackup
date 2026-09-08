@@ -361,9 +361,12 @@ public sealed class BackupChecker(
                 else
                     await store.WriteInfoAsync(account, container, info, password, ct: ct);
 
-                using var _ = await catalogs.LockForWriteAsync(account.Id, container, ct);
-                await using var writable = await catalogs.OpenAsync(account.Id, container, readOnly: false, ct);
-                await writable.ApplyPatchesAsync(patches, ct);
+                // Or, if that write cannot be made, the version leaves the catalog: the marks are in the cloud
+                // already and a catalog that kept the pre-mark rows under an unchanged identity would be trusted
+                // forever (see IVersionCatalogs.ApplyPatchesOrInvalidateAsync).
+                // No logger of its own — the checker is constructed by hand in half a dozen places and has never
+                // taken one — so the catalogs' logger does the reporting.
+                await catalogs.ApplyPatchesOrInvalidateAsync(account.Id, container, patches, log: null, ct);
             }
             finally
             {
@@ -488,6 +491,12 @@ public sealed class BackupChecker(
     /// first (from whichever older home still holds it, the cloud last of all), then the refs are streamed out of it
     /// once each and turned into names by the pure function below. If any version cannot be brought in (missing
     /// locally and the cloud read fails) this throws — which is the caller's cue to give up on deleting.
+    /// <para>
+    /// The refs are streamed out of the whole catalog rather than version by version, which used to over-protect by
+    /// however many versions the catalog held that the info file no longer listed; since a run reconciles the
+    /// catalog against the info file before it asks it anything (<see cref="IVersionCatalogs.ReconcileAsync"/>, and
+    /// retention does the same), the two sets are the same one and this is exact.
+    /// </para>
     /// </summary>
     public async Task<HashSet<string>> BuildReferencedSetAsync(
         Account account, string container, string? password, BackupInfoFile info, CancellationToken ct = default)

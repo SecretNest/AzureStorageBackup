@@ -61,9 +61,27 @@ public sealed class VersionCatalogsMigrationTests
     }
 
     private static List<NSubstitute.Core.ICall> WarningCalls(ILogger<VersionCatalogs> logger) =>
+        LogCalls(logger, LogLevel.Warning);
+
+    private static List<NSubstitute.Core.ICall> ErrorCalls(ILogger<VersionCatalogs> logger) =>
+        LogCalls(logger, LogLevel.Error);
+
+    private static List<NSubstitute.Core.ICall> LogCalls(ILogger<VersionCatalogs> logger, LogLevel level) =>
         [.. logger.ReceivedCalls()
             .Where(c => c.GetMethodInfo().Name == nameof(ILogger.Log))
-            .Where(c => c.GetArguments()[0] is LogLevel.Warning)];
+            .Where(c => c.GetArguments()[0] is LogLevel actual && actual == level)];
+
+    /// <summary>The cloud half of the migration chain, wired to hand back exactly these bytes as the version's
+    /// downloaded index.</summary>
+    private static void CloudReturns(IBackupInfoStore infoStore, byte[] bytes) =>
+        infoStore.ReadIndexToFileAsync(
+                Arg.Any<Account>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string?>(), Arg.Any<int>(), Arg.Any<string>(),
+                Arg.Any<CancellationToken>())
+            .Returns(ci =>
+            {
+                File.WriteAllBytes(ci.ArgAt<string>(5), bytes);
+                return Task.CompletedTask;
+            });
 
     // ---- Test 1: a catalog hit touches nothing else --------------------------------------------------------------
 
@@ -76,7 +94,8 @@ public sealed class VersionCatalogsMigrationTests
         var sample = IndexSamples.Sample();
         var bytes = LegacyIndexSerializer.SerializeIndex(sample);
 
-        await using (var catalog = await catalogs.OpenAsync(AccountId, Container, readOnly: false, CancellationToken.None))
+        using (var held = await catalogs.LockForWriteAsync(AccountId, Container, CancellationToken.None))
+        await using (var catalog = await catalogs.OpenForWriteAsync(held, AccountId, Container, CancellationToken.None))
         {
             using var reader = new IndexStreamReader(new MemoryStream(bytes));
             await catalog.ImportVersionAsync(1, Identity, reader, CancellationToken.None);
@@ -283,7 +302,7 @@ public sealed class VersionCatalogsMigrationTests
             .Returns<Task>(_ => throw new InvalidOperationException("cloud unavailable"));
         var files = TestIndexFiles.New();
         var logger = Substitute.For<ILogger<VersionCatalogs>>();
-        var catalogs = new VersionCatalogs(TestCatalogs.NewStore(), files, db, infoStore, logger);
+        var catalogs = new VersionCatalogs(TestCatalogs.NewStore(), files, db, infoStore, logger, TestCatalogs.NewTempRoot());
 
         var sample = IndexSamples.Sample();
         var fullBytes = LegacyIndexSerializer.SerializeIndex(sample);
@@ -300,6 +319,87 @@ public sealed class VersionCatalogsMigrationTests
 
         await using var catalog = await catalogs.OpenAsync(AccountId, Container, readOnly: true, CancellationToken.None);
         Assert.Null(await catalog.GetVersionAsync(1, CancellationToken.None));
+    }
+
+    // ---- Test 9: a catalog file SQLite cannot read is a cache miss, not a wall ------------------------------------
+
+    [Fact]
+    public async Task Ensure_rebuilds_a_catalog_that_is_not_a_database_at_all()
+    {
+        using var db = NewDb();
+        var infoStore = Substitute.For<IBackupInfoStore>();
+        var sample = IndexSamples.Sample();
+        CloudReturns(infoStore, LegacyIndexSerializer.SerializeIndex(sample));
+        var store = TestCatalogs.NewStore();
+        var logger = Substitute.For<ILogger<VersionCatalogs>>();
+        var catalogs = new VersionCatalogs(
+            store, TestIndexFiles.New(), db, infoStore, logger, TestCatalogs.NewTempRoot());
+
+        // 4096 bytes of noise where the catalog should be — a power loss mid-write, a half-restored backup of the
+        // cache directory. The read-only probe's pragmas go through it happily and the first SELECT is what raises
+        // SQLITE_NOTADB, which used to escape EnsureVersionAsync and fail every backup, check, restore, retention
+        // round and UI browse of the container until somebody deleted the file by hand.
+        var path = store.PathFor(AccountId, Container);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        var garbage = new byte[4096];
+        Random.Shared.NextBytes(garbage);
+        await File.WriteAllBytesAsync(path, garbage);
+
+        await catalogs.EnsureVersionAsync(TestAccount, Container, Version(), Identity, password: null, CancellationToken.None);
+
+        // The version is in, from the cloud, and the file at that path is a catalog again.
+        await using var catalog = await catalogs.OpenAsync(AccountId, Container, readOnly: true, CancellationToken.None);
+        await AssertCatalogHasSampleAsync(catalog, 1, sample);
+        Assert.Single(WarningCalls(logger));
+    }
+
+    // ---- Test 10: patches that cannot be written invalidate the version instead of leaving it stale ---------------
+
+    [SkippableFact]
+    public async Task Patches_that_cannot_be_applied_drop_the_version_so_the_cloud_is_read_again()
+    {
+        Skip.If(OperatingSystem.IsWindows(), "The failure is provoked with POSIX file permissions.");
+
+        using var db = NewDb();
+        var infoStore = Substitute.For<IBackupInfoStore>();
+        var store = TestCatalogs.NewStore();
+        var logger = Substitute.For<ILogger<VersionCatalogs>>();
+        var catalogs = new VersionCatalogs(
+            store, TestIndexFiles.New(), db, infoStore, logger, TestCatalogs.NewTempRoot());
+
+        // What the catalog holds now: the version as it was BEFORE the check marked anything.
+        var marked = IndexSamples.Sample();          // carries "gone.txt" as unrecoverable
+        var unmarked = marked with { UnrecoverablePaths = [] };
+        using (var held = await catalogs.LockForWriteAsync(AccountId, Container, CancellationToken.None))
+        await using (var catalog = await catalogs.OpenForWriteAsync(held, AccountId, Container, CancellationToken.None))
+        {
+            using var reader = new IndexStreamReader(new MemoryStream(LegacyIndexSerializer.SerializeIndex(unmarked)));
+            await catalog.ImportVersionAsync(1, Identity, reader, CancellationToken.None);
+        }
+
+        // What the cloud holds: the rewritten index, marks and all — the checker uploads it before it ever touches
+        // the catalog, so this is the state the local file has to be reconciled to and not the other way round.
+        CloudReturns(infoStore, LegacyIndexSerializer.SerializeIndex(marked));
+
+        // …and the catalog file cannot be written. A disk that filled up, a volume remounted read-only: whatever
+        // the cause, the patch below fails after the cloud write has already succeeded.
+        var path = store.PathFor(AccountId, Container);
+        File.SetUnixFileMode(path, UnixFileMode.UserRead | UnixFileMode.GroupRead | UnixFileMode.OtherRead);
+
+        await catalogs.ApplyPatchesOrInvalidateAsync(
+            AccountId, Container, [new CatalogPatch(1, "gone.txt", null, true, null)], log: null,
+            CancellationToken.None);
+
+        // Reported, not swallowed…
+        Assert.NotEmpty(ErrorCalls(logger));
+        // …and the stale rows are gone rather than sitting there under an identity that says "already imported".
+        await Assert.ThrowsAsync<FileNotFoundException>(
+            () => catalogs.OpenAsync(AccountId, Container, readOnly: true, CancellationToken.None));
+
+        // So the very next reader migrates the version back in from the cloud — with the mark on it.
+        await catalogs.EnsureVersionAsync(TestAccount, Container, Version(), Identity, password: null, CancellationToken.None);
+        await using var rebuilt = await catalogs.OpenAsync(AccountId, Container, readOnly: true, CancellationToken.None);
+        Assert.Equal(["gone.txt"], await rebuilt.UnrecoverableAsync(1, CancellationToken.None));
     }
 
     // ---- The .idx file store itself: what the chain above reads through, and what deletes it ---------------------

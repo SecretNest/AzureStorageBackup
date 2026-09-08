@@ -86,7 +86,7 @@ public sealed class RestoreOrchestratorTests : IDisposable
             workFactory: TestWorkDbs.New());
         _catalogStore = TestCatalogs.NewStore();
         var restore = new RestoreOrchestrator(
-            factory, store, new VersionCatalogs(_catalogStore, TestIndexFiles.New(), authority.Db, store),
+            factory, store, new VersionCatalogs(_catalogStore, TestIndexFiles.New(), authority.Db, store, logger: null, TestCatalogs.NewTempRoot()),
             restoreCompressor ?? new SevenZipCompressor(), new FileHasher(), Path.Combine(_temp, "restore"))
         { Clock = restoreClock, CaseProbe = caseProbe };
         return (backup, restore, store, factory);

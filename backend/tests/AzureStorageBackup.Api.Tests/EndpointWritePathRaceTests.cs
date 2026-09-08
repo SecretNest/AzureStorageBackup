@@ -9,6 +9,7 @@ using Microsoft.AspNetCore.Hosting;
 using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.DependencyInjection.Extensions;
+using Microsoft.Extensions.Logging;
 
 namespace AzureStorageBackup.Api.Tests;
 
@@ -88,13 +89,26 @@ public sealed class EndpointWritePathRaceTests
         public Task EnsureVersionAsync(Account account, string container, BackupVersion version, long identityTicks, string? password, CancellationToken ct = default)
             => throw new NotSupportedException();
 
+        public Task<VersionCatalog> OpenForWriteAsync(
+            CatalogWriteLock held, int accountId, string container, CancellationToken ct = default)
+            => throw new NotSupportedException();
+
         public Task RemoveVersionAsync(int accountId, string container, int version, CancellationToken ct = default)
+            => throw new NotSupportedException();
+
+        public Task ReconcileAsync(
+            int accountId, string container, IReadOnlyCollection<int> keepVersions, CancellationToken ct = default)
             => throw new NotSupportedException();
 
         public Task RemoveContainerAsync(int accountId, string container, CancellationToken ct = default)
             => throw new OperationCanceledException();
 
-        public Task<IDisposable> LockForWriteAsync(int accountId, string container, CancellationToken ct = default)
+        public Task ApplyPatchesOrInvalidateAsync(
+            int accountId, string container, IReadOnlyList<CatalogPatch> patches, ILogger? logger,
+            CancellationToken ct = default)
+            => throw new NotSupportedException();
+
+        public Task<CatalogWriteLock> LockForWriteAsync(int accountId, string container, CancellationToken ct = default)
             => throw new NotSupportedException();
     }
 

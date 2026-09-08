@@ -213,21 +213,12 @@ public sealed class RetentionCleaner(
             //
             // This round's own retirees are excluded: they must stay until the cloud deletes are done (cloud first),
             // and they leave through the removal below.
+            //
+            // The same call a run makes at its start, for the same reason — one implementation of "the info file
+            // says which versions exist; make the catalog agree" (see IVersionCatalogs.ReconcileAsync).
             var known = new HashSet<int>(info.Versions.Select(v => v.Version));
             known.UnionWith(retired.Select(v => v.Version));
-            var stale = new List<int>();
-            if (await TryOpenAsync(catalogs_, account.Id, container, ct) is { } probe)
-            {
-                await using (probe)
-                {
-                    foreach (var row in await probe.ListVersionsAsync(ct))
-                        if (!known.Contains(row.Version))
-                            stale.Add(row.Version);
-                }
-            }
-
-            foreach (var version in stale)
-                await catalogs_.RemoveVersionAsync(account.Id, container, version, ct);
+            await catalogs_.ReconcileAsync(account.Id, container, known, ct);
 
             if (await TryOpenAsync(catalogs_, account.Id, container, ct) is { } catalog)
             {

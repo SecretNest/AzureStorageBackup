@@ -1582,7 +1582,7 @@ public sealed class BackupRepairerTests : IDisposable
             };
             using (var writeLock = await catalogs.LockForWriteAsync(account.Id, name))
             {
-                await using var writable = await catalogs.OpenAsync(account.Id, name, readOnly: false);
+                await using var writable = await catalogs.OpenForWriteAsync(writeLock, account.Id, name);
                 using var import = new IndexStreamReader(new MemoryStream(LegacyIndexSerializer.SerializeIndex(stale)));
                 await writable.ImportVersionAsync(99, info.Backup.CreatedAt.UtcTicks, import, CancellationToken.None);
             }

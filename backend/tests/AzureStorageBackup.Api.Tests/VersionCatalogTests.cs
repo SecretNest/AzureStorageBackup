@@ -285,7 +285,7 @@ public sealed class VersionCatalogTests : IDisposable
     // ---- The remaining readers ---------------------------------------------------------------------------------
 
     [Fact]
-    public async Task Entries_stream_by_directory_by_storage_and_by_path_list()
+    public async Task Entries_stream_by_storage_and_by_path_list()
     {
         await using var catalog = await OpenAsync();
         await ImportAsync(catalog, 1,
@@ -296,10 +296,6 @@ public sealed class VersionCatalogTests : IDisposable
             Entry("d", 4, "D", Pack("p0001", "d")),
             Entry("dd/x.txt", 5, "X", Blob("data/x")),
         ]);
-
-        // A path boundary, not a string prefix: "d" itself is in, "dd/x.txt" is not. Source order (seq) throughout.
-        Assert.Equal(["d/b.txt", "d/a.txt", "d"], await Collect(catalog.EntriesUnderAsync(1, "d", CancellationToken.None)));
-        Assert.Equal(["z.txt", "d/b.txt", "d/a.txt", "d", "dd/x.txt"], await Collect(catalog.EntriesUnderAsync(1, "", CancellationToken.None)));
 
         // Grouped by (kind, ref) so a consumer can finish one blob or pack at a time without buffering the version.
         Assert.Equal(["d/a.txt", "d/b.txt", "dd/x.txt", "d", "z.txt"], await Collect(catalog.EntriesByStorageAsync(1, CancellationToken.None)));

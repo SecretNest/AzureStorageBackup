@@ -20,8 +20,9 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
 {
     /// <summary>One <see cref="SemaphoreSlim"/> per container path, created on first use and kept for the process's
     /// lifetime — cheap (a handful of bytes each), and simpler than tearing one down while a caller might still be
-    /// waiting on it. Shared by <see cref="LockForWriteAsync"/>, <see cref="RemoveContainerAsync"/> and a write
-    /// open's corrupt-file recovery — see their doc comments for why they must not be nested on the same caller.</summary>
+    /// waiting on it. Shared by <see cref="LockForWriteAsync"/> and <see cref="RemoveContainerAsync"/> — see their
+    /// doc comments for why they must not be nested on the same caller. A write open's corrupt-file recovery does
+    /// <b>not</b> take it: <see cref="OpenForWriteAsync"/> only runs with the caller's own handle in hand.</summary>
     private readonly ConcurrentDictionary<string, SemaphoreSlim> _locks = new();
 
     /// <summary>Paths this process has already run <see cref="VersionCatalog.QuickCheckAsync"/> against successfully.
@@ -50,35 +51,57 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
     private SemaphoreSlim GateFor(string path) => _locks.GetOrAdd(path, static _ => new SemaphoreSlim(1, 1));
 
     /// <summary>
-    /// Opens the container's catalog. A read-only open never creates anything — a missing file is a
+    /// Opens the container's catalog <b>read-only</b>. Never creates anything — a missing file is a
     /// <see cref="FileNotFoundException"/>, not an empty catalog conjured for a caller who only meant to look — and
     /// never runs <c>quick_check</c> (a reader that hits a bad page simply fails the query that touches it, and is
     /// never the one to delete and recreate the file).
     /// <para>
-    /// A write open creates the directory, opens the file (creating it and its schema if needed, per
-    /// <see cref="VersionCatalog.OpenAsync"/>), and — the first time this process opens this exact path — runs
-    /// <see cref="VersionCatalog.QuickCheckAsync"/> once. If the open or the check finds the file unreadable
-    /// (<c>SQLITE_NOTADB</c> from <see cref="CatalogSql.ApplyPragmas"/>'s own statements on a file that isn't a
-    /// database at all, or <c>SQLITE_CORRUPT</c> from a bad page <c>quick_check</c> found), the file is not treated
-    /// as a fatal error: it is a cache of what the cloud already holds, so it gets deleted and rebuilt empty. That
-    /// deletion takes the container's write lock — the same one <see cref="LockForWriteAsync"/> hands out — so two
-    /// callers racing to open the same corrupt file cannot both delete it out from under each other; whichever loses
-    /// the race re-opens what the winner already fixed instead of deleting a second time. A caller that already
-    /// holds that lock via <see cref="LockForWriteAsync"/> for this container must not call this method re-entrantly
-    /// while holding it — <see cref="SemaphoreSlim"/> is not reentrant, and the corrupt-recovery branch awaiting the
-    /// same lock again would deadlock forever. In practice this is not a real constraint: a corrupt file is caught
-    /// on the first open of a container, before any lock has been taken for it.
+    /// The <paramref name="readOnly"/> flag is kept so that every reader's call reads as what it is at the call
+    /// site, but only <c>true</c> is accepted: a write open needs the container's write lock in hand, and that is
+    /// <see cref="OpenForWriteAsync"/>, which takes the handle as an argument so the requirement is checked by the
+    /// compiler rather than by a comment.
     /// </para>
     /// </summary>
     public async Task<VersionCatalog> OpenAsync(int accountId, string container, bool readOnly, CancellationToken ct)
     {
+        if (!readOnly)
+            throw new ArgumentException(
+                $"A write open must go through {nameof(OpenForWriteAsync)} with the container's write lock held.",
+                nameof(readOnly));
+
         var path = PathFor(accountId, container);
-        if (readOnly)
-        {
-            if (!File.Exists(path))
-                throw new FileNotFoundException($"No catalog for container '{container}' under account {accountId}.", path);
-            return await VersionCatalog.OpenAsync(path, readOnly: true, ct);
-        }
+        if (!File.Exists(path))
+            throw new FileNotFoundException($"No catalog for container '{container}' under account {accountId}.", path);
+        return await VersionCatalog.OpenAsync(path, readOnly: true, ct);
+    }
+
+    /// <summary>
+    /// Opens the container's catalog for writing, which is only legal while holding that container's write lock —
+    /// hence <paramref name="held"/>: the handle <see cref="LockForWriteAsync"/> returned, passed in as proof, and
+    /// checked to be a handle for <em>this</em> container rather than some other one the caller happened to hold.
+    /// <para>
+    /// It creates the directory, opens the file (creating it and its schema if needed, per
+    /// <see cref="VersionCatalog.OpenAsync"/>), and — the first time this process opens this exact path — runs
+    /// <see cref="VersionCatalog.QuickCheckAsync"/> once. If the open or the check finds the file unreadable
+    /// (<c>SQLITE_NOTADB</c> from <see cref="CatalogSql.ApplyPragmas"/>'s own statements on a file that isn't a
+    /// database at all, or <c>SQLITE_CORRUPT</c> from a bad page <c>quick_check</c> found), the file is not treated
+    /// as a fatal error: it is a cache of what the cloud already holds, so it gets deleted and rebuilt empty.
+    /// </para>
+    /// <para>
+    /// That recovery does <b>not</b> take the write lock — the caller already holds it, and
+    /// <see cref="SemaphoreSlim"/> is not reentrant, so taking it again is a deadlock, not a safety measure. It does
+    /// not need to: the lock the caller holds is exactly what keeps a second writer from deleting the same file at
+    /// the same moment, which is all the locking was ever there for.
+    /// </para>
+    /// </summary>
+    public async Task<VersionCatalog> OpenForWriteAsync(
+        CatalogWriteLock held, int accountId, string container, CancellationToken ct)
+    {
+        ArgumentNullException.ThrowIfNull(held);
+        var path = PathFor(accountId, container);
+        if (!string.Equals(held.Path, path, StringComparison.Ordinal))
+            throw new InvalidOperationException(
+                $"The write lock held is for '{held.Path}', not for container '{container}' under account {accountId} ('{path}').");
 
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
 
@@ -88,7 +111,7 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
         }
         catch (SqliteException ex) when (ex.SqliteErrorCode is 11 /* SQLITE_CORRUPT */ or 26 /* SQLITE_NOTADB */)
         {
-            return await RecoverAsync(path, ct);
+            return await RecoverAsync(path, ex, ct);
         }
     }
 
@@ -115,33 +138,18 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
         return catalog;
     }
 
-    /// <summary>The corrupt-file path: takes the container's write lock, then re-tries the open in case another
-    /// caller already fixed it while this one waited for the lock, and only deletes-and-recreates if it is still
-    /// broken.</summary>
-    private async Task<VersionCatalog> RecoverAsync(string path, CancellationToken ct)
+    /// <summary>The corrupt-file path: delete the file and its WAL siblings and open a fresh, empty catalog in its
+    /// place. No lock is taken here — the only caller is <see cref="OpenForWriteAsync"/>, which has already proved
+    /// the container's write lock is held, and that lock is what keeps a second writer from doing the same thing to
+    /// the same file at the same moment.</summary>
+    private async Task<VersionCatalog> RecoverAsync(string path, SqliteException cause, CancellationToken ct)
     {
-        var gate = GateFor(path);
-        await gate.WaitAsync(ct);
-        try
-        {
-            try
-            {
-                return await OpenCheckedAsync(path, ct);
-            }
-            catch (SqliteException ex) when (ex.SqliteErrorCode is 11 /* SQLITE_CORRUPT */ or 26 /* SQLITE_NOTADB */)
-            {
-                logger?.LogWarning(ex,
-                    "Catalog {Path} is unreadable; deleting it. It is a cache and will be rebuilt from the cloud on demand.", path);
-                DeleteContainerFiles(path);
-                _checkedPaths.TryRemove(path, out _);
-                Directory.CreateDirectory(Path.GetDirectoryName(path)!);
-                return await OpenCheckedAsync(path, ct);
-            }
-        }
-        finally
-        {
-            gate.Release();
-        }
+        logger?.LogWarning(cause,
+            "Catalog {Path} is unreadable; deleting it. It is a cache and will be rebuilt from the cloud on demand.", path);
+        DeleteContainerFiles(path);
+        _checkedPaths.TryRemove(path, out _);
+        Directory.CreateDirectory(Path.GetDirectoryName(path)!);
+        return await OpenCheckedAsync(path, ct);
     }
 
     /// <summary>
@@ -152,16 +160,17 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
     /// single-writer contract that ultimately enforces it; the semaphore just fails fast in-process instead of
     /// blocking on <c>busy_timeout</c>.
     /// <para>
-    /// This is the same lock <see cref="OpenAsync"/>'s corrupt-recovery and <see cref="RemoveContainerAsync"/> take
-    /// internally. Holding it while calling either of those for the same container deadlocks — the semaphore is not
-    /// reentrant.
+    /// This is the same lock <see cref="RemoveContainerAsync"/> takes internally. Holding it while calling that for
+    /// the same container deadlocks — the semaphore is not reentrant. <see cref="OpenForWriteAsync"/>, by contrast,
+    /// is meant to be called with the handle this returns and takes no lock of its own.
     /// </para>
     /// </summary>
-    public async Task<IDisposable> LockForWriteAsync(int accountId, string container, CancellationToken ct)
+    public async Task<CatalogWriteLock> LockForWriteAsync(int accountId, string container, CancellationToken ct)
     {
-        var gate = GateFor(PathFor(accountId, container));
+        var path = PathFor(accountId, container);
+        var gate = GateFor(path);
         await gate.WaitAsync(ct);
-        return new Release(gate);
+        return new CatalogWriteLock(gate, path);
     }
 
     /// <summary>
@@ -207,16 +216,32 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
             File.Delete(path);
     }
 
-    /// <summary>Releases the container's write semaphore exactly once, however many times <see cref="Dispose"/> is
-    /// called — the pattern every <c>using</c> over a lock handle relies on.</summary>
-    private sealed class Release(SemaphoreSlim gate) : IDisposable
-    {
-        private int _released;
+}
 
-        public void Dispose()
-        {
-            if (Interlocked.Exchange(ref _released, 1) == 0)
-                gate.Release();
-        }
+/// <summary>
+/// A held write slot for one container's catalog, and the token <see cref="VersionCatalogStore.OpenForWriteAsync"/>
+/// demands: passing it is what turns "the caller must hold the lock" from a doc comment into something the compiler
+/// checks, and carrying the path it was taken for is what lets the open reject a handle for a different container.
+/// Releases the semaphore exactly once however many times <see cref="Dispose"/> is called — the pattern every
+/// <c>using</c> over a lock handle relies on.
+/// </summary>
+public sealed class CatalogWriteLock : IDisposable
+{
+    private readonly SemaphoreSlim _gate;
+    private int _released;
+
+    internal CatalogWriteLock(SemaphoreSlim gate, string path)
+    {
+        _gate = gate;
+        Path = path;
+    }
+
+    /// <summary>The catalog file this slot was reserved for.</summary>
+    internal string Path { get; }
+
+    public void Dispose()
+    {
+        if (Interlocked.Exchange(ref _released, 1) == 0)
+            _gate.Release();
     }
 }

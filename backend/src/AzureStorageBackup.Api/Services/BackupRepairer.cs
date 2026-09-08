@@ -245,11 +245,11 @@ public sealed class BackupRepairer(
                 if (changed.Count > 0)
                 {
                     // The container's single write slot, held for the patching and nothing else — the uploads above
-                    // are minutes of work and must not sit inside it.
-                    using var writeLock = await catalogs.LockForWriteAsync(account.Id, container, ct);
-                    await using var writable = await catalogs.OpenAsync(account.Id, container, readOnly: false, ct);
-                    foreach (var vnum in changed)
-                        await writable.ApplyPatchesAsync(patches.PatchesFor(vnum), ct);
+                    // are minutes of work and must not sit inside it. And if the patching cannot be written at all,
+                    // the versions leave the catalog rather than staying behind as pre-repair rows the cloud has
+                    // already moved past (see IVersionCatalogs.ApplyPatchesOrInvalidateAsync).
+                    var all = changed.SelectMany(patches.PatchesFor).ToList();
+                    await catalogs.ApplyPatchesOrInvalidateAsync(account.Id, container, all, log: null, ct);
                 }
 
                 // Recorded in both places now: the catalog answers for them from here on, and keeping them would

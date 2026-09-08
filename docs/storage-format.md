@@ -284,14 +284,33 @@ is a queryable copy of them and can be rebuilt from them at any time. That is wh
 `synchronous=NORMAL`, and it is what makes corruption a cache miss rather than an incident: the
 first read-write open of a path in a process runs `PRAGMA quick_check` once, and a file that fails
 it — or that SQLite refuses as `SQLITE_CORRUPT` or `SQLITE_NOTADB` — is deleted with a warning and
-rebuilt from the cloud on demand. Deleting the whole `index-cache/` directory costs downloads, never
-data.
+rebuilt from the cloud on demand. That holds on the read path too: the cheap read-only probe every
+reader starts with treats an unreadable file as a miss and falls through to the write path, which is
+where the rebuild happens. Deleting the whole `index-cache/` directory costs downloads, never data.
 
 **One writer per container.** Every writer — a run's finish, retention, the check's and the
-repairer's marks — takes the container's write lock for the duration. Readers open their own
+repairer's marks — takes the container's write lock for the duration, and the write open demands
+that lock as an argument, so "the caller holds it" is checked by the compiler rather than promised
+in a comment. The rebuild above therefore takes no lock of its own: the caller's is already what
+keeps a second writer from deleting the same file at the same moment. Readers open their own
 connections and, under WAL, never wait for the writer. A `VersionCatalog` wraps a single connection
 and is not thread-safe, so a caller that needs two cursors at once (the run opens one for the diff
 and one for dedup) opens two.
+
+**The info file decides which versions exist.** A run reconciles the catalog against it before it
+asks the catalog anything, and so does retention: every version in the catalog that the info file
+does not list is removed. This is not tidiness. Dedup, collision avoidance and the prescreen all
+query the catalog without a version predicate, and retention deletes a retired version's
+exclusively-owned blobs from the cloud *before* it drops that version's rows — so a cleanup
+interrupted in between (a Stop, a shutdown, one 5xx) leaves a catalog whose extra version points at
+blobs the container no longer holds, and without the reconcile the next run would hand a new file
+one of those addresses and record it as backed up.
+
+**A patch that cannot be written invalidates the version.** The check and the repair upload the
+rewritten index and commit the info file before they record the same marks in the catalog. If that
+last write fails, the version is dropped from the catalog instead of being left with pre-mark rows
+under an unchanged identity — which nothing would ever re-import — so the next reader migrates it
+back from the cloud, marks and all.
 
 A version index is immutable once written, so a cache hit is valid by construction. The identity
 stamp — the backup's creation timestamp — detects a container deleted and recreated, where version

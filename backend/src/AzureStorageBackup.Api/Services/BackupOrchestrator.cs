@@ -750,17 +750,29 @@ public sealed class BackupOrchestrator(
                 return 0;
             });
 
-        // A container nobody has backed up yet has no catalog file at all, and a read-only open of a missing one is a
-        // FileNotFoundException rather than an empty catalog conjured for a reader that only meant to look — which is
-        // the right rule for every other caller and the wrong one for the run that is about to create the first
-        // version. So the first run creates it, empty, which is exactly what its diff and its dedup should find. With
-        // versions to ensure, the loop above has already created it on its way to importing them.
-        if (info.Versions.Count == 0)
+        // …and the other direction: everything the catalog holds that the info file does NOT list has to go, before
+        // a single question is asked of it. Dedup, collision avoidance and the prescreen below all query the catalog
+        // with no version predicate, so a version retired from the info file whose rows are still here would go on
+        // offering its blobs as dedup hits — and a retention cleanup deletes those blobs from the cloud *before* it
+        // removes the rows, so a Stop, a shutdown or one 5xx in the middle of that leaves precisely a catalog whose
+        // extra version points at names the cloud no longer holds. Dedup would then record a file as backed up at an
+        // address holding nothing. Before the branch, the maps were built from info.Versions alone and could not
+        // have this problem; this is what keeps the two equivalent.
+        //
+        // It doubles as the first run's catalog creation: a container nobody has backed up yet has no catalog file
+        // at all, and a read-only open of a missing one is a FileNotFoundException rather than an empty catalog
+        // conjured for a reader that only meant to look — the right rule for every other caller and the wrong one
+        // for the run about to create the first version. Reconciling opens for writing, which creates it, empty,
+        // which is exactly what this run's diff and dedup should find.
+        //
+        // Under BeforeUploadAsync like the loop above: it takes the container's write lock, and a stop pressed while
+        // another writer holds it must end the run rather than wait it out.
+        await BeforeUploadAsync(async t =>
         {
-            using var creating = await catalogs.LockForWriteAsync(request.Account.Id, request.Container, ct);
-            await using var created = await catalogs.OpenAsync(
-                request.Account.Id, request.Container, readOnly: false, ct);
-        }
+            await catalogs.ReconcileAsync(
+                request.Account.Id, request.Container, info.Versions.Select(v => v.Version).ToList(), t);
+            return 0;
+        });
 
         // Two read-only handles, because a VersionCatalog is one SQLite connection and is not thread-safe: the diff
         // walks the previous version's entries on the run's own thread while the prober asks the dedup resolver about
@@ -2359,9 +2371,9 @@ public sealed class BackupOrchestrator(
             {
                 try
                 {
-                    using var _ = await catalogs.LockForWriteAsync(request.Account.Id, request.Container, ct);
-                    await using var catalog = await catalogs.OpenAsync(
-                        request.Account.Id, request.Container, readOnly: false, ct);
+                    using var held = await catalogs.LockForWriteAsync(request.Account.Id, request.Container, ct);
+                    await using var catalog = await catalogs.OpenForWriteAsync(
+                        held, request.Account.Id, request.Container, ct);
                     await using var file = File.OpenRead(serialized);
                     using var reader = new IndexStreamReader(file);
                     await catalog.ImportVersionAsync(version, identity, reader, ct);
@@ -2369,8 +2381,12 @@ public sealed class BackupOrchestrator(
                 }
                 catch (Exception ex) when (attempt == 1 && ex is not OperationCanceledException)
                 {
-                    // One retry, no delay: what this loses to is another opener of the same file, and that one is
-                    // already gone by the time the lock comes back.
+                    // One retry, no delay. What it is retrying is a *transient* loser of the race for the file:
+                    // another process-local writer that had the lock, or a busy_timeout expiring against a second
+                    // host writing the same catalog on a shared volume — both of them gone by the time the lock
+                    // comes back, which is why there is no delay and why one more attempt is enough. A corrupt
+                    // file is not among the things it retries: that is handled inside the open, which deletes and
+                    // recreates the file rather than throwing (see VersionCatalogStore.OpenForWriteAsync).
                 }
             }
         }

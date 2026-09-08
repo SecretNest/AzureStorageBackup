@@ -2,6 +2,7 @@ using System.Net.Sockets;
 using Azure.Storage.Blobs.Models;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
+using Microsoft.Extensions.Logging;
 
 namespace AzureStorageBackup.Api.Tests;
 
@@ -530,14 +531,27 @@ public sealed class BackupCancelModesTests : IDisposable
             int accountId, string container, bool readOnly, CancellationToken ct = default)
             => inner.OpenAsync(accountId, container, readOnly, ct);
 
-        public Task<IDisposable> LockForWriteAsync(int accountId, string container, CancellationToken ct = default)
+        public Task<VersionCatalog> OpenForWriteAsync(
+            CatalogWriteLock held, int accountId, string container, CancellationToken ct = default)
+            => inner.OpenForWriteAsync(held, accountId, container, ct);
+
+        public Task<CatalogWriteLock> LockForWriteAsync(int accountId, string container, CancellationToken ct = default)
             => inner.LockForWriteAsync(accountId, container, ct);
 
         public Task RemoveVersionAsync(int accountId, string container, int version, CancellationToken ct = default)
             => inner.RemoveVersionAsync(accountId, container, version, ct);
 
+        public Task ReconcileAsync(
+            int accountId, string container, IReadOnlyCollection<int> keepVersions, CancellationToken ct = default)
+            => inner.ReconcileAsync(accountId, container, keepVersions, ct);
+
         public Task RemoveContainerAsync(int accountId, string container, CancellationToken ct = default)
             => inner.RemoveContainerAsync(accountId, container, ct);
+
+        public Task ApplyPatchesOrInvalidateAsync(
+            int accountId, string container, IReadOnlyList<CatalogPatch> patches, ILogger? logger,
+            CancellationToken ct = default)
+            => inner.ApplyPatchesOrInvalidateAsync(accountId, container, patches, logger, ct);
     }
 
     private static async Task<Exception> RunAndCatchAsync(Task run, StopKind kind) =>
