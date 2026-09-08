@@ -264,8 +264,8 @@ public sealed class VersionCatalogsMigrationTests
         }
 
         var reported = new List<int>();
-        // Progress<T> posts to the captured SynchronizationContext; a plain IProgress keeps the assertions in-line.
-        var progress = new InlineProgress(reported.Add);
+        // Progress<T> posts to the thread pool; the inline one keeps the assertions in-line.
+        var progress = new InlineProgress<int>(reported.Add);
         await catalogs.EnsureVersionsAsync(TestAccount, Container, versions, Identity, password: null, progress, CancellationToken.None);
 
         await using var catalog = await catalogs.OpenAsync(AccountId, Container, readOnly: true, CancellationToken.None);
@@ -298,7 +298,7 @@ public sealed class VersionCatalogsMigrationTests
         await catalogs.EnsureVersionsAsync(TestAccount, Container, versions, Identity, password: null, null, CancellationToken.None);
 
         var reported = new List<int>();
-        await catalogs.EnsureVersionsAsync(TestAccount, Container, versions, Identity, password: null, new InlineProgress(reported.Add), CancellationToken.None);
+        await catalogs.EnsureVersionsAsync(TestAccount, Container, versions, Identity, password: null, new InlineProgress<int>(reported.Add), CancellationToken.None);
 
         Assert.Equal([2], reported);
     }
@@ -335,11 +335,6 @@ public sealed class VersionCatalogsMigrationTests
         using var held = await catalogs.LockForWriteAsync(AccountId, Container, CancellationToken.None);
         await using var writer = await catalogs.OpenForWriteAsync(held, AccountId, Container, CancellationToken.None);
         Assert.Equal(CatalogSql.GlobalIndexNames.Count, await writer.GlobalIndexCountAsync(CancellationToken.None));
-    }
-
-    private sealed class InlineProgress(Action<int> report) : IProgress<int>
-    {
-        public void Report(int value) => report(value);
     }
 
     // ---- Test 7: removing a container drops the catalog and every legacy row ------------------------------------------

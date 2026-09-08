@@ -756,8 +756,11 @@ public sealed class BackupOrchestrator(
         using (var loading = new StageTracker("LoadingVersions", info.Versions.Count, d =>
                    progress?.Report(new BackupProgress(BackupStage.LoadingVersions, 0, 0, 0, 0) { Detail = d })))
         {
+            // Synchronous on purpose: Progress<T> posts its callbacks to the thread pool, and a pass where every
+            // version is a hit reports the whole count once and ends within milliseconds — the callback then ran
+            // after Complete(), and the line stood at "0 of 9" for the seconds it was on screen.
             var settled = 0;
-            var settledVersions = new Progress<int>(n =>
+            var settledVersions = new InlineProgress<int>(n =>
             {
                 // The callback may see the same count twice (hits are reported as a block, then each import adds
                 // one); only the increase is work.
@@ -4224,4 +4227,11 @@ public sealed class BackupOrchestrator(
         };
     }
 
+}
+
+/// <summary>An <see cref="IProgress{T}"/> that invokes the callback on the reporting thread, where
+/// <see cref="Progress{T}"/> would post it to the thread pool and let a short stage finish before it runs.</summary>
+internal sealed class InlineProgress<T>(Action<T> report) : IProgress<T>
+{
+    public void Report(T value) => report(value);
 }
