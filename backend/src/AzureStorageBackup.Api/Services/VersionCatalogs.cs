@@ -37,6 +37,13 @@ public sealed class VersionCatalogs(
     public Task<CatalogWriteLock> LockForWriteAsync(int accountId, string container, CancellationToken ct = default) =>
         catalogs.LockForWriteAsync(accountId, container, ct);
 
+    public bool NeedsCheck(int accountId, string container) => catalogs.NeedsCheck(accountId, container);
+
+    public Task EnsureCheckedAsync(int accountId, string container, CancellationToken ct = default) =>
+        catalogs.EnsureCheckedAsync(accountId, container, ct);
+
+    public long CatalogBytes(int accountId, string container) => catalogs.CatalogBytes(accountId, container);
+
     public async Task EnsureVersionAsync(
         Account account, string container, BackupVersion version, long identityTicks, string? password, CancellationToken ct = default)
     {

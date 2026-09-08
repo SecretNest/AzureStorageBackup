@@ -1407,4 +1407,38 @@ public sealed class BackupOrchestratorTests : IDisposable
         }
         finally { await container.DeleteIfExistsAsync(); }
     }
+
+    /// <summary>The catalog's once-per-process quick_check reads the whole file, and for a big history that is
+    /// tens of seconds with nothing on screen but "Loading versions 100%". It now runs as its own stage, between
+    /// the version load and the diff, and only when it is actually due: the first run after a start pays it and
+    /// says so, the next run on the same process does not mention it.</summary>
+    [SkippableFact]
+    public async Task The_Catalog_Check_Has_Its_Own_Stage_And_Runs_Once_Per_Process()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var (orchestrator, _, factory) = Build();
+        var account = AzuriteAccount();
+        var name = RandomName("orchqc-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            WriteText("a.txt", "alpha");
+            var first = new List<BackupProgress>();
+            await orchestrator.RunAsync(Request(account, name), new SyncProgress(first));
+
+            var stages = first.Select(p => p.Stage).Distinct().ToList();
+            var checking = stages.IndexOf(BackupStage.CheckingCatalog);
+            Assert.True(checking > stages.IndexOf(BackupStage.LoadingVersions), "the check comes after the versions are loaded");
+            Assert.True(checking < stages.IndexOf(BackupStage.Diffing), "the check comes before the diff");
+            Assert.Contains(first, p => p.Stage == BackupStage.CheckingCatalog && p.Detail is { Stage: "CheckingCatalog" });
+
+            var second = new List<BackupProgress>();
+            await orchestrator.RunAsync(Request(account, name), new SyncProgress(second));
+            Assert.DoesNotContain(second, p => p.Stage == BackupStage.CheckingCatalog);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
 }

@@ -155,6 +155,30 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
         return await OpenCheckedAsync(path, ct);
     }
 
+    /// <summary>Whether the next write open of this container's catalog will run the full-file
+    /// <see cref="VersionCatalog.QuickCheckAsync"/> — true until the first write open in this process, and again after
+    /// <see cref="ForgetChecked"/>. The run asks this **before** it opens, so the check can be shown on a stage line of
+    /// its own instead of running unannounced inside whatever open happens to come first.</summary>
+    public bool NeedsCheck(int accountId, string container) => !_checkedPaths.ContainsKey(PathFor(accountId, container));
+
+    /// <summary>Runs the check now, under the container's write lock, if it is still due — the write open that follows
+    /// finds the path checked. A catalog nobody wrote yet is created (and trivially passes), as any write open would.
+    /// Cancellation interrupts the statement and leaves the path unchecked, so the next open pays for it instead.</summary>
+    public async Task EnsureCheckedAsync(int accountId, string container, CancellationToken ct)
+    {
+        using var held = await LockForWriteAsync(accountId, container, ct);
+        await using var catalog = await OpenForWriteAsync(held, accountId, container, ct);
+    }
+
+    /// <summary>The bytes <see cref="VersionCatalog.QuickCheckAsync"/> is about to read — the main file plus its WAL,
+    /// which the check reads through. 0 for a catalog nobody wrote yet.</summary>
+    public long CatalogBytes(int accountId, string container)
+    {
+        var path = PathFor(accountId, container);
+        long Size(string p) { try { return File.Exists(p) ? new FileInfo(p).Length : 0; } catch { return 0; } }
+        return Size(path) + Size(path + "-wal");
+    }
+
     /// <summary>Forgets that this path passed <see cref="VersionCatalog.QuickCheckAsync"/>, so the next write open
     /// runs it again. For when something other than that check found the damage: <see cref="VersionCatalogs"/>'s
     /// read-only probe hits a <c>SQLITE_CORRUPT</c>/<c>SQLITE_NOTADB</c> row well after this process last opened the

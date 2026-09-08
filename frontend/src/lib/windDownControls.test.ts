@@ -111,10 +111,18 @@ describe('windDownControls while wrapping up', () => {
 
 describe('loading the version history', () => {
   test('Pause alone goes quiet, with its own reason; Suspend and Stop stay live', () => {
-    const c = windDownControls(undefined, false, true)
+    const c = windDownControls(undefined, false, 'LoadingVersions')
     expect(c.canPause).toBe(false)
-    expect(c.pauseHint).toMatch(/cannot pause/)
+    expect(c.pauseHint).toMatch(/loading its version history/)
     expect(c.canActOnGate).toBe(true) // Suspend, Resume, Retry now
+    expect(c.canStop).toBe(true)
+  })
+
+  test('the catalog check greys Pause the same way, with a reason of its own', () => {
+    const c = windDownControls(undefined, false, 'CheckingCatalog')
+    expect(c.canPause).toBe(false)
+    expect(c.pauseHint).toMatch(/checking its catalog/)
+    expect(c.canActOnGate).toBe(true)
     expect(c.canStop).toBe(true)
   })
 
@@ -127,7 +135,7 @@ describe('loading the version history', () => {
   })
 
   test('a wind-down already under way wins over the stage', () => {
-    const c = windDownControls('suspend', false, true)
+    const c = windDownControls('suspend', false, 'LoadingVersions')
     expect(c.canPause).toBe(false)
     expect(c.pauseHint).toBeUndefined()
   })

@@ -7,6 +7,9 @@ const STAGE_UNITS: Record<string, string> = {
   // The backup's pre-diff pass over the retained versions (its own token: the check's LoadingIndex counts
   // entries of one index, this counts versions of a container's history).
   LoadingVersions: 'versions',
+  // The catalog's once-per-process full-file check: one item, the file, so the counts line is spelled out below
+  // rather than read as "0 of 1 catalog".
+  CheckingCatalog: 'catalog',
   Diffing: 'files',
   Uploading: 'objects',
   Restoring: 'objects',
@@ -44,6 +47,7 @@ const STAGE_UNITS: Record<string, string> = {
 const STAGE_LABELS: Record<string, string> = {
   LoadingIndex: 'Loading index',
   LoadingVersions: 'Loading versions',
+  CheckingCatalog: 'Checking catalog',
   Assessing: 'Assessing damage',
   WritingIndex: 'Writing index',
 }
@@ -128,7 +132,11 @@ export function stageLines(detail: StageProgress, hold?: PipelineHold) {
       ? Math.min(detail.processed + 1, detail.total)
       : detail.processed
   const counts =
-    detail.total > 0
+    detail.stage === 'CheckingCatalog'
+      ? // One statement over one file, with no progress to be had from it: say what the wait is, since the item
+        // line already says how big the file is.
+        'one full read of the catalog file'
+      : detail.total > 0
       ? `${shown.toLocaleString()} of ${detail.total.toLocaleString()} ${unit}`
       : `${detail.processed.toLocaleString()} ${unit} so far` // Scanning does not know the total — computing it is what scanning is for
   // The in-flight breakdown. "N items processed" alone cannot distinguish work from a hang: during the

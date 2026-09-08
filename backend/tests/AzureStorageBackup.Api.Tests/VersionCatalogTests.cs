@@ -518,4 +518,16 @@ public sealed class VersionCatalogTests : IDisposable
         command.Parameters.AddWithValue("@v", version);
         return (T)Convert.ChangeType(command.ExecuteScalar()!, typeof(T));
     }
+
+    /// <summary>A Stop or Suspend pressed while the check runs must end the run, not wait for the check: the
+    /// statement is interrupted and the caller sees the cancellation it asked for, never a bare SQLite error.</summary>
+    [Fact]
+    public async Task QuickCheck_reports_a_cancelled_token_as_cancellation()
+    {
+        var path = System.IO.Path.Combine(_dir, "qc.db");
+        await using var catalog = await VersionCatalog.OpenAsync(path, readOnly: false, CancellationToken.None);
+        using var cts = new CancellationTokenSource();
+        cts.Cancel();
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => catalog.QuickCheckAsync(cts.Token));
+    }
 }

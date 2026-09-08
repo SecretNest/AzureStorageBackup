@@ -188,15 +188,29 @@ public sealed partial class VersionCatalog : IAsyncDisposable
     /// </summary>
     public async Task QuickCheckAsync(CancellationToken ct)
     {
-        using var command = _connection.CreateCommand();
-        command.CommandText = "PRAGMA quick_check";
-        await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
-        // Only the first row is read, and that is the whole answer: quick_check returns exactly one row, the single
-        // string "ok", for a healthy file, and one row per problem otherwise — so a first row that is not "ok" (or
-        // no row at all) already means damage, and the rest of the rows would only be more detail about it.
-        var ok = await reader.ReadAsync(ct) && reader.GetString(0) == "ok";
-        if (!ok)
-            throw new SqliteException("Catalog failed PRAGMA quick_check.", 11 /* SQLITE_CORRUPT */);
+        ct.ThrowIfCancellationRequested();
+        // Microsoft.Data.Sqlite only looks at the token before it starts a statement, and its Cancel() is a no-op — so
+        // on its own a Stop pressed during the check would wait for the whole read of the file. sqlite3_interrupt is
+        // the engine's own way out: the running statement returns SQLITE_INTERRUPT at its next step, which is
+        // reported below as the cancellation the caller asked for.
+        var handle = _connection.Handle;
+        using var interrupt = ct.Register(() => { if (handle is not null) SQLitePCL.raw.sqlite3_interrupt(handle); });
+        try
+        {
+            using var command = _connection.CreateCommand();
+            command.CommandText = "PRAGMA quick_check";
+            await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
+            // Only the first row is read, and that is the whole answer: quick_check returns exactly one row, the single
+            // string "ok", for a healthy file, and one row per problem otherwise — so a first row that is not "ok" (or
+            // no row at all) already means damage, and the rest of the rows would only be more detail about it.
+            var ok = await reader.ReadAsync(ct) && reader.GetString(0) == "ok";
+            if (!ok)
+                throw new SqliteException("Catalog failed PRAGMA quick_check.", 11 /* SQLITE_CORRUPT */);
+        }
+        catch (SqliteException ex) when (ex.SqliteErrorCode == 9 /* SQLITE_INTERRUPT */ && ct.IsCancellationRequested)
+        {
+            throw new OperationCanceledException("The catalog check was interrupted.", ex, ct);
+        }
     }
 
     public ValueTask DisposeAsync() => _connection.DisposeAsync();

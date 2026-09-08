@@ -84,6 +84,18 @@ public interface IVersionCatalogs
     /// <summary>Reserves the container's single write slot; see <see cref="VersionCatalogStore.LockForWriteAsync"/>
     /// for what it protects and which calls must never be made while holding it.</summary>
     Task<CatalogWriteLock> LockForWriteAsync(int accountId, string container, CancellationToken ct = default);
+
+    /// <summary>Whether the next write open of this container's catalog will pay the once-per-process full-file
+    /// <c>quick_check</c> (<see cref="VersionCatalogStore.NeedsCheck"/>). The backup asks before its first write
+    /// open so the check runs on a stage line of its own. Defaults to false: a test double that has no such check
+    /// simply never shows the stage.</summary>
+    bool NeedsCheck(int accountId, string container) => false;
+
+    /// <summary>Runs the check now if it is due — see <see cref="VersionCatalogStore.EnsureCheckedAsync"/>.</summary>
+    Task EnsureCheckedAsync(int accountId, string container, CancellationToken ct = default) => Task.CompletedTask;
+
+    /// <summary>The bytes the check will read (main file plus WAL), for the stage line; 0 when unknown.</summary>
+    long CatalogBytes(int accountId, string container) => 0;
 }
 
 /// <summary>What happened to one version during <see cref="IVersionCatalogs.EnsureVersionsAsync"/>.</summary>
