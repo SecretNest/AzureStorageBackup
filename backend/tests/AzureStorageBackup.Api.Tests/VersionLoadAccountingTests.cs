@@ -58,7 +58,7 @@ public sealed class VersionLoadAccountingTests
 
         h.Report(accounting, new VersionLoadProgress(7, VersionLoadEvent.Importing, 30_000));
         Assert.Equal(30_000, h.Last.WorkDone);
-        Assert.Equal("version 7", h.Last.CurrentItem);   // the label set on the first heartbeat rides every publish after it
+        Assert.StartsWith("version 7 @", h.Last.CurrentItem);   // the label set on the first heartbeat rides every publish after it
 
         h.Report(accounting, new VersionLoadProgress(7, VersionLoadEvent.Imported, 50_000));
         Assert.Equal(50_000, h.Last.WorkDone);
@@ -90,5 +90,23 @@ public sealed class VersionLoadAccountingTests
         Assert.Equal(0, h.Last.WorkTotal);
         Assert.Null(h.Last.WorkPercent);
         Assert.Equal(50, h.Last.Percent);
+    }
+
+    [Fact]
+    public void The_current_item_carries_the_versions_timestamps_in_utc_for_the_browser_to_format()
+    {
+        var version = Version(11, 1) with
+        {
+            StartedAt = new DateTimeOffset(2026, 9, 4, 10, 59, 10, TimeSpan.FromHours(8)),
+            CreatedAt = new DateTimeOffset(2026, 9, 4, 11, 1, 0, TimeSpan.FromHours(8)),
+        };
+
+        Assert.Equal(
+            "version 11 @2026-09-04T02:59:10.0000000Z→2026-09-04T03:01:00.0000000Z",
+            VersionLoadAccounting.Label(version));
+        // A version from before start times were recorded: the start slot is empty, the shape holds.
+        Assert.Equal(
+            "version 3 @→2026-09-04T03:01:00.0000000Z",
+            VersionLoadAccounting.Label(version with { Version = 3, StartedAt = null }));
     }
 }

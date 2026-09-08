@@ -20,6 +20,7 @@ internal sealed class VersionLoadAccounting : IProgress<VersionLoadProgress>
 {
     private readonly StageTracker _tracker;
     private readonly Dictionary<int, long> _share;
+    private readonly Dictionary<int, string> _labels;
     private readonly Dictionary<int, long> _booked = new();
     private int? _current;
 
@@ -27,13 +28,26 @@ internal sealed class VersionLoadAccounting : IProgress<VersionLoadProgress>
     {
         _tracker = tracker;
         _share = new Dictionary<int, long>(versions.Count);
+        _labels = new Dictionary<int, string>(versions.Count);
         foreach (var version in versions)
         {
             var files = Math.Max(0, version.Stats.Files);
             _share[version.Version] = files;
+            _labels[version.Version] = Label(version);
             tracker.DeclareWork(files);
         }
     }
+
+    /// <summary>
+    /// The current-item line for a version under import: <c>version 11 @2026-09-04T02:59:10Z→2026-09-04T03:01:00Z</c>,
+    /// the start (empty for a version written before start times were recorded) and the end as round-trip UTC
+    /// timestamps. Machine-readable on purpose: the check and restore pages print a version as "Version 11 —
+    /// 2026/9/4 10:59:10 → 11:01:00" in the <b>browser's</b> timezone, and this line should read the same. A date
+    /// formatted here would be in the container's clock, UTC as a rule, and disagree with every other date on the
+    /// page; so the UI parses this shape (<c>versionItemLabel</c> in stageLines.ts) and formats it itself.
+    /// </summary>
+    internal static string Label(BackupVersion version) =>
+        $"version {version.Version} @{version.StartedAt?.UtcDateTime.ToString("o") ?? ""}→{version.CreatedAt.UtcDateTime:o}";
 
     public void Report(VersionLoadProgress value)
     {
@@ -55,7 +69,7 @@ internal sealed class VersionLoadAccounting : IProgress<VersionLoadProgress>
                 if (_current != value.Version)
                 {
                     _current = value.Version;
-                    _tracker.Touch($"version {value.Version}");
+                    _tracker.Touch(_labels.GetValueOrDefault(value.Version, $"version {value.Version}"));
                 }
 
                 break;

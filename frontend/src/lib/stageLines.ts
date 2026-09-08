@@ -1,5 +1,5 @@
 import type { StageProgress } from '../api/backupConfigs'
-import { formatBytes, formatDuration } from '../constants/format'
+import { formatBytes, formatDuration, formatVersionSpan } from '../constants/format'
 import type { WindDownKind } from './windDownControls'
 
 const STAGE_UNITS: Record<string, string> = {
@@ -557,4 +557,22 @@ export function preparingLabelOf(stage: string): string {
 export function preparingRowLabelOf(stage: string): string {
   const label = preparingLabelOf(stage)
   return label.charAt(0).toUpperCase() + label.slice(1)
+}
+
+/**
+ * The current-item line of the version-loading stage, as the operator should read it: "Version 11 —
+ * 2026/9/4 10:59:10 → 11:01:00", the same wording and the same browser-local clock as the version lists on
+ * the check and restore dialogs.
+ *
+ * The backend sends `version 11 @<startedAt>→<createdAt>` with both timestamps in UTC (see
+ * VersionLoadAccounting.Label): a date formatted server-side would be on the container's clock and disagree
+ * with every other date on the page. Anything not in that shape — an older backend, another stage's item —
+ * is returned as it came.
+ */
+export function versionItemLabel(currentItem: string): string {
+  const m = /^version (\d+) @(\S*)→(\S+)$/.exec(currentItem)
+  if (!m) return currentItem
+  const [, version, startedAt, createdAt] = m
+  if (Number.isNaN(new Date(createdAt).getTime())) return currentItem
+  return `Version ${version} — ${formatVersionSpan(startedAt || null, createdAt)}`
 }
