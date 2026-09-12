@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { logsApi, levelLabels, OperationLogLevel, type LogEntry } from '../api/logs'
 import { latestWins } from '../lib/latestWins'
+import { gatedLoad } from '../lib/gatedLoad'
 import { EmptyRow } from '../components/EmptyRow'
 import { formatLocalDateTime, formatUtcOffset } from '../constants/format'
 
@@ -10,10 +11,13 @@ export function LogsPage() {
   const timeZone = formatUtcOffset(new Date())
 
   const [logs, setLogs] = useState<LogEntry[]>([])
-  // Set once a query comes back, whatever it came back with. Without it an empty `logs` cannot say
-  // "no entries" from "not asked yet", and the table announces "No log entries." while the request is
-  // still in flight — which on this page is doubly wrong, because a filter change re-runs the query
-  // and the flash then lands between two populated results. See EmptyRow.
+  // Set once a query that still counts comes back, whatever it came back with. Without it an empty
+  // `logs` cannot say "no entries" from "not asked yet", and the table announces "No log entries."
+  // while the request is still in flight — which on this page is doubly wrong, because a filter change
+  // re-runs the query and the flash then lands between two populated results. See EmptyRow.
+  // "Still counts": a query superseded by the next keystroke must not set it either. It used to,
+  // through a `.finally` next to the gated `.then`, so on a slow server the superseded query's return
+  // showed "No log entries." over entries that had merely not arrived, with no error line (gatedLoad).
   const [loaded, setLoaded] = useState(false)
   const [minLevel, setMinLevel] = useState<number | ''>('')
   const [source, setSource] = useState('')
@@ -27,27 +31,31 @@ export function LogsPage() {
   // matches the filter controls it sits under. See the note in latestWins.ts.
   const loadGate = useRef(latestWins())
   const load = () => {
-    const isLatest = loadGate.current.begin()
-    logsApi
-      .query({
-        minLevel: minLevel === '' ? undefined : minLevel,
-        source: source || undefined,
-        from: from ? new Date(from).toISOString() : undefined,
-        to: to ? new Date(to).toISOString() : undefined,
-        limit: 300,
-      })
-      .then((r) => {
-        if (isLatest()) setLogs(r)
-      })
-      .catch((e) => {
-        if (isLatest()) setError(e instanceof Error ? e.message : String(e))
-      })
-      // finally, not then: a failed query must still end the "loading" state, or the table sits on
-      // "Loading…" forever with the real reason in the error line above it.
-      // Deliberately never reset to false on a re-query: a filter change then leaves the previous
-      // result on screen until the new one lands, which is what should happen — blanking the table
-      // between two populated results is the same flash this flag exists to remove.
-      .finally(() => setLoaded(true))
+    // Both outcomes end the "loading" state — a failed query too, or the table sits on "Loading…"
+    // forever with the real reason in the error line above it — but only for the latest query; a
+    // superseded one delivers nothing (gatedLoad). Deliberately never reset to false on a re-query: a
+    // filter change then leaves the previous result on screen until the new one lands, which is what
+    // should happen — blanking the table between two populated results is the same flash this flag
+    // exists to remove.
+    void gatedLoad(
+      loadGate.current,
+      () =>
+        logsApi.query({
+          minLevel: minLevel === '' ? undefined : minLevel,
+          source: source || undefined,
+          from: from ? new Date(from).toISOString() : undefined,
+          to: to ? new Date(to).toISOString() : undefined,
+          limit: 300,
+        }),
+      (r) => {
+        setLogs(r)
+        setLoaded(true)
+      },
+      (e) => {
+        setError(e instanceof Error ? e.message : String(e))
+        setLoaded(true)
+      },
+    )
   }
   useEffect(load, [minLevel, source, from, to])
 

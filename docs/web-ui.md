@@ -171,6 +171,18 @@ and a path of several hundred characters would stretch the table off screen. On 
 preceding card drops its bottom border and the status row drops its top border, so the two merge
 visually into one card.
 
+**An empty table has three states, and only an answer may choose between two of them.** `EmptyRow`
+prints "Loading…" until the page's `loaded` flag is set and its empty message ("No backups yet.",
+"No log entries.") after — never the empty message over a list that has merely not arrived. The
+flag is set only by the outcome of the **latest** request (`lib/gatedLoad.ts` over the
+`latestWins` gate): a request superseded by a newer one — the Backups page's mount load overtaken
+by its 5-second poll on a slow server, a Logs query overtaken by the next keystroke — delivers
+neither its data, nor its error, nor "loaded". Before this rule the pages set the flag in a
+`.finally` beside the gated `.then`, and a slow server showed "No backups yet." with no error line
+for as long as it stayed slow. The unattended poll still never raises an error banner on its own
+failure, with one exception: while nothing has loaded yet, its failure is the only answer the page
+has, so it is shown rather than leaving "Loading…" unexplained.
+
 ## Dialogs
 
 A uniform three-part structure, with desktop appearance unchanged:
