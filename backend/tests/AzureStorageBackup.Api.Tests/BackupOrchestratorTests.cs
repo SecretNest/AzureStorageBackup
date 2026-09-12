@@ -1403,7 +1403,52 @@ public sealed class BackupOrchestratorTests : IDisposable
 
             var shares = recording.VolumeShares;
             Assert.NotEmpty(shares);
-            Assert.All(shares, s => Assert.Equal(100L * 1024 * 1024, s)); // 600 MB across 5 + 1 uploaders
+            Assert.All(shares, s => Assert.Equal(VolumeLabelling.Labelled(100L * 1024 * 1024), s)); // 600 MB across 5 + 1 uploaders
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>An encrypted backup's volumes are different bytes on every run (7z's random IV), so no label of
+    /// theirs can ever match a later recompression: the run tells the uploader not to label them, which is also what
+    /// keeps them from being read into memory for a hash nobody will ever compare (volume-identity.md).</summary>
+    [SkippableFact]
+    public async Task An_Encrypted_Run_Sends_Its_Volumes_Unlabelled()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var recording = new ShareRecordingUploader(new BlobUploader(new BlobClientFactory(TestSecrets.Reader)));
+        var (orchestrator, _, factory) = Build(uploader: recording);
+        var account = AzuriteAccount();
+        var name = RandomName("orchenc-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            WriteText("small.txt", "goes into a pack");
+            WriteBytes("big.bin", 6_000_000); // over the single-file threshold: its own family
+            await orchestrator.RunAsync(Request(account, name) with
+            {
+                Password = "pw",
+                Options = new BackupEngineOptions
+                {
+                    Plan = new PlanOptions { SingleFileThresholdBytes = 5_000_000 },
+                    UploadConcurrency = 5,
+                    UploadMemoryLimitBytes = 600L * 1024 * 1024,
+                },
+            });
+
+            var shares = recording.VolumeShares;
+            Assert.NotEmpty(shares);
+            Assert.All(shares, s => Assert.Equal(VolumeLabelling.None, s));
+            var volumes = 0;
+            foreach (var prefix in new[] { "data/", "packs/" })
+                await foreach (var b in container.GetBlobsAsync(BlobTraits.Metadata, BlobStates.None, prefix, CancellationToken.None))
+                {
+                    volumes++;
+                    Assert.False(b.Metadata.ContainsKey(VolumeIdentity.MetaKey), $"{b.Name} carries a label");
+                }
+            Assert.True(volumes >= 2, "the fixture's premise: a pack and a single-file blob both landed");
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

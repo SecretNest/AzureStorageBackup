@@ -43,6 +43,21 @@ The one exception is a caller that already holds the bytes' hash — the raw rou
 file whose FullHash the backup computed in the same format — whose label is used verbatim: no
 buffering, no recompute, any size.
 
+**Encrypted backups are not labelled at all.** 7z draws a fresh random IV for every archive it
+encrypts, so the same source compressed twice under the same password is different bytes end to
+end (measured: 199,354 of 200,176 bytes differ), and every retry, resume and repair recompresses
+from scratch. A label on an encrypted volume can therefore never match anything a later run holds;
+writing it would only buy the memory that holds the volume or the second read of it. So a task
+whose backup has a password hands the uploader `VolumeLabelling.None` for every volume: no hash,
+no in-memory copy, no two-pass — the volume streams from disk as it is, through the 4 MB read
+buffer `FileHasher.OpenRead` gives every upload (the size that was measured to hold the uplink at
+line rate; the SDK still copies it to the socket in 80 KB slices, served out of that buffer). The
+upload memory limit is simply not spent by an encrypted task. The compare side is switched off with
+it: an unlabelled family never reads a local volume to test it against a cloud label, and any label
+left by an earlier era is overwritten together with the volume. "Unlabelled" already read as
+"different" to every skip decision, which is exactly what an encrypted volume is, so nothing about
+the outcome changed — only the bill.
+
 ## The one comparison rule, and where the burden of proof sits
 
 - **Upload side** (deciding whether to skip): *cannot prove identical → treat as different →
@@ -76,8 +91,8 @@ of kept and uploaded volumes assembles into exactly the new family.
   metadata unaffected — restore takes times from the index, the in-archive stamp has no consumer.
   The whole streaming family is deterministic end to end. Era transition needs no analysis: legacy
   volumes carry no label and are therefore "different" without ever being compared.
-- **Encrypted backups**: random salt/IV per run — nothing ever matches, everything uploads, which
-  is today's behavior exactly.
+- **Encrypted backups**: random IV per archive — nothing could ever match, so nothing is labelled
+  and nothing is compared (see *Writing the label*); everything uploads, streamed from disk.
 - If any 7z upgrade breaks determinism, hashes stop matching and volumes upload: **the assumption
   failing costs bandwidth, never correctness.** That asymmetry is the whole reason comparison is
   by bytes rather than by theory.

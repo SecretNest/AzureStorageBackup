@@ -362,9 +362,12 @@ public static class VolumeBlobIO
     /// landed — the backup's in-hand accounting (<c>PauseGate.BeginWork</c>). Counted per volume, not per family,
     /// for the reason given there: once the hold is up, what is still moving is a handful of volumes and not the
     /// file, and "pausing" has to end when they land.</param>
-    /// <param name="inMemoryLimitBytes">The calling task's per-stream share of the global upload memory limit
-    /// (<see cref="UploadMemoryBudget.PerStream"/>), handed to the uploader with every volume: a volume that fits
-    /// is labelled from memory, a bigger one two-pass. Null = the uploader's own fallback.</param>
+    /// <param name="labelling">Whether the volumes get identity labels, and the calling task's per-stream share
+    /// of the global upload memory limit (<see cref="UploadMemoryBudget.PerStream"/>) for computing them, handed
+    /// to the uploader with every volume: a volume that fits is labelled from memory, a bigger one two-pass, and
+    /// an unlabelled one (<see cref="VolumeLabelling.None"/> — encrypted backups) streams from disk unhashed. With
+    /// labelling off, the skip decision is off too: no cloud label is compared, because none could be proven to
+    /// match a volume that is different bytes on every run. Null = label within the uploader's own fallback share.</param>
     public static async Task UploadAsync(
         IBlobUploader uploader, Account account, string container, string baseRef,
         IReadOnlyList<string> volumeFiles, AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
@@ -375,7 +378,7 @@ public static class VolumeBlobIO
         Func<CancellationToken, Task>? beforeVolume = null,
         Func<bool>? volumeHeld = null,
         Func<IDisposable?>? volumeWork = null,
-        long? inMemoryLimitBytes = null)
+        VolumeLabelling? labelling = null)
     {
         // For multi-volume, mark which volume this is in the label: a large file splits into thousands of
         // volumes, and showing only the path would repeat the same line thousands of times with no sign of
@@ -395,7 +398,10 @@ public static class VolumeBlobIO
             if (beforeVolume is not null)
                 await beforeVolume(ct);
             var exists = existingVolumes?.ContainsKey(name) == true;
-            if (exists && existingVolumes![name] is { Label: { } cloudLabel } cloud
+            // An unlabelled upload (encrypted backup) never proves a volume in place: its bytes differ from the
+            // cloud's by construction, so the compare — a full read of the local volume — is not even attempted.
+            var mayProve = labelling?.Label ?? true;
+            if (mayProve && exists && existingVolumes![name] is { Label: { } cloudLabel } cloud
                 && cloud.Length == new FileInfo(file).Length
                 && cloudLabel == await VolumeIdentity.ComputeAsync(file, ct)
                 && (cloudBytesVerify is null || await cloudBytesVerify(name, cloudLabel)))
@@ -423,8 +429,8 @@ public static class VolumeBlobIO
                     await uploader.DeleteIfExistsAsync(account, container, name, ct);
                 }
                 await (exists
-                    ? uploader.UploadOverwriteAsync(account, container, name, file, tier, retry, ct, metadata, p, inMemoryLimitBytes)
-                    : uploader.UploadIfMissingAsync(account, container, name, file, tier, retry, ct, metadata, p, inMemoryLimitBytes));
+                    ? uploader.UploadOverwriteAsync(account, container, name, file, tier, retry, ct, metadata, p, labelling)
+                    : uploader.UploadIfMissingAsync(account, container, name, file, tier, retry, ct, metadata, p, labelling));
             }
             if (scope is null)
             {
@@ -520,7 +526,7 @@ public static class VolumeBlobIO
         IReadOnlyDictionary<string, string>? metadata = null, VolumeUploadScope? scope = null,
         Action<string>? onVolumeUploaded = null, string? label = null,
         Func<CancellationToken, Task>? beforeVolume = null,
-        long? inMemoryLimitBytes = null)
+        VolumeLabelling? labelling = null)
     {
         var newNames = VolumeNames(baseRef, volumeFiles.Count);
 
@@ -533,7 +539,7 @@ public static class VolumeBlobIO
             scope, onVolumeUploaded, label, existing,
             cloudBytesVerify: (name, expected) => CloudBytesMatchAsync(container, name, expected, ct),
             beforeVolume: beforeVolume,
-            inMemoryLimitBytes: inMemoryLimitBytes);
+            labelling: labelling);
 
         // Delete leftover old volumes outside the new set (e.g. the tail when the old volume count > the new
         // one, or the old naming after a single↔multi switch).

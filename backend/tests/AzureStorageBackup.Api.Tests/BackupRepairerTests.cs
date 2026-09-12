@@ -1637,7 +1637,7 @@ public sealed class BackupRepairerTests : IDisposable
 
             var shares = recording.VolumeShares;
             Assert.NotEmpty(shares);
-            Assert.All(shares, s => Assert.Equal(100L * 1024 * 1024, s)); // 400 MB across the repair's 4 streams
+            Assert.All(shares, s => Assert.Equal(VolumeLabelling.Labelled(100L * 1024 * 1024), s)); // 400 MB across the repair's 4 streams
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

@@ -286,7 +286,10 @@ function PerformanceOptions({
         every volume takes the two-read route. Any non-zero limit grants each stream at least{' '}
         <strong>80 KB</strong>, however many streams there are: below one read chunk the memory route would
         hold less than the disk route&apos;s own buffer, so a limit that small still buffers 80 KB rather than
-        turning every tiny blob two-pass.
+        turning every tiny blob two-pass. <strong>Encrypted backups do not use this limit at all.</strong> 7z
+        encrypts every archive under a fresh random IV, so an encrypted volume is different bytes on every
+        run and no hash of it could ever let a later run skip re-uploading it; none is computed, the volume is
+        never held in memory, and it streams from disk through the upload&apos;s own 4 MB read buffer.
       </p>
       {defaultVolumeBytes !== undefined && (
         <p className="text-muted" style={{ marginTop: '-0.4rem' }}>

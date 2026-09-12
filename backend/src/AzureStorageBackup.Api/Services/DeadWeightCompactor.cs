@@ -192,7 +192,7 @@ public sealed class DeadWeightCompactor(
                     var sizes = staged.Files.Select(f => new FileInfo(f).Length).ToList(); // take the sizes before releasing
                     await VolumeBlobIO.ReplaceAsync(
                         uploader, account, container, baseRef, staged.Files, dataTier, retry: null, ct,
-                        inMemoryLimitBytes: UploadMemoryBudget.PerStream(uploadMemoryLimitBytes, streams: 1));
+                        labelling: VolumeLabelling.For(password, UploadMemoryBudget.PerStream(uploadMemoryLimitBytes, streams: 1)));
                     return sizes;
                 }
                 finally

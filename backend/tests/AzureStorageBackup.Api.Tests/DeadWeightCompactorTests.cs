@@ -573,7 +573,7 @@ public sealed class DeadWeightCompactorTests : IDisposable
 
             var shares = recording.VolumeShares;
             Assert.NotEmpty(shares);
-            Assert.All(shares, s => Assert.Equal(300L * 1024 * 1024, s));
+            Assert.All(shares, s => Assert.Equal(VolumeLabelling.Labelled(300L * 1024 * 1024), s));
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

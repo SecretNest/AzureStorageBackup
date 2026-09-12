@@ -65,23 +65,25 @@ public interface IBlobUploader
         => UploadOverwriteAsync(account, container, blobName, filePath, tier, retry, ct, metadata);
 
     /// <summary>
-    /// The volume path's overload: <paramref name="inMemoryLimitBytes"/> is the calling task's per-stream share of
-    /// the global upload memory limit (<see cref="UploadMemoryBudget"/>), the most of the file the uploader may
-    /// hold in memory to label it. Null = the uploader's own fallback (<see cref="BlobUploader.DefaultInMemoryLimitBytes"/>).
-    /// Default-forwarding like the progress overload, and for the same reason: ten arguments select this one
-    /// uniquely, and test doubles that never look at the share change nothing.
+    /// The volume path's overload: <paramref name="labelling"/> says whether the volume gets its identity label at
+    /// all and, if so, the calling task's per-stream share of the global upload memory limit
+    /// (<see cref="UploadMemoryBudget"/>), the most of the file the uploader may hold in memory to label it
+    /// (<see cref="VolumeLabelling"/>). Null = label within the uploader's own fallback share
+    /// (<see cref="BlobUploader.DefaultInMemoryLimitBytes"/>). Default-forwarding like the progress overload, and
+    /// for the same reason: ten arguments select this one uniquely, and test doubles that never look at the
+    /// labelling change nothing.
     /// </summary>
     Task<bool> UploadIfMissingAsync(
         Account account, string container, string blobName, string filePath,
         AccessTier tier, RetryOptions? retry, CancellationToken ct,
-        IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress, long? inMemoryLimitBytes)
+        IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress, VolumeLabelling? labelling)
         => UploadIfMissingAsync(account, container, blobName, filePath, tier, retry, ct, metadata, progress);
 
-    /// <summary>Overwrite upload carrying the per-stream memory share — see the if-missing overload above.</summary>
+    /// <summary>Overwrite upload carrying the labelling — see the if-missing overload above.</summary>
     Task UploadOverwriteAsync(
         Account account, string container, string blobName, string filePath,
         AccessTier tier, RetryOptions? retry, CancellationToken ct,
-        IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress, long? inMemoryLimitBytes)
+        IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress, VolumeLabelling? labelling)
         => UploadOverwriteAsync(account, container, blobName, filePath, tier, retry, ct, metadata, progress);
 }
 
@@ -105,6 +107,11 @@ public sealed class BlobUploader(IBlobClientFactory factory) : IBlobUploader
     /// "never": only an empty file, which holds nothing, still takes the memory route.</summary>
     public static bool HoldsInMemory(long fileLength, long inMemoryLimitBytes) => fileLength <= inMemoryLimitBytes;
 
+    /// <summary>The same question with the labelling in hand: a volume that is not labelled is never held in
+    /// memory — there is no hash to compute over the bytes sent, so the disk route's own buffer is all it needs.</summary>
+    public static bool HoldsInMemory(long fileLength, VolumeLabelling labelling)
+        => labelling.Label && HoldsInMemory(fileLength, labelling.InMemoryLimitBytes);
+
     public Task<bool> UploadIfMissingAsync(
         Account account, string container, string blobName, string filePath,
         AccessTier tier, RetryOptions? retry = null, CancellationToken ct = default,
@@ -120,8 +127,8 @@ public sealed class BlobUploader(IBlobClientFactory factory) : IBlobUploader
     public Task<bool> UploadIfMissingAsync(
         Account account, string container, string blobName, string filePath,
         AccessTier tier, RetryOptions? retry, CancellationToken ct,
-        IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress, long? inMemoryLimitBytes)
-        => UploadCoreAsync(account, container, blobName, filePath, tier, overwrite: false, retry, ct, metadata, progress, inMemoryLimitBytes);
+        IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress, VolumeLabelling? labelling)
+        => UploadCoreAsync(account, container, blobName, filePath, tier, overwrite: false, retry, ct, metadata, progress, labelling);
 
     public async Task UploadOverwriteAsync(
         Account account, string container, string blobName, string filePath,
@@ -138,15 +145,15 @@ public sealed class BlobUploader(IBlobClientFactory factory) : IBlobUploader
     public async Task UploadOverwriteAsync(
         Account account, string container, string blobName, string filePath,
         AccessTier tier, RetryOptions? retry, CancellationToken ct,
-        IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress, long? inMemoryLimitBytes)
-        => await UploadCoreAsync(account, container, blobName, filePath, tier, overwrite: true, retry, ct, metadata, progress, inMemoryLimitBytes);
+        IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress, VolumeLabelling? labelling)
+        => await UploadCoreAsync(account, container, blobName, filePath, tier, overwrite: true, retry, ct, metadata, progress, labelling);
 
     /// <summary>Upload core: with overwrite=false, short-circuit and return false if the blob already exists (if-missing semantics);
     /// with overwrite=true, just overwrite-upload. Returns whether an upload actually happened.</summary>
     private async Task<bool> UploadCoreAsync(
         Account account, string container, string blobName, string filePath,
         AccessTier tier, bool overwrite, RetryOptions? retry, CancellationToken ct,
-        IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress, long? inMemoryLimitBytes)
+        IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress, VolumeLabelling? labelling)
     {
         var blob = factory.CreateServiceClient(account)
             .GetBlobContainerClient(container)
@@ -167,12 +174,16 @@ public sealed class BlobUploader(IBlobClientFactory factory) : IBlobUploader
         // source file, whose FullHash the backup computed in the same format) — used verbatim, no buffering, no
         // recompute, any size. Consistency with the bytes rides the caller's own guarantees (the raw route's
         // stat-bracket).
+        // And a caller that wants no label at all (VolumeLabelling.None — an encrypted backup, whose volumes are
+        // different bytes on every run and could never be skipped on a label) gets neither route: the file streams
+        // from disk as it is, through FileHasher.OpenRead's buffer, and the memory share is not spent.
+        var how = labelling ?? VolumeLabelling.Labelled(DefaultInMemoryLimitBytes);
         byte[]? buffered = null;
         FileBracket? bracket = null;
-        if (metadata?.ContainsKey(VolumeIdentity.MetaKey) != true)
+        if (how.Label && metadata?.ContainsKey(VolumeIdentity.MetaKey) != true)
         {
             var info = new FileInfo(filePath);
-            if (HoldsInMemory(info.Length, inMemoryLimitBytes ?? DefaultInMemoryLimitBytes))
+            if (HoldsInMemory(info.Length, how))
             {
                 await using (var read = FileHasher.OpenRead(filePath))
                 using (var ms = new MemoryStream())

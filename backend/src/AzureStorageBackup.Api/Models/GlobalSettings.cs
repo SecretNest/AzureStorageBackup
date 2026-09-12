@@ -93,7 +93,10 @@ public class GlobalSettings
     /// Cap on the memory a single task may spend holding volumes for labelled uploads — split evenly across that
     /// task's upload streams (<see cref="Services.UploadMemoryBudget"/>). A volume that fits its stream's share is
     /// hashed and sent from memory; a bigger one is hashed first and re-read from disk for the send. 0 = never hold
-    /// a volume in memory. Global, not a per-config default: it protects the host, not a backup. Default 1 GB.
+    /// a volume in memory. An encrypted backup spends none of it: its volumes are not labelled (7z's random IV makes
+    /// them different bytes on every run, so no label could ever justify a skip) and stream from disk unhashed
+    /// (<see cref="Services.VolumeLabelling"/>). Global, not a per-config default: it protects the host, not a
+    /// backup. Default 1 GB.
     /// </summary>
     public long UploadMemoryLimitBytes { get; set; } = 1024L * 1024 * 1024;
     public int DownloadConcurrency { get; set; } = 5; // Download concurrency for restore / deep check (PRD 3.4)
