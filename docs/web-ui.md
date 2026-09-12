@@ -312,6 +312,16 @@ also take over every unhandled exception outside that scope, changing existing f
 Status 400–499 passes through with Azure's code and description; everything else, including
 connection failures, maps to **502** meaning the storage account is unreachable.
 
+**Every request has a deadline** (`api/client.ts`, 60 s, per-request override, 0 disables). Before
+it, a request the server never answered — queued behind the page's own polling on a saturated disk —
+simply never settled: the list pages sat on "Loading…" with nothing to say and Save stayed greyed
+out for the rest of the session. Now it fails as `ApiTimeoutError` (status 0, "No response from the
+server after 60 seconds."), which is deliberately its own type: "the server said no" and "nothing came
+back at all" call for different things from the reader, and Save words the latter as "nothing was
+saved". A caller's own abort signal rides alongside the deadline, not instead of it, and stays the
+`AbortError` it asked for. The long jobs — backup, check, restore, repair — are started and polled,
+so no request this app makes legitimately runs that long.
+
 ## Live probes in a form
 
 The sentinel field asks the backend, as you type, whether the path is there — debounced 400 ms, with

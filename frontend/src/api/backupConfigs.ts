@@ -654,8 +654,7 @@ export interface ImportResult {
 export const backupConfigsApi = {
   list: () => api.get<BackupConfig[]>('/backup-configs'),
   get: (id: number) => api.get<BackupConfig>(`/backup-configs/${id}`),
-  create: (input: BackupConfigInput, signal?: AbortSignal) =>
-    api.post<BackupConfig>('/backup-configs', input, { signal }),
+  create: (input: BackupConfigInput) => api.post<BackupConfig>('/backup-configs', input),
   import: (
     accountId: number,
     containerName: string,
@@ -668,8 +667,7 @@ export const backupConfigsApi = {
       password,
       checkAfterImport,
     }),
-  update: (id: number, input: BackupConfigInput, signal?: AbortSignal) =>
-    api.put<BackupConfig>(`/backup-configs/${id}`, input, { signal }),
+  update: (id: number, input: BackupConfigInput) => api.put<BackupConfig>(`/backup-configs/${id}`, input),
   remove: (id: number, deleteContainer = false) =>
     api.del(`/backup-configs/${id}${deleteContainer ? '?deleteContainer=true' : ''}`),
   resetStatus: (id: number) => api.post<void>(`/backup-configs/${id}/reset-status`, {}),
