@@ -167,6 +167,38 @@ public sealed partial class VersionCatalog : IAsyncDisposable
         await command.ExecuteNonQueryAsync(ct);
     }
 
+    /// <summary>
+    /// The version size, as a fraction of the history already in the catalog, from which one version's import is
+    /// cheaper bracketed by <see cref="DropGlobalIndexesAsync"/> and <see cref="RebuildGlobalIndexesAsync"/> than
+    /// inserted into the live content-keyed indexes. A hundredth. The rebuild sorts every row of the history once
+    /// per index — a few microseconds a row, sequential; the inserts read a random page per row per index, and
+    /// once the history outgrows the cache a random page on a NAS is a millisecond or more. The ratio between
+    /// those two per-row costs is where the trade turns, and a hundred leaves the small daily version of a big
+    /// history on the live-index side while the version that is a real share of it takes the sort.
+    /// <para>
+    /// Field, 2026-09-12: with the indexes kept live for every single version, a version of a few million rows
+    /// into an 8 GB catalog read 1.2 GB/min from disk for over an hour, 40% of one core, 91 MB of memory — the
+    /// migration's read amplification (<see cref="CatalogSql.GlobalIndexNames"/>) on the routine path.
+    /// </para>
+    /// </summary>
+    internal const int BulkImportRatio = 100;
+
+    /// <summary>Whether one version's import should take the content-keyed indexes down — see <see cref="BulkImportRatio"/>.
+    /// Nothing to insert brackets nothing; the first version of an empty history rebuilds three empty trees, which
+    /// costs nothing and keeps the decision a single rule.</summary>
+    internal static bool PrefersRebuild(long versionRows, long historyRows) =>
+        versionRows > 0 && versionRows * BulkImportRatio >= historyRows;
+
+    /// <summary>The rows the catalog holds, as the sum of every version's declared count: what
+    /// <see cref="PrefersRebuild"/> measures a version against. Read off the versions table, not counted over
+    /// entries — on a catalog of gigabytes the question has to be free.</summary>
+    public async Task<long> HistoryRowsAsync(CancellationToken ct)
+    {
+        using var command = _connection.CreateCommand();
+        command.CommandText = "SELECT COALESCE(SUM(entry_count), 0) FROM versions";
+        return Convert.ToInt64(await command.ExecuteScalarAsync(ct));
+    }
+
     /// <summary>How many of <see cref="CatalogSql.GlobalIndexNames"/> the file currently has — all of them on a
     /// healthy catalog, none in the middle of a bulk import.</summary>
     internal async Task<int> GlobalIndexCountAsync(CancellationToken ct)

@@ -161,6 +161,11 @@ public sealed class BackupProgressDetailTests : IDisposable
             // "… → journal"). Which of the three a snapshot catches is the 200 ms throttle's call — on a 40-row
             // import all three land inside one window — so only the shape is asserted, not the step.
             Assert.Contains(updating, r => r.Detail!.CurrentItem?.StartsWith("version 1 → ") == true);
+
+            // The first version of an empty catalog takes the index bracket (VersionCatalog.PrefersRebuild), and the
+            // bracket is only correct if it rebuilds what it dropped.
+            await using (var catalog = await authority.Catalogs.OpenAsync(account.Id, name, readOnly: true, CancellationToken.None))
+                Assert.Equal(CatalogSql.GlobalIndexNames.Count, await catalog.GlobalIndexCountAsync(CancellationToken.None));
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

@@ -313,8 +313,23 @@ means a random page read per row per index over a tree that spans every version 
 Measured with a 64 MiB page cache: importing ten versions read 1.2 GB of pages with the three live
 and one page without them; on the NAS this migration showed up as 30 GB of block reads (ZFS serves
 a 4 KiB page from a 128 KiB record) and hours of wall time for a single container. The rebuild is
-a sort and a sequential write per index. One missing version — the routine case — keeps the indexes
-live, since rebuilding them over the whole history would cost more than one version's inserts.
+a sort and a sequential write per index.
+
+**One version at a time is decided by size.** The run that just finished records its own version
+the same way (`ImportIntoCatalogAsync`, the Updating catalog stage), and a single version missing
+at the probe is imported through the same code. Both used to keep the indexes live on the
+assumption that one version's random inserts cost less than a sort of the whole history — which
+holds while the history fits the cache and stops holding when it does not. Measured on 2026-09-12:
+a version of a few million rows into an 8 GB catalog read 1.2 GB/min from disk for over an hour,
+on 40% of a core and 91 MB of memory. The rule is now `VersionCatalog.PrefersRebuild`: a version
+that is at least a hundredth of the rows already in the catalog takes the same drop-and-rebuild
+bracket; a smaller one goes into the live indexes. A hundred is the ratio between the two per-row
+costs — microseconds a row for the sort, a millisecond or more for a random page on a NAS — so the
+small daily version of a big history stays on the cheap side and the version that is a real share
+of it takes the sort. The history's size comes from the versions table's declared counts, not a
+count over entries, so asking is free. While the indexes sort back, the stage's item line says so
+("… catalog.db (8.2 GB), rebuilding content indexes"): the entries figure is already at its total
+by then, and minutes of 100% standing still is the hang the stage was renamed over.
 
 A migration that stops halfway (a stop pressed, a crash, one version whose index blob cannot be
 read) leaves the versions that did import and no content-keyed indexes; the catalog is slower to

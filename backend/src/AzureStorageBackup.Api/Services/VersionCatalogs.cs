@@ -88,12 +88,13 @@ public sealed class VersionCatalogs(
     }
 
     /// <summary>Versions missing from the catalog at or above which <see cref="EnsureVersionsAsync"/> takes the
-    /// content-keyed indexes down for the duration. One missing version is the routine case (the run that just
-    /// finished writes its own, and the next run's probe finds everything else in place); the indexes are kept
-    /// live for it, because rebuilding three trees over the whole history costs more than one version's random
-    /// inserts. Two or more is a migration — a container whose catalog has yet to be built — and there the trade
-    /// reverses: the rebuild is one sort per index, while the inserts are a random page read per row per index
-    /// over every version already in.</summary>
+    /// content-keyed indexes down for the duration, whatever their size. Two or more is a migration — a container
+    /// whose catalog has yet to be built — and there the rebuild is one sort per index, while the inserts are a
+    /// random page read per row per index over every version already in. One missing version (the run that just
+    /// finished could not record its own; the next run's probe imports it) is decided by its size against the
+    /// history, <see cref="VersionCatalog.PrefersRebuild"/> — it used to keep the indexes live unconditionally,
+    /// on the assumption that one version's random inserts are cheaper than the sort, which stops holding once
+    /// the history outgrows the cache.</summary>
     internal const int BulkImportThreshold = 2;
 
     public async Task EnsureVersionsAsync(
@@ -137,7 +138,8 @@ public sealed class VersionCatalogs(
         // behind this. Not rebuilt on the way out of a failure or a stop: the rebuild takes as long as the
         // history is big, and a stop pressed during a migration wants the run to end, not to sort three indexes
         // first. The next write open's schema pass rebuilds them; in between, queries are slower and still right.
-        var bulk = missing.Count >= BulkImportThreshold;
+        var bulk = missing.Count >= BulkImportThreshold
+            || (missing.Count == 1 && VersionCatalog.PrefersRebuild(missing[0].Stats.Files, await catalog.HistoryRowsAsync(ct)));
         if (bulk)
             await catalog.DropGlobalIndexesAsync(ct);
         foreach (var version in missing)
