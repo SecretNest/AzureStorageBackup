@@ -661,15 +661,23 @@ export const backupConfigsApi = {
     password: string | null,
     checkAfterImport: boolean,
   ) =>
+    // No deadline: the import loads every version's catalog inside the request, after the configuration
+    // row is already committed — hours for a long history on the NAS. Cut off at the client's default the
+    // request is cancelled part-way, the configuration is left with a partial catalog, and a retry answers
+    // "container taken".
     api.post<ImportResult>('/backup-configs/import', {
       accountId,
       containerName,
       password,
       checkAfterImport,
-    }),
+    }, { timeoutMs: 0 }),
   update: (id: number, input: BackupConfigInput) => api.put<BackupConfig>(`/backup-configs/${id}`, input),
+  // No deadline: the delete runs the container delete, the row, the log purge, the catalog and journal
+  // removal and the keyring recovery in sequence under the request, and an abort part-way leaves orphans
+  // that the next cleanup cannot see. Queued behind another backup's write it can take a while; waiting
+  // is the lesser evil.
   remove: (id: number, deleteContainer = false) =>
-    api.del(`/backup-configs/${id}${deleteContainer ? '?deleteContainer=true' : ''}`),
+    api.del(`/backup-configs/${id}${deleteContainer ? '?deleteContainer=true' : ''}`, { timeoutMs: 0 }),
   resetStatus: (id: number) => api.post<void>(`/backup-configs/${id}/reset-status`, {}),
   // Migrating the local root. preview is a pure query and can be retried freely; only changeLocalRoot mutates.
   previewLocalRoot: (id: number, newRoot: string) =>
@@ -684,8 +692,11 @@ export const backupConfigsApi = {
       ...(version != null ? { version: String(version) } : {}),
       ...(path ? { path } : {}),
     })}`),
+  // No deadline: the estimate HEADs every distinct object in the selection to find the archived ones, and
+  // a selection of tens of thousands of single-file blobs runs past a minute. Cut off, the dialog would
+  // offer "Start restore" without the rehydration warning that this estimate exists to show.
   restoreEstimate: (id: number, version: number | null, paths: string[]) =>
-    api.post<RestoreEstimate>(`/backup-configs/${id}/restore-estimate`, { version, paths }),
+    api.post<RestoreEstimate>(`/backup-configs/${id}/restore-estimate`, { version, paths }, { timeoutMs: 0 }),
   restore: (
     id: number,
     targetRoot: string | null,

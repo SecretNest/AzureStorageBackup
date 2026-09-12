@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import { authApi } from '../api/auth'
-import { ApiError } from '../api/client'
+import { ApiError, ApiTimeoutError } from '../api/client'
 
 /** Preset-password login page (design §6). No username. */
 export function LoginPage({ onSignedIn }: { onSignedIn: () => void }) {
@@ -19,7 +19,11 @@ export function LoginPage({ onSignedIn }: { onSignedIn: () => void }) {
     } catch (e) {
       // Only a 401 means "wrong password". Reporting a network failure or a 500 as a bad password
       // makes people retype a perfectly correct password over and over during an outage.
+      // A timeout is tested before the generic ApiError branch it would otherwise fall into: it carries no
+      // HTTP status (0), and "the server returned 0" is not a thing anyone can act on.
       if (e instanceof ApiError && e.status === 401) setError('Incorrect password.')
+      else if (e instanceof ApiTimeoutError)
+        setError(`Sign-in failed: no response from the server after ${e.timeoutMs / 1000} seconds. Please try again.`)
       else if (e instanceof ApiError)
         setError(`Sign-in failed: the server returned ${e.status}. Please try again.`)
       else setError('Sign-in failed: could not reach the server. Please try again.')

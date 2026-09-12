@@ -203,15 +203,29 @@ export function BackupConfigsPage() {
   // The first list to arrive also hydrates the repair states, whichever request brought it: it used
   // to hang off the mount request alone, so when that one was superseded by the poll on a slow server,
   // a suspended repair's resume button never appeared until the page was reloaded.
+  // `listInFlight` is the poll's guard (see the 5-second effect): a tick that would only supersede a
+  // list request still on the wire is skipped, because on a server where every list takes longer than
+  // the interval, superseding on every tick means nothing is ever delivered — the page would sit on
+  // "Loading…" with a dozen list requests stacked against the browser's connection budget, each one
+  // making the next slower. User actions are not guarded: a click's request supersedes on purpose.
   const configsGate = useRef(latestWins())
+  const listInFlight = useRef(false)
   const hydrated = useRef(false)
-  const refreshConfigs = (onError: (e: unknown) => void) =>
-    gatedLoad(
+  const loadErrorShown = useRef(false)
+  const refreshConfigs = (onError: (e: unknown) => void) => {
+    listInFlight.current = true
+    return gatedLoad(
       configsGate.current,
       backupConfigsApi.list,
       (list) => {
         setConfigs(list)
         markLoaded()
+        // A load failure's banner is cleared by the next list that arrives — nothing else would: the banner
+        // has no dismiss, and every other setError(null) in this file sits inside a button handler.
+        if (loadErrorShown.current) {
+          loadErrorShown.current = false
+          setError(null)
+        }
         refreshInterrupted(list)
         if (!hydrated.current) {
           hydrated.current = true
@@ -219,11 +233,15 @@ export function BackupConfigsPage() {
         }
       },
       onError,
-    )
+    ).finally(() => {
+      listInFlight.current = false
+    })
+  }
   // A failed load ends the "loading" state along with reporting why, or the table would sit on
   // "Loading…" forever with the real reason in the error line above it.
   const showLoadError = (e: unknown) => {
     setError(e instanceof Error ? e.message : String(e))
+    loadErrorShown.current = true
     markLoaded()
   }
   // The latest-wins gate above decides who may WRITE; it does nothing about how many requests are in the
@@ -354,12 +372,12 @@ export function BackupConfigsPage() {
   // first answer the page has, and the alternative is "Loading…" with no explanation until a tick
   // succeeds — which on a server that keeps failing is never.
   useEffect(() => {
-    const refresh = () =>
-      writeInFlight.current
-        ? Promise.resolve(null)
-        : refreshConfigs((e) => {
-            if (!loadedRef.current) showLoadError(e)
-          })
+    const refresh = () => {
+      if (writeInFlight.current || listInFlight.current) return
+      void refreshConfigs((e) => {
+        if (!loadedRef.current) showLoadError(e)
+      })
+    }
     const t = setInterval(refresh, 5000)
     // Browsers throttle background-tab timers to minutes, so switching back shows the previous tick's
     // stale snapshot and waits a full period to update — with a long job running, that is half the reason
