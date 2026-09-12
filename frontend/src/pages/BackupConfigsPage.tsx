@@ -20,6 +20,7 @@ import { errorBadgeLabel } from '../lib/errorBadge'
 import { etaLabel } from '../lib/etaLabel'
 import { showsInterruptedNotice } from '../lib/interruptedNotice'
 import { latestWins, type LatestWins } from '../lib/latestWins'
+import { gatedLoad } from '../lib/gatedLoad'
 import { pauseDisplay } from '../lib/pauseDisplay'
 import { isInScope, parseScope, scopeToText } from '../lib/scopeRules'
 import { windDownControls, type CatalogPass, type WindDownKind } from '../lib/windDownControls'
@@ -133,12 +134,21 @@ function formatRetryIn(at: string): string {
 
 export function BackupConfigsPage() {
   const [configs, setConfigs] = useState<BackupConfig[]>([])
-  // Set once the first list request comes back, whatever it came back with. Without it an empty
-  // `configs` cannot say "no backups" from "no backups *yet fetched*", and this page — the landing
-  // page — greets the user with "No backups yet." before showing them their backups. See EmptyRow.
-  // The 5-second refresh below deliberately does not touch it: once loaded, always loaded, so a tick
+  // Set once the first list request that still counts comes back, whatever it came back with. Without
+  // it an empty `configs` cannot say "no backups" from "no backups *yet fetched*", and this page — the
+  // landing page — greets the user with "No backups yet." before showing them their backups. See EmptyRow.
+  // The 5-second refresh below deliberately does not reset it: once loaded, always loaded, so a tick
   // that fails or returns late leaves the previous list on screen rather than blanking the table.
+  // "Still counts" is the other half: a request the latest-wins gate has superseded — the mount load
+  // on a slow server, overtaken by the first poll tick — must not set this either. It used to, through
+  // a `.finally` next to the gated `.then`, and the page then showed "No backups yet." over a list
+  // that had merely not arrived, with no error line, for as long as the server stayed slow (gatedLoad).
   const [loaded, setLoaded] = useState(false)
+  const loadedRef = useRef(false)
+  const markLoaded = () => {
+    loadedRef.current = true
+    setLoaded(true)
+  }
   const [accounts, setAccounts] = useState<Account[]>([])
   const [runs, setRuns] = useState<Record<number, BackupRun>>({})
   // Which runs have been asked to wind down, and how. Stopping is asynchronous — the signal only takes effect
@@ -190,15 +200,26 @@ export function BackupConfigsPage() {
   // just-started run back to Idle — and because activeKey derives from configs, that flicker also
   // restarted the active-polling effect and fired its departure logic for a run that never left. The gate
   // begins when a list() is SENT, so whichever request started later wins, not whichever returned later.
+  // Only the latest request's answer counts — its list, its error, and "loaded" alike; a superseded
+  // one delivers nothing (gatedLoad). The caller decides what a failure means, because the two
+  // triggers disagree: a user action reports it, the unattended poll normally keeps quiet.
   const configsGate = useRef(latestWins())
-  const refreshConfigs = () => {
-    const isLatest = configsGate.current.begin()
-    return backupConfigsApi.list().then((list) => {
-      if (!isLatest()) return null
-      setConfigs(list)
-      refreshInterrupted(list)
-      return list
-    })
+  const refreshConfigs = (onError: (e: unknown) => void) =>
+    gatedLoad(
+      configsGate.current,
+      backupConfigsApi.list,
+      (list) => {
+        setConfigs(list)
+        markLoaded()
+        refreshInterrupted(list)
+      },
+      onError,
+    )
+  // A failed load ends the "loading" state along with reporting why, or the table would sit on
+  // "Loading…" forever with the real reason in the error line above it.
+  const showLoadError = (e: unknown) => {
+    setError(e instanceof Error ? e.message : String(e))
+    markLoaded()
   }
   // The latest-wins gate above decides who may WRITE; it does nothing about how many requests are in the
   // air. This one is the second half, and it is the half that matters under load: this is a fan-out of one
@@ -225,11 +246,7 @@ export function BackupConfigsPage() {
   }
 
   const load = () => {
-    refreshConfigs()
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
-      // finally, not then: a failed load must still end the "loading" state, or the table sits on
-      // "Loading…" forever with the real reason in the error line above it.
-      .finally(() => setLoaded(true))
+    void refreshConfigs(showLoadError)
   }
 
   // Hydrate repair states: a suspended repair must show its resume button after a page load or a container
@@ -286,12 +303,9 @@ export function BackupConfigsPage() {
   }, [runs])
 
   useEffect(() => {
-    refreshConfigs()
-      .then((list) => {
-        if (list !== null) hydrateRepairs(list)
-      })
-      .catch((e) => setError(e instanceof Error ? e.message : String(e)))
-      .finally(() => setLoaded(true))
+    void refreshConfigs(showLoadError).then((list) => {
+      if (list !== null) hydrateRepairs(list)
+    })
     // Mount only, deliberately — see hydrateRepairs.
   }, [])
 
@@ -331,9 +345,17 @@ export function BackupConfigsPage() {
   // activity), no cloud.
   // This is an unattended background refresh, so one network blip must not raise an error banner — it
   // could cover another error the user is reading, and there is nothing they can do about this refresh
-  // anyway. The next tick retries naturally.
+  // anyway. The next tick retries naturally. The one exception is a page that has not loaded yet: when
+  // this tick superseded the mount load (a slow server) and then failed itself, its failure is the
+  // first answer the page has, and the alternative is "Loading…" with no explanation until a tick
+  // succeeds — which on a server that keeps failing is never.
   useEffect(() => {
-    const refresh = () => (writeInFlight.current ? Promise.resolve(null) : refreshConfigs()).catch(() => {})
+    const refresh = () =>
+      writeInFlight.current
+        ? Promise.resolve(null)
+        : refreshConfigs((e) => {
+            if (!loadedRef.current) showLoadError(e)
+          })
     const t = setInterval(refresh, 5000)
     // Browsers throttle background-tab timers to minutes, so switching back shows the previous tick's
     // stale snapshot and waits a full period to update — with a long job running, that is half the reason
