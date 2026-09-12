@@ -16,8 +16,7 @@ describe('gatedLoad', () => {
   it('delivers and returns the result of the only request in flight', async () => {
     const gate = latestWins()
     const seen: string[][] = []
-    const result = await gatedLoad(gate, () => Promise.resolve(['a']), (r) => seen.push(r), () => { throw new Error('no') })
-    expect(result).toEqual(['a'])
+    await gatedLoad(gate, () => Promise.resolve(['a']), (r) => seen.push(r), () => { throw new Error('no') })
     expect(seen).toEqual([['a']])
   })
 
@@ -35,11 +34,11 @@ describe('gatedLoad', () => {
     const p2 = gatedLoad(gate, () => second.promise, (r) => delivered.push(r), (e) => errors.push(e))
 
     first.resolve(['stale'])
-    expect(await p1).toBeNull()
+    await p1
     expect(delivered).toEqual([])
 
     second.resolve(['fresh'])
-    expect(await p2).toEqual(['fresh'])
+    await p2
     expect(delivered).toEqual([['fresh']])
     expect(errors).toEqual([])
   })
@@ -52,15 +51,14 @@ describe('gatedLoad', () => {
     void gatedLoad(gate, () => new Promise<string[]>(() => {}), () => {}, (e) => errors.push(e))
 
     first.reject(new Error('stale failure'))
-    expect(await p1).toBeNull()
+    await p1 // settles rather than rejects: the failure was superseded, nobody is owed it
     expect(errors).toEqual([])
   })
 
-  it('the latest request delivers its error and resolves to null', async () => {
+  it('the latest request delivers its error and settles without rejecting', async () => {
     const gate = latestWins()
     const errors: unknown[] = []
-    const result = await gatedLoad(gate, () => Promise.reject(new Error('boom')), () => { throw new Error('no') }, (e) => errors.push(e))
-    expect(result).toBeNull()
+    await gatedLoad(gate, () => Promise.reject(new Error('boom')), () => { throw new Error('no') }, (e) => errors.push(e))
     expect(errors).toHaveLength(1)
     expect((errors[0] as Error).message).toBe('boom')
   })

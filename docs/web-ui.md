@@ -181,7 +181,10 @@ neither its data, nor its error, nor "loaded". Before this rule the pages set th
 `.finally` beside the gated `.then`, and a slow server showed "No backups yet." with no error line
 for as long as it stayed slow. The unattended poll still never raises an error banner on its own
 failure, with one exception: while nothing has loaded yet, its failure is the only answer the page
-has, so it is shown rather than leaving "Loading…" unexplained.
+has, so it is shown rather than leaving "Loading…" unexplained — and the next list that arrives
+clears it. The poll also skips a tick while a list request is still on the wire: on a server where
+every list takes longer than the interval, superseding on every tick would mean no request is ever
+the latest when it lands, and nothing would ever be delivered.
 
 ## Dialogs
 
@@ -320,7 +323,11 @@ server after 60 seconds."), which is deliberately its own type: "the server said
 back at all" call for different things from the reader, and Save words the latter as "nothing was
 saved". A caller's own abort signal rides alongside the deadline, not instead of it, and stays the
 `AbortError` it asked for. The long jobs — backup, check, restore, repair — are started and polled,
-so no request this app makes legitimately runs that long.
+so almost no request this app makes legitimately runs that long. Three do their work inside the call
+and opt out (`timeoutMs: 0`): **import** loads every version's catalog after the configuration row is
+committed, **restore-estimate** HEADs every object in the selection to find the archived ones, and a
+configuration's **delete** runs its cloud, row, log, catalog and journal removals in sequence — for
+each, a cancellation part-way is worse than a long wait.
 
 ## Live probes in a form
 

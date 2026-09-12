@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { latestWins } from '../lib/latestWins'
+import { gatedLoad } from '../lib/gatedLoad'
 import {
   containersApi,
   containerStatusLabel,
@@ -19,20 +20,26 @@ export function ContainersPage({ account, onBack }: { account: Account; onBack: 
   // latestWins: load() fires from mount, Refresh, and the post-create/post-delete refreshes, with nothing
   // stopping two from being in flight at once — and the OLDER response can resolve last, reverting the list
   // to a snapshot from before the create/delete (the new container "vanishes" until the next refresh).
+  // Both outcomes end "loading", but only the latest request's outcome does (gatedLoad): a superseded
+  // request used to end it through an ungated `.finally`, and the page then said "No containers yet"
+  // over a list that had merely not arrived — right after the user created one, until the newer
+  // request landed.
   const loadGate = useRef(latestWins())
   const load = useCallback(() => {
-    const isLatest = loadGate.current.begin()
     setLoading(true)
     setError(null)
-    containersApi
-      .list(account.id)
-      .then((r) => {
-        if (isLatest()) setContainers(r)
-      })
-      .catch((e) => {
-        if (isLatest()) setError(e instanceof Error ? e.message : String(e))
-      })
-      .finally(() => setLoading(false))
+    void gatedLoad(
+      loadGate.current,
+      () => containersApi.list(account.id),
+      (r) => {
+        setContainers(r)
+        setLoading(false)
+      },
+      (e) => {
+        setError(e instanceof Error ? e.message : String(e))
+        setLoading(false)
+      },
+    )
   }, [account.id])
 
   useEffect(load, [load])

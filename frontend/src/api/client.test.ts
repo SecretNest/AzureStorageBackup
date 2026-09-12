@@ -34,6 +34,26 @@ describe('request deadline', () => {
     expect((failure as DOMException).name).toBe('AbortError')
   })
 
+  // Safari 16.0–17.3 has AbortSignal.timeout but not AbortSignal.any; the stitched fallback must behave
+  // the same both ways round.
+  it('without AbortSignal.any, the deadline and a caller abort are still combined', async () => {
+    const original = AbortSignal.any
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ;(AbortSignal as any).any = undefined
+    try {
+      vi.stubGlobal('fetch', stalledFetch())
+      const controller = new AbortController()
+      const cancelled = api.get('/system/browse', { signal: controller.signal, timeoutMs: 10_000 }).catch((e: unknown) => e)
+      controller.abort()
+      expect((await cancelled as DOMException).name).toBe('AbortError')
+
+      const timedOut = await api.get('/system/browse', { signal: new AbortController().signal, timeoutMs: 20 }).catch((e: unknown) => e)
+      expect(timedOut).toBeInstanceOf(ApiTimeoutError)
+    } finally {
+      AbortSignal.any = original
+    }
+  })
+
   it('a deadline of 0 means none', async () => {
     const fetched = stalledFetch()
     vi.stubGlobal('fetch', fetched)

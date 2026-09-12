@@ -14,25 +14,22 @@ import type { LatestWins } from './latestWins'
  * arrived, and only the latest request's answer counts, so the callbacks own that flag and a
  * superseded request never reaches them.
  *
- * @returns the result when it was delivered; null when the request was superseded, and null after a
- * delivered error too — the caller has been told through `onError` and nothing is left to do.
+ * The callbacks are the only outputs; the returned promise settles when the request has, delivered
+ * or not, and never rejects — for a caller that needs to know the request is over (an in-flight guard).
  */
 export function gatedLoad<T>(
   gate: LatestWins,
   request: () => Promise<T>,
   onResult: (result: T) => void,
   onError: (error: unknown) => void,
-): Promise<T | null> {
+): Promise<void> {
   const isLatest = gate.begin()
   return request().then(
     (result) => {
-      if (!isLatest()) return null
-      onResult(result)
-      return result
+      if (isLatest()) onResult(result)
     },
     (error: unknown) => {
       if (isLatest()) onError(error)
-      return null
     },
   )
 }
