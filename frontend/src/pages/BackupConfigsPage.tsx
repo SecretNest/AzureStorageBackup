@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react'
 import { accountsApi, type Account } from '../api/accounts'
-import { ApiError } from '../api/client'
+import { ApiError, ApiTimeoutError } from '../api/client'
 import { refreshKeyringStatus, useKeyringStatus } from '../api/keyring'
 import { settingsApi, type GlobalSettings } from '../api/settings'
 import { ChangeLocalRootDialog } from '../components/ChangeLocalRootDialog'
@@ -62,9 +62,6 @@ import {
   BackupPresence,
   type ContainerInfo,
 } from '../api/containers'
-
-/** How long Save/Create waits for the server before giving up and saying so. See save(). */
-const SAVE_TIMEOUT_MS = 60_000
 
 const cloudLevelLabels: Record<number, string> = {
   [CloudCheckLevel.None]: "Don't check cloud",
@@ -203,7 +200,11 @@ export function BackupConfigsPage() {
   // Only the latest request's answer counts — its list, its error, and "loaded" alike; a superseded
   // one delivers nothing (gatedLoad). The caller decides what a failure means, because the two
   // triggers disagree: a user action reports it, the unattended poll normally keeps quiet.
+  // The first list to arrive also hydrates the repair states, whichever request brought it: it used
+  // to hang off the mount request alone, so when that one was superseded by the poll on a slow server,
+  // a suspended repair's resume button never appeared until the page was reloaded.
   const configsGate = useRef(latestWins())
+  const hydrated = useRef(false)
   const refreshConfigs = (onError: (e: unknown) => void) =>
     gatedLoad(
       configsGate.current,
@@ -212,6 +213,10 @@ export function BackupConfigsPage() {
         setConfigs(list)
         markLoaded()
         refreshInterrupted(list)
+        if (!hydrated.current) {
+          hydrated.current = true
+          hydrateRepairs(list)
+        }
       },
       onError,
     )
@@ -253,12 +258,13 @@ export function BackupConfigsPage() {
   // restart, and the row-level polling only runs while activity says Repairing. Routed through the
   // per-config repair gate like every other writer of that map.
   //
-  // On mount only, not on every load(). This is another per-configuration fan-out, and load() runs after
-  // every button on the page — Backup, Stop, Save, Delete, Reset — so it used to double the request burst
-  // of every single click for information that cannot have changed: a repair that starts or ends while the
-  // page is open is already tracked by the 1-second tick, whose departure handler fires one last
-  // refreshRepair for a repair that has just stopped being active (see the cleanup below). Only the state
-  // that predates this page had to be discovered, and that is what mounting means.
+  // Once, on the first list that arrives, not on every load(). This is another per-configuration fan-out,
+  // and load() runs after every button on the page — Backup, Stop, Save, Delete, Reset — so it used to
+  // double the request burst of every single click for information that cannot have changed: a repair
+  // that starts or ends while the page is open is already tracked by the 1-second tick, whose departure
+  // handler fires one last refreshRepair for a repair that has just stopped being active (see the cleanup
+  // below). Only the state that predates this page had to be discovered, and the first list is when the
+  // page first knows which configurations there are.
   const hydrateRepairs = (list: BackupConfig[]) => {
     for (const c of list)
       void refreshRepair(c.id)
@@ -303,10 +309,8 @@ export function BackupConfigsPage() {
   }, [runs])
 
   useEffect(() => {
-    void refreshConfigs(showLoadError).then((list) => {
-      if (list !== null) hydrateRepairs(list)
-    })
-    // Mount only, deliberately — see hydrateRepairs.
+    load()
+    // Mount only, deliberately: the poll below takes over from here.
   }, [])
 
   // Lets the ticks and cleanups of the effects below read the **latest** configs/restores without putting
@@ -700,31 +704,29 @@ export function BackupConfigsPage() {
     }
     setBusy(true)
     setError(null)
-    // Bounded, and it says so when the bound is hit. Before this, the request had no deadline at all: if it
-    // never got through — queued behind the page's own polling against the six connections a browser gives
-    // an origin, or waiting on a server with its disk saturated — the await simply never settled, so the
-    // `finally` below never ran, and Save stayed greyed out with no message, no error and nothing saved for
-    // the rest of the session. A minute is far longer than this write can legitimately take (it is a handful
-    // of local SQLite rows) and short enough that the user has not yet walked away.
-    const timeout = AbortSignal.timeout(SAVE_TIMEOUT_MS)
+    // Bounded by the API client's deadline (DEFAULT_TIMEOUT_MS), and it says so when the bound is hit.
+    // This write was the first request to get one: if it never got through — queued behind the page's own
+    // polling against the six connections a browser gives an origin, or waiting on a server with its disk
+    // saturated — the await simply never settled, so the `finally` below never ran, and Save stayed greyed
+    // out with no message, no error and nothing saved for the rest of the session.
     writeInFlight.current = true
     try {
       if (editing) {
-        await backupConfigsApi.update(editing.id, form, timeout)
+        await backupConfigsApi.update(editing.id, form)
       } else {
         // §4.6: after a successful creation, do not just close — offer to run the first backup now.
-        const created = await backupConfigsApi.create(form, timeout)
+        const created = await backupConfigsApi.create(form)
         setPostCreate(created)
       }
       closeForm()
       load()
     } catch (e) {
-      // AbortSignal.timeout aborts with a TimeoutError, which is distinguishable from an abort the user
-      // asked for — and worth distinguishing, because "the server said no" and "nothing came back at all"
-      // call for completely different things from the person reading it.
+      // A timeout is worth its own wording here: "the server said no" and "nothing came back at all" call
+      // for completely different things from the person reading it, and the one thing they need to know
+      // about the latter is that nothing was saved.
       setError(
-        e instanceof DOMException && e.name === 'TimeoutError'
-          ? `No response after ${SAVE_TIMEOUT_MS / 1000} seconds, so nothing was saved. `
+        e instanceof ApiTimeoutError
+          ? `No response after ${e.timeoutMs / 1000} seconds, so nothing was saved. `
             + 'This backup is unchanged. A busy disk can hold the request up that long — try again once the '
             + 'running job has settled.'
           : e instanceof Error ? e.message : String(e),
