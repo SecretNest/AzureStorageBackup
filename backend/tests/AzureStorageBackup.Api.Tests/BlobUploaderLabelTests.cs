@@ -245,7 +245,7 @@ public sealed class BlobUploaderLabelTests : IDisposable
 
             await new BlobUploader(factory).UploadIfMissingAsync(
                 account, name, "data/big.001", file, AccessTier.Hot, retry: null, ct: default,
-                metadata: null, progress: null, inMemoryLimitBytes: 100 * 1024);
+                metadata: null, progress: null, labelling: VolumeLabelling.Labelled(100 * 1024));
 
             var blob = container.GetBlobClient("data/big.001");
             var props = (await blob.GetPropertiesAsync()).Value;
@@ -276,11 +276,45 @@ public sealed class BlobUploaderLabelTests : IDisposable
 
             await new BlobUploader(factory).UploadOverwriteAsync(
                 account, name, "data/z.001", file, AccessTier.Hot, retry: null, ct: default,
-                metadata: null, progress: null, inMemoryLimitBytes: 0);
+                metadata: null, progress: null, labelling: VolumeLabelling.Labelled(0));
 
             var props = (await container.GetBlobClient("data/z.001").GetPropertiesAsync()).Value;
             Assert.Equal("xxh128:" + Convert.ToHexString(XxHash128.Hash(content)).ToLowerInvariant(),
                 props.Metadata[VolumeIdentity.MetaKey]);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
+    /// <summary>An encrypted backup's volume goes up with **no** label and is not read into memory for one: the
+    /// bytes are different on every run (7z's random IV), so a label could never justify a skip, and the only thing
+    /// computing it would buy is the memory or the second read. The caller's own metadata still rides the upload.</summary>
+    [SkippableFact]
+    public async Task An_Unlabelled_Upload_Carries_No_Label_And_Keeps_The_Callers_Metadata()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var account = AzuriteAccount();
+        var name = RandomName("nolabel-");
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            var content = new byte[300 * 1024];
+            Random.Shared.NextBytes(content);
+            var file = Path.Combine(_dir, "enc.001");
+            await File.WriteAllBytesAsync(file, content);
+
+            await new BlobUploader(factory).UploadIfMissingAsync(
+                account, name, "data/enc.001", file, AccessTier.Hot, retry: null, ct: default,
+                metadata: new Dictionary<string, string> { ["v"] = "opaque" }, progress: null,
+                labelling: VolumeLabelling.None);
+
+            var blob = container.GetBlobClient("data/enc.001");
+            var props = (await blob.GetPropertiesAsync()).Value;
+            Assert.False(props.Metadata.ContainsKey(VolumeIdentity.MetaKey), "an unlabelled upload must write no xxh128");
+            Assert.Equal("opaque", props.Metadata["v"]);
+            Assert.Equal(content, (await blob.DownloadContentAsync()).Value.Content.ToArray());
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

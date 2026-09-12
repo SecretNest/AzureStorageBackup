@@ -153,8 +153,11 @@ bytes it describes. A volume that fits its upload stream's share of the global u
 is hashed and sent from one in-memory read; a bigger one is hashed from disk and re-read for the
 send (two-pass); the raw route supplies the hash it already holds. The label's only consumer is the upload
 path's skip decision — resume and repair verify a cloud volume in place instead of re-sending it;
-check never reads it. Legacy volumes carry none and therefore always read as "different". The full
-argument is [volume-identity.md](volume-identity.md).
+check never reads it. Legacy volumes carry none and therefore always read as "different". So do the
+volumes of an **encrypted** backup, which carry none on purpose: 7z's random IV makes every encrypted
+archive different bytes, a label could never match, and computing one would only cost the memory or
+the second read — they stream from disk unhashed. The full argument is
+[volume-identity.md](volume-identity.md).
 
 > **Rationale — why `.001` is not written last as a completeness marker.** It used to be, as an "the
 > family is complete" signal, and it was dropped together with cloud-side existence dedup: it doubled

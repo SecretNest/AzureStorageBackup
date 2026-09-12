@@ -1090,7 +1090,7 @@ public sealed class VolumeBlobIOTests
     /// volume of every family must carry it to the uploader, or the cap is a number nobody reads.</summary>
     private sealed class ShareRecordingUploader : IBlobUploader
     {
-        public List<long?> Shares { get; } = [];
+        public List<VolumeLabelling?> Shares { get; } = [];
 
         public Task<bool> UploadIfMissingAsync(
             Account account, string container, string blobName, string filePath,
@@ -1107,18 +1107,18 @@ public sealed class VolumeBlobIOTests
         public Task<bool> UploadIfMissingAsync(
             Account account, string container, string blobName, string filePath,
             AccessTier tier, RetryOptions? retry, CancellationToken ct,
-            IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress, long? inMemoryLimitBytes)
+            IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress, VolumeLabelling? labelling)
         {
-            lock (Shares) Shares.Add(inMemoryLimitBytes);
+            lock (Shares) Shares.Add(labelling);
             return Task.FromResult(true);
         }
 
         public Task UploadOverwriteAsync(
             Account account, string container, string blobName, string filePath,
             AccessTier tier, RetryOptions? retry, CancellationToken ct,
-            IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress, long? inMemoryLimitBytes)
+            IReadOnlyDictionary<string, string>? metadata, IProgress<long>? progress, VolumeLabelling? labelling)
         {
-            lock (Shares) Shares.Add(inMemoryLimitBytes);
+            lock (Shares) Shares.Add(labelling);
             return Task.CompletedTask;
         }
     }
@@ -1130,8 +1130,63 @@ public sealed class VolumeBlobIOTests
 
         await VolumeBlobIO.UploadAsync(
             up, Acc(), "c", "data/h", ["/tmp/a.001", "/tmp/a.002"], AccessTier.Hot,
-            inMemoryLimitBytes: 7 * 1024 * 1024);
+            labelling: VolumeLabelling.Labelled(7 * 1024 * 1024));
 
-        Assert.Equal([7L * 1024 * 1024, 7L * 1024 * 1024], up.Shares);
+        Assert.Equal([VolumeLabelling.Labelled(7 * 1024 * 1024), VolumeLabelling.Labelled(7 * 1024 * 1024)], up.Shares);
+    }
+
+    /// <summary>An encrypted family carries "no label" to the uploader for every volume — the same plumbing as
+    /// the share, because it is the same decision: label from memory, label two-pass, or do not label.</summary>
+    [Fact]
+    public async Task Every_Volume_Of_An_Unlabelled_Family_Tells_The_Uploader_So()
+    {
+        var up = new ShareRecordingUploader();
+
+        await VolumeBlobIO.UploadAsync(
+            up, Acc(), "c", "data/h", ["/tmp/a.001", "/tmp/a.002"], AccessTier.Hot,
+            labelling: VolumeLabelling.None);
+
+        Assert.Equal([VolumeLabelling.None, VolumeLabelling.None], up.Shares);
+    }
+
+    /// <summary>With labelling off, a cloud label is never compared — not even one that would match (a family
+    /// labelled before encrypted backups stopped labelling). The local volume is not read for a hash that cannot
+    /// justify anything, and the volume is overwritten as "unproven", which is what an encrypted volume always is.</summary>
+    [SkippableFact]
+    public async Task An_Unlabelled_Family_Overwrites_Even_A_Matching_Label()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite is not running");
+
+        var account = AzuriteAccount();
+        var factory = new BlobClientFactory(TestSecrets.Reader);
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(RandomName("volnolabel-"));
+        await container.CreateIfNotExistsAsync();
+        var dir = Path.Combine(Path.GetTempPath(), "asb-volnolabel-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            var file = Path.Combine(dir, "v.7z");
+            await File.WriteAllTextAsync(file, "same bytes");
+            // A cloud volume that IS this volume, labelled as such by an earlier (labelling) era.
+            await container.GetBlobClient("data/h").UploadAsync(new BinaryData("same bytes"), new BlobUploadOptions
+            {
+                Metadata = new Dictionary<string, string> { [VolumeIdentity.MetaKey] = await VolumeIdentity.ComputeAsync(file) },
+            });
+            var before = (await container.GetBlobClient("data/h").GetPropertiesAsync()).Value.ETag;
+            var existing = await VolumeBlobIO.ListFamilyLabelsAsync(container, "data/h", CancellationToken.None);
+
+            await VolumeBlobIO.UploadAsync(
+                new BlobUploader(factory), account, container.Name, "data/h", [file], AccessTier.Hot,
+                existingVolumes: existing, labelling: VolumeLabelling.None);
+
+            var props = (await container.GetBlobClient("data/h").GetPropertiesAsync()).Value;
+            Assert.NotEqual(before, props.ETag); // overwritten, not skipped
+            Assert.False(props.Metadata.ContainsKey(VolumeIdentity.MetaKey)); // and the stale label is gone with it
+        }
+        finally
+        {
+            await container.DeleteIfExistsAsync();
+            try { Directory.Delete(dir, recursive: true); } catch { /* best effort */ }
+        }
     }
 }

@@ -10,7 +10,8 @@ namespace AzureStorageBackup.Api.Services;
 /// backup, repair and compaction splits the limit evenly across its own upload streams, and a volume bigger than
 /// its stream's share is hashed from disk first and re-read from disk for the send (<see cref="BlobUploader"/>).
 /// Two tasks running at once each get the full limit — the setting is spent per operation, like the concurrency
-/// it multiplies.
+/// it multiplies. An encrypted task spends none of it: its volumes go up unlabelled and are never held
+/// (<see cref="VolumeLabelling"/>).
 /// </para>
 /// </summary>
 public static class UploadMemoryBudget

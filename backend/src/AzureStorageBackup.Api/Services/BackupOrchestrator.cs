@@ -3101,10 +3101,12 @@ public sealed class BackupOrchestrator(
     /// for the pipeline that starts them and the memory share that is divided among them.</summary>
     private static int UploaderCount(BackupEngineOptions opts) => Math.Max(2, Math.Max(1, opts.UploadConcurrency) + 1);
 
-    /// <summary>This run's per-stream share of the global upload memory limit (<see cref="UploadMemoryBudget"/>):
-    /// the most of a volume one of its uploaders may hold in memory to label it.</summary>
-    private static long PerStreamMemory(BackupRequest request) =>
-        UploadMemoryBudget.PerStream(request.Options.UploadMemoryLimitBytes, UploaderCount(request.Options));
+    /// <summary>How this run's volumes are labelled (<see cref="VolumeLabelling"/>): not at all when the backup is
+    /// encrypted, otherwise within this run's per-stream share of the global upload memory limit
+    /// (<see cref="UploadMemoryBudget"/>) — the most of a volume one of its uploaders may hold in memory to label it.</summary>
+    private static VolumeLabelling Labelling(BackupRequest request) => VolumeLabelling.For(
+        request.Password,
+        UploadMemoryBudget.PerStream(request.Options.UploadMemoryLimitBytes, UploaderCount(request.Options)));
 
     private static string StagedName(string entryPath) =>
         "b" + Convert.ToHexString(System.Security.Cryptography.SHA256.HashData(
@@ -3203,7 +3205,7 @@ public sealed class BackupOrchestrator(
                     beforeVolume: ParkOf(control),
                     volumeHeld: HeldOf(control),
                     volumeWork: WorkOf(control),
-                    inMemoryLimitBytes: PerStreamMemory(request));
+                    labelling: Labelling(request));
 
             // The other half of the raw route's bracket. The source was stat'ed before it was hashed; if either
             // half of that pair has moved since, the bytes just written under this content address are not
@@ -4134,7 +4136,7 @@ public sealed class BackupOrchestrator(
                     beforeVolume: ParkOf(control),
                     volumeHeld: HeldOf(control),
                     volumeWork: WorkOf(control),
-                    inMemoryLimitBytes: PerStreamMemory(request));
+                    labelling: Labelling(request));
             // Only settle once it has confirmed and returned. On an exception it is deliberately **not** settled:
             // that leftover is exactly what Stop now has to clear.
             if (existingVolumes is not null)
