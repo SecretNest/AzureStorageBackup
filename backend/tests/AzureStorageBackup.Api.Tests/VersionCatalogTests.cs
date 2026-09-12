@@ -29,6 +29,41 @@ public sealed class VersionCatalogTests : IDisposable
     // ---- Test 1: the round trip that keeps the cloud format frozen -------------------------------------------
 
 
+    /// <summary>
+    /// When one version's import should take the content-keyed indexes down and rebuild them rather than insert
+    /// into them row by row. The rebuild is one sort per index over the whole history; the inserts are a random
+    /// page read per row per index once the history outgrows the cache. Field (2026-09-12): a version of a few
+    /// million rows into an 8 GB catalog read 1.2 GB/min for over an hour with the indexes live.
+    /// </summary>
+    [Theory]
+    [InlineData(0, 0, false)]                    // nothing to insert: nothing to bracket
+    [InlineData(0, 35_000_000, false)]
+    [InlineData(1, 0, true)]                     // the first version of an empty catalog: a rebuild of nothing
+    [InlineData(40, 0, true)]
+    [InlineData(350_000, 35_000_000, true)]      // one hundredth of the history
+    [InlineData(349_999, 35_000_000, false)]     // just under: the random inserts are the cheaper side
+    [InlineData(10_000, 35_000_000, false)]      // the routine small version into a big history
+    [InlineData(2_700_000, 35_000_000, true)]    // the 3/database shape that took over an hour
+    public void PrefersRebuild_when_the_version_is_at_least_a_hundredth_of_the_history(long versionRows, long historyRows, bool expected) =>
+        Assert.Equal(expected, VersionCatalog.PrefersRebuild(versionRows, historyRows));
+
+    [Fact]
+    public async Task HistoryRows_is_the_sum_of_the_imported_versions_row_counts()
+    {
+        await using var catalog = await OpenAsync();
+        Assert.Equal(0, await catalog.HistoryRowsAsync(CancellationToken.None));
+
+        var three = IndexSamples.Sample() with { Entries = [Entry("a.bin", 1), Entry("b.bin", 2), Entry("c.bin", 3)] };
+        var five = IndexSamples.Sample() with { Entries = [Entry("a.bin", 1), Entry("b.bin", 2), Entry("c.bin", 3), Entry("d.bin", 4), Entry("e.bin", 5)] };
+        using (var reader = new IndexStreamReader(new MemoryStream(LegacyIndexSerializer.SerializeIndex(three))))
+            await catalog.ImportVersionAsync(1, 1, reader, CancellationToken.None);
+        using (var reader = new IndexStreamReader(new MemoryStream(LegacyIndexSerializer.SerializeIndex(five))))
+            await catalog.ImportVersionAsync(2, 1, reader, CancellationToken.None);
+
+        // Declared counts, not a scan of the entries table: on an 8 GB catalog the question has to be free.
+        Assert.Equal(8, await catalog.HistoryRowsAsync(CancellationToken.None));
+    }
+
     [Fact]
     public async Task Import_reports_the_running_row_count_every_ten_thousand_rows()
     {

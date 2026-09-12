@@ -71,6 +71,8 @@ interruptibility under real data volumes. All of it is merged into `main`.
 | 09-09 | Settings save per page: the row is two API resources, `/settings/defaults` and `/settings/performance`, each writing only its own half; the whole-object PUT (one page's Save overwriting the other page's fields) is gone | [web-ui.md](web-ui.md) |
 | 09-08 | Pause is greyed while the versions load (the pass cannot park; a pause against it read "Paused" over a migration still running) and the pass counts as in hand; Suspend and Stop stay live and keep every version already imported | [run-lifecycle.md](run-lifecycle.md) |
 | 09-08 | The version under import is named with its dates on the browser's clock, as the check and restore lists name versions | [progress-display.md](progress-display.md) |
+| 09-12 | The wrap-up has names and numbers: Writing index opens as the index is serialized ("preparing the index"), Finalizing becomes Updating catalog and counts the import in entries, and the row's headline stops borrowing the upload's N-of-N for the stages after it (it read 100% → 0% → 100% for a hang that was three unnamed stretches) | [progress-display.md](progress-display.md) |
+| 09-12 | One version's catalog import takes the drop-and-rebuild bracket when it is at least a hundredth of the history (`VersionCatalog.PrefersRebuild`), on the run's own import and on a single missing version alike; the live-index assumption held for a 1 GB catalog and read 1.2 GB/min for over an hour on an 8 GB one | [storage-format.md](storage-format.md) |
 
 ### The migration that read 30 GB to write 1 GB (2026.9.8.3)
 

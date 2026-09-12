@@ -340,6 +340,63 @@ public sealed class VersionCatalogsMigrationTests
         Assert.Equal(CatalogSql.GlobalIndexNames.Count, await writer.GlobalIndexCountAsync(CancellationToken.None));
     }
 
+    /// <summary>One missing version used to keep the indexes live unconditionally — "the rebuild costs more than
+    /// one version's random inserts" — which stopped being true once the history outgrew the cache. Now the one
+    /// version takes the bracket by the same rule as the run's own import: at least a hundredth of the history.
+    /// Observed the same way as the interrupted migration above: the source fails after the drop, so the missing
+    /// indexes are the evidence that the bracket was taken.</summary>
+    [Fact]
+    public async Task EnsureVersions_brackets_a_single_missing_version_that_is_large_against_the_history()
+    {
+        using var db = NewDb();
+        var infoStore = Substitute.For<IBackupInfoStore>();
+        infoStore.ReadIndexToFileAsync(
+                Arg.Any<Account>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string?>(), Arg.Any<int>(), Arg.Any<string>(),
+                Arg.Any<CancellationToken>())
+            .Returns<Task>(_ => throw new InvalidOperationException("cloud unavailable"));
+        var files = TestIndexFiles.New();
+        var catalogs = TestCatalogs.New(db, infoStore, files);
+        var sample = IndexSamples.Sample();
+        await TestIndexFiles.WriteAsync(files, AccountId, Container, 1, Identity, LegacyIndexSerializer.SerializeIndex(sample), CancellationToken.None);
+        await catalogs.EnsureVersionsAsync(TestAccount, Container, [Version(1)], Identity, password: null, null, CancellationToken.None);
+
+        // Version 2 declares as many rows as the whole history holds, and its only source throws.
+        var large = Version(2) with { Stats = new VersionStats(sample.Entries.Count, 0, 0, 0) };
+        await Assert.ThrowsAsync<InvalidOperationException>(() => catalogs.EnsureVersionsAsync(
+            TestAccount, Container, [Version(1), large], Identity, password: null, null, CancellationToken.None));
+
+        await using var readOnly = await catalogs.OpenAsync(AccountId, Container, readOnly: true, CancellationToken.None);
+        Assert.Equal(0, await readOnly.GlobalIndexCountAsync(CancellationToken.None));
+    }
+
+    /// <summary>The other side of the rule: a small version against a history it is a tiny fraction of keeps the
+    /// indexes live, as one missing version always did.</summary>
+    [Fact]
+    public async Task EnsureVersions_keeps_the_indexes_live_for_a_single_small_missing_version()
+    {
+        using var db = NewDb();
+        var infoStore = Substitute.For<IBackupInfoStore>();
+        infoStore.ReadIndexToFileAsync(
+                Arg.Any<Account>(), Arg.Any<string>(), Arg.Any<string>(), Arg.Any<string?>(), Arg.Any<int>(), Arg.Any<string>(),
+                Arg.Any<CancellationToken>())
+            .Returns<Task>(_ => throw new InvalidOperationException("cloud unavailable"));
+        var files = TestIndexFiles.New();
+        var catalogs = TestCatalogs.New(db, infoStore, files);
+        var sample = IndexSamples.Sample();
+        await TestIndexFiles.WriteAsync(files, AccountId, Container, 1, Identity, LegacyIndexSerializer.SerializeIndex(sample), CancellationToken.None);
+        await catalogs.EnsureVersionsAsync(TestAccount, Container, [Version(1)], Identity, password: null, null, CancellationToken.None);
+
+        // Declared as a hundredth of the history less one row: the random inserts are the cheaper side.
+        var history = sample.Entries.Count;
+        var small = Version(2) with { Stats = new VersionStats(Math.Max(0, history / 100 - 1), 0, 0, 0) };
+        Assert.False(VersionCatalog.PrefersRebuild(small.Stats.Files, history), "the sample must sit below the rule for this test to mean anything");
+        await Assert.ThrowsAsync<InvalidOperationException>(() => catalogs.EnsureVersionsAsync(
+            TestAccount, Container, [Version(1), small], Identity, password: null, null, CancellationToken.None));
+
+        await using var readOnly = await catalogs.OpenAsync(AccountId, Container, readOnly: true, CancellationToken.None);
+        Assert.Equal(CatalogSql.GlobalIndexNames.Count, await readOnly.GlobalIndexCountAsync(CancellationToken.None));
+    }
+
     // ---- Test 7: removing a container drops the catalog and every legacy row ------------------------------------------
 
     [Fact]
