@@ -783,3 +783,49 @@ describe('the catalog check stage', () => {
     expect(lines.done).toBe('')
   })
 })
+
+describe('the index write stage', () => {
+  test('before the first volume is planned, says the index is being prepared rather than "0 volumes so far"', () => {
+    // Serializing a few million entries to disk and encoding them is seconds to a minute before the tracker
+    // has a transfer to count; the item line names the version, the counts line must not read as an empty
+    // stage.
+    const lines = stageLines(
+      progress({ stage: 'WritingIndex', processed: 0, total: 0, currentItem: 'version 12 (2,675,000 entries)' }),
+    )
+    expect(lines.label).toBe('Writing index')
+    expect(lines.counts).toBe('preparing the index')
+    expect(lines.speed).toBe('')
+  })
+
+  test('once the volumes are planned, counts transfers as before', () => {
+    const lines = stageLines(progress({ stage: 'WritingIndex', processed: 2, total: 12 }))
+    expect(lines.counts).toBe('2 of 12 volumes')
+  })
+})
+
+describe('the catalog update stage', () => {
+  test('counts the catalog rows landing, in entries, and names the step on the item line', () => {
+    const lines = stageLines(
+      progress({
+        stage: 'UpdatingCatalog',
+        processed: 0,
+        total: 1,
+        workTotal: 2_675_000,
+        workDone: 1_250_000,
+        workPercent: 46,
+        currentItem: 'version 12 → catalog.db (8.2 GB)',
+      }),
+    )
+    expect(lines.label).toBe('Updating catalog')
+    expect(lines.counts).toBe('recording the new version')
+    expect(lines.done).toBe('1,250,000 / 2,675,000 entries (46%)')
+    expect(lines.done).not.toContain('B')
+    expect(lines.speed).toBe('')
+  })
+
+  test('says nothing about entries before the import declares them', () => {
+    const lines = stageLines(progress({ stage: 'UpdatingCatalog', processed: 0, total: 1, currentItem: 'version 12 → backup info' }))
+    expect(lines.counts).toBe('recording the new version')
+    expect(lines.done).toBe('')
+  })
+})

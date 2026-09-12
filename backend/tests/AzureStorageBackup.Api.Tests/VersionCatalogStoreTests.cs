@@ -204,7 +204,7 @@ public sealed class VersionCatalogStoreTests : IDisposable
         // EVERY production write open happens inside this lock — the import at the end of a run, the checker's and
         // the repairer's patching, retention's removal. The timeout is the assertion: while recovery took the same
         // (non-reentrant) semaphore its caller was already holding, this waited forever, and a torn page in a
-        // catalog hung the next run at Finalizing. It has to come back, and it has to come back rebuilt.
+        // catalog hung the next run at the catalog update (then called Finalizing). It has to come back, and it has to come back rebuilt.
         using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(10));
         using var held = await store.LockForWriteAsync(AccountId, Container, timeout.Token);
         await using (var catalog = await store.OpenForWriteAsync(held, AccountId, Container, timeout.Token))

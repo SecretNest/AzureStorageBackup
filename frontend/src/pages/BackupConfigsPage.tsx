@@ -18,6 +18,7 @@ import { stageLabelOf, versionItemLabel } from '../lib/stageLines'
 import { checkLocalSkipNotice, runSkipNotice } from '../lib/sentinelNotice'
 import { errorBadgeLabel } from '../lib/errorBadge'
 import { etaLabel } from '../lib/etaLabel'
+import { headlinePercent } from '../lib/headlinePercent'
 import { showsInterruptedNotice } from '../lib/interruptedNotice'
 import { latestWins, type LatestWins } from '../lib/latestWins'
 import { gatedLoad } from '../lib/gatedLoad'
@@ -2192,9 +2193,9 @@ function RunStatus({
   // folding it into a percentage.
   // It falls back to the count only when bytes are unavailable (scanning and diffing report no byte
   // workload, and during upload the denominator grows until the diff finishes).
-  const singlePercent =
-    (details[0]?.workPercent ?? details[0]?.percent) ??
-    (p.stage >= BackupStage.Uploading ? p.percent : null)
+  // The fallback to run.percent is the upload stage's alone — see headlinePercent for what happened when
+  // the stages after it borrowed a figure that is N of N by then.
+  const singlePercent = headlinePercent(p.stage, p.percent, details)
   // Speed and remaining time come from the **upload** detail, falling back to the headline only when there is no upload.
   //
   // With both running, the diff's must not be used: the diff's ETA says "how much longer until this round

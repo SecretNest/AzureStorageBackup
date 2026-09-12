@@ -126,7 +126,7 @@ paused run holding the whole pool would otherwise take unrelated backups hostage
 ## The shape of a run
 
 ```
-Scan → Diff → Plan ──▶ DiffWorkQueue ──▶ prober ──▶ compressor ──▶ uploaders ──▶ WriteIndex → Finalize → Cleanup
+Scan → Diff → Plan ──▶ DiffWorkQueue ──▶ prober ──▶ compressor ──▶ uploaders ──▶ WriteIndex → Commit → Cleanup
 ```
 
 The left half is sequential and local. The right half is three concurrent stages connected by
