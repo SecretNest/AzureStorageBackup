@@ -135,13 +135,32 @@ public sealed class BackupProgressDetailTests : IDisposable
             Assert.Equal(0, uploading[^1].Detail!.Queued);
 
             // The index write reports as a stage of its own, and runs to a settled end. It used to be the one blind
-            // stretch of the pipeline: a single stage report and then nothing until Finalizing, which at a few
+            // stretch of the pipeline: a single stage report and then nothing until the catalog update, which at a few
             // million entries is minutes of "Writing index" with nothing on screen.
             var writing = progress.Reports.Where(r => r.Stage == BackupStage.WritingIndex && r.Detail is not null).ToList();
             Assert.NotEmpty(writing);
             Assert.Equal("WritingIndex", writing[^1].Detail!.Stage);
             Assert.True(writing[^1].Detail!.Total > 0, "the transfer count is what the percentage is read off");
             Assert.Equal(writing[^1].Detail!.Total, writing[^1].Detail!.Processed);
+            // The stage opens at serialization, before there is a transfer to count: the .idx file and its encoding
+            // are the stretch that grows with the file count, and it used to sit under "Uploading 100%" with every
+            // object settled. The first detail names the version; the transfer count is planned later.
+            Assert.Equal(0, writing[0].Detail!.Total);
+            Assert.Contains("version 1", writing[0].Detail!.CurrentItem);
+
+            // The catalog update counts the import in entries — the rows of the new version landing in catalog.db —
+            // and names the file. On an 8 GB history that import is minutes, and with no figure of its own the
+            // headline stood at the upload's 100% for all of them, under a name (Finalizing) that promised seconds.
+            var updating = progress.Reports.Where(r => r.Stage == BackupStage.UpdatingCatalog && r.Detail is not null).ToList();
+            Assert.NotEmpty(updating);
+            Assert.Equal("UpdatingCatalog", updating[^1].Detail!.Stage);
+            Assert.True(updating[^1].Detail!.WorkTotal > 0, "the import declares the version's entry count as its workload");
+            Assert.Equal(updating[^1].Detail!.WorkTotal, updating[^1].Detail!.WorkDone);
+            Assert.Equal(1, updating[^1].Detail!.Processed);
+            // The item line names the version and the step ("version 1 → backup info", "… → catalog.db (12 KB)",
+            // "… → journal"). Which of the three a snapshot catches is the 200 ms throttle's call — on a 40-row
+            // import all three land inside one window — so only the shape is asserted, not the step.
+            Assert.Contains(updating, r => r.Detail!.CurrentItem?.StartsWith("version 1 → ") == true);
         }
         finally { await container.DeleteIfExistsAsync(); }
     }

@@ -50,6 +50,9 @@ const STAGE_LABELS: Record<string, string> = {
   CheckingCatalog: 'Checking catalog',
   Assessing: 'Assessing damage',
   WritingIndex: 'Writing index',
+  // The commit of the new version, named for the catalog import because that is what takes the time — minutes
+  // on a history of gigabytes. As "Finalizing", a stage that long read as a finish that would not finish.
+  UpdatingCatalog: 'Updating catalog',
 }
 
 /** The on-screen name of a stage — exported so run headlines (the repair row) can say which phase is
@@ -136,7 +139,17 @@ export function stageLines(detail: StageProgress, hold?: PipelineHold) {
       ? // One statement over one file, with no progress to be had from it: say what the wait is, since the item
         // line already says how big the file is.
         'one full read of the catalog file'
-      : detail.total > 0
+      : detail.stage === 'UpdatingCatalog'
+        ? // One version, committed in three steps the item line names in turn (the info file, the catalog import,
+          // the journal). Its progress is the entries line: the import is what takes the time, and it is counted
+          // in rows, so "0 of 1" here would stand still for the whole stage.
+          'recording the new version'
+        : detail.stage === 'WritingIndex' && detail.total === 0
+          ? // Nothing to count yet: the index is being serialized to disk and encoded, seconds to a minute at a few
+            // million entries, and the tracker only learns its transfer count once the volumes are planned.
+            // "0 volumes so far" over that stretch reads as a stage that has not started.
+            'preparing the index'
+          : detail.total > 0
       ? `${shown.toLocaleString()} of ${detail.total.toLocaleString()} ${unit}`
       : `${detail.processed.toLocaleString()} ${unit} so far` // Scanning does not know the total — computing it is what scanning is for
   // The in-flight breakdown. "N items processed" alone cannot distinguish work from a hang: during the
@@ -466,9 +479,10 @@ export function stageLines(detail: StageProgress, hold?: PipelineHold) {
             : detail.workDone > 0 &&
               `${formatBytes(detail.workDone)} ${detail.stage === 'Verifying' ? 'verified' : 'restored'}`,
         ]
-      : detail.stage === 'LoadingVersions'
+      : detail.stage === 'LoadingVersions' || detail.stage === 'UpdatingCatalog'
         ? [
-            // The version-loading pass declares its workload in **entries** (index rows), not bytes: an import's
+            // The version-loading pass and the finish's catalog import declare their workload in **entries**
+            // (index rows), not bytes: an import's
             // cost is per row, and versions differ in rows by orders of magnitude, so the row fraction is what the
             // percentage and the remaining time are computed from. Formatting it as bytes would print "1.2 MB /
             // 5.0 MB original" over a stage that moves no bytes at all.

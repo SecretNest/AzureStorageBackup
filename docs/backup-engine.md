@@ -4,7 +4,7 @@ One run of a backup, from walking the source tree to committing the version. The
 their own weight have their own document; this one is the spine they hang off.
 
 ```
-Scan → Diff → Plan → Compress → Upload → WriteIndex → Finalize → Cleanup
+Scan → Diff → Plan → Compress → Upload → WriteIndex → Commit → Cleanup
 ```
 
 Compression and upload are three concurrent stages rather than steps in this line — see
@@ -74,13 +74,21 @@ The version's second-level index is uploaded first and its success confirmed bef
 records that the version exists. A new version writes its own file and never rewrites an older one,
 except where dead-weight compaction forces it.
 
-## 7. Finalize
+## 7. Commit
 
 The info file is updated atomically: the new contents go to a temporary blob, and only on success is
 the real name overwritten. A network failure therefore cannot corrupt it. The write carries
 `If-Match` against the recorded ETag, so an external change — another machine, a recreated container
 — is detected rather than silently overwritten; on conflict the local state is cleared and reported,
 and the next run resyncs.
+
+Once the info file is committed, the version is imported into the container's local catalog by
+reading back the very file that went to the cloud (see [content-identity.md](content-identity.md)),
+and only then is the journal deleted. The import is the long part: every entry of the new version
+goes in, not only the changed ones, and on a history of gigabytes that is minutes of random B-tree
+inserts. On screen the whole step is the **Updating catalog** stage, counted in entries
+([progress-display.md](progress-display.md)) — it was called Finalizing until 2026-09-12, and under
+that name a ten-minute import read as a finish that would not finish.
 
 ## 8. Retention and cleanup
 

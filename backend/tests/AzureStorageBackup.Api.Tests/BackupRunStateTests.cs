@@ -61,7 +61,7 @@ public class BackupRunStateTests
         Assert.False(At(BackupStage.Scanning).WrappingUp);
         Assert.False(At(BackupStage.Uploading).WrappingUp);
         Assert.True(At(BackupStage.WritingIndex).WrappingUp);
-        Assert.True(At(BackupStage.Finalizing).WrappingUp);
+        Assert.True(At(BackupStage.UpdatingCatalog).WrappingUp);
         Assert.True(At(BackupStage.CleaningUp).WrappingUp);
     }
 

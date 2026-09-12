@@ -34,7 +34,7 @@ export const BackupStage = {
   Diffing: 3,
   Uploading: 4,
   WritingIndex: 5,
-  Finalizing: 6,
+  UpdatingCatalog: 6,
   CleaningUp: 7,
   Completed: 8,
 } as const
@@ -46,7 +46,7 @@ export const backupStageLabels: Record<number, string> = {
   [BackupStage.Diffing]: 'Diffing',
   [BackupStage.Uploading]: 'Uploading',
   [BackupStage.WritingIndex]: 'Writing index',
-  [BackupStage.Finalizing]: 'Finalizing',
+  [BackupStage.UpdatingCatalog]: 'Updating catalog',
   [BackupStage.CleaningUp]: 'Cleaning up',
   [BackupStage.Completed]: 'Completed',
 }

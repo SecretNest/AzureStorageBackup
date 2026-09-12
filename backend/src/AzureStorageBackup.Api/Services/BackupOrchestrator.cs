@@ -138,7 +138,10 @@ public enum BackupStage
     Diffing,
     Uploading,
     WritingIndex,
-    Finalizing,
+    /// <summary>The new version being committed: the info file, then every one of its entries into the local
+    /// catalog, then the journal. Named for the import because that is what takes the time — minutes on a
+    /// history of gigabytes — and as "Finalizing" a stage that long read as a finish that would not finish.</summary>
+    UpdatingCatalog,
     CleaningUp,
     Completed,
 }
@@ -2131,6 +2134,17 @@ public sealed class BackupOrchestrator(
         var uploaded = uploadedItems;
 
         // 6. Serialize the second-level index of the new version.
+        // The index stage opens **here**, not at the upload of the file: everything from this line to the last
+        // verification read-back is the stretch that grows with the file count — the final stats query, the .idx
+        // file written entry by entry, its encoding — and for as long as it had no stage it sat under "Uploading
+        // 100%" with every object settled, minutes at a few million entries, read as a hang. Nothing past the stop
+        // check above consults the gate, so this is also exactly where the run stops being pausable
+        // (BackupRunState.WrappingUp: stage >= WritingIndex).
+        // The tracker is disposed with the method: Complete() below is the terminal publish, and a throw between
+        // here and there must not leave a heartbeat behind.
+        progress?.Report(new BackupProgress(BackupStage.WritingIndex, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
+        using var indexTracker = new StageTracker("WritingIndex", total: 0, d =>
+            progress?.Report(new BackupProgress(BackupStage.WritingIndex, diff.ChangedFiles, diff.ChangedBytes, uploaded, total) { Detail = d }));
         // Everything the finish reads is a read of the draft, so the writer has to be caught up first.
         await ledger.FlushAsync(ct);
         var version = (info.Versions.LastOrDefault()?.Version ?? 0) + 1;
@@ -2139,6 +2153,9 @@ public sealed class BackupOrchestrator(
         // the version record reports are the same count, and a second query for it would be a second chance to
         // disagree as well as a second scan of a million rows.
         var (files, bytes) = await ledger.FinalStatsAsync(ct);
+        // The item line while the file is written: which version, and how many rows it is — the number that says
+        // how long this can take. The store replaces it with the blob's name once encoding starts.
+        indexTracker.Touch($"version {version} ({files:N0} entries)");
 
         // The two read-only catalog handles have answered their last question — the diff is long over and this line
         // was the previous version's empty-directory list. They close here rather than at the end of the method
@@ -2169,12 +2186,9 @@ public sealed class BackupOrchestrator(
         }
 
         // 7. WriteIndex (upload the second-level index first)
-        progress?.Report(new BackupProgress(BackupStage.WritingIndex, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
-        // Tracked like the scan: this is the stretch whose length grows with the file count — a few million entries
-        // is hundreds of MB up the uplink and back down for verification — and it used to run without a single
-        // report between the line above and Finalizing. The store books every volume as it moves.
-        var indexTracker = new StageTracker("WritingIndex", total: 0, d =>
-            progress?.Report(new BackupProgress(BackupStage.WritingIndex, diff.ChangedFiles, diff.ChangedBytes, uploaded, total) { Detail = d }));
+        // Tracked like the scan: a few million entries is hundreds of MB up the uplink and back down for
+        // verification, and it used to run without a single report until the catalog update. The store books every
+        // volume as it moves.
         string indexBlob;
         int indexVolumes;
         try
@@ -2189,8 +2203,19 @@ public sealed class BackupOrchestrator(
         // The catalog import is deferred until the info file commits successfully (see below), so that a write
         // conflict on the info file does not leave the catalog holding a version nothing in the cloud claims.
 
-        // 8/9. Finalize (atomically update the info file)
-        progress?.Report(new BackupProgress(BackupStage.Finalizing, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
+        // 8/9. Commit the version: the info file, atomically, then the catalog, then the journal.
+        // Three steps, named in turn on the item line. The import is the one that takes the time — every entry of
+        // the new version, not only the changed ones, goes into a catalog that can be gigabytes — so the stage's
+        // workload is the version's entry count and the import books rows as they land. Ten minutes of
+        // "Finalizing 100%" on an 8 GB history was this stretch, borrowing the upload's finished figure for want of
+        // one of its own.
+        // One item, ticked off at the end: WorkPercent needs a settled total, and the frontend words the count line
+        // for this stage rather than printing "0 of 1".
+        progress?.Report(new BackupProgress(BackupStage.UpdatingCatalog, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
+        using var committing = new StageTracker("UpdatingCatalog", total: 1, d =>
+            progress?.Report(new BackupProgress(BackupStage.UpdatingCatalog, diff.ChangedFiles, diff.ChangedBytes, uploaded, total) { Detail = d }));
+        committing.DeclareWork(files);
+        committing.Touch($"version {version} → backup info");
         var completedAt = DateTimeOffset.UtcNow;
         info.Versions.Add(new BackupVersion
         {
@@ -2210,7 +2235,8 @@ public sealed class BackupOrchestrator(
         // went to the cloud rather than by re-deriving the entries from the draft. That is what makes "the catalog
         // holds exactly what the container holds" true by construction, seq order included, instead of true as long
         // as two pieces of code keep agreeing.
-        await ImportIntoCatalogAsync(request, version, identity, serialized, ct);
+        committing.Touch($"version {version} → catalog.db ({ByteSize.Human(catalogs.CatalogBytes(request.Account.Id, request.Container))})");
+        await ImportIntoCatalogAsync(request, version, identity, serialized, committing, ct);
         // The last reader of it is gone. Dropped here rather than left to the scope below, because what follows is
         // retention cleanup, which downloads and repacks archives onto the same temp volume — an index at a few
         // million entries is hundreds of MB, and there is no reason for it to be lying there while that runs.
@@ -2221,7 +2247,12 @@ public sealed class BackupOrchestrator(
         // than the info file commit and there is a gap where neither side claims it, and the freshly uploaded
         // content gets deleted as an orphan.
         if (control is not null)
+        {
+            committing.Touch($"version {version} → journal");
             await control.CompleteAsync();
+        }
+        committing.Advance(0, work: 0);
+        committing.Complete();
 
         // 10. Cleanup (drop expired versions and the data they exclusively own, per the retention policy, §10)
         progress?.Report(new BackupProgress(BackupStage.CleaningUp, diff.ChangedFiles, diff.ChangedBytes, uploaded, total));
@@ -2424,8 +2455,13 @@ public sealed class BackupOrchestrator(
     /// </para>
     /// </summary>
     private async Task ImportIntoCatalogAsync(
-        BackupRequest request, int version, long identity, string serialized, CancellationToken ct)
+        BackupRequest request, int version, long identity, string serialized, StageTracker progress, CancellationToken ct)
     {
+        // Rows booked on the tracker so far. Kept across the retry rather than reset with it: the second attempt's
+        // count starts again from zero, and booking it afresh would run the stage past its declared workload. Only
+        // what exceeds the high-water mark is new; the remainder to the header count is booked once the import
+        // has committed, which also covers a version too small for the callback to fire at all.
+        long booked = 0;
         try
         {
             for (var attempt = 1; ; attempt++)
@@ -2437,7 +2473,15 @@ public sealed class BackupOrchestrator(
                         held, request.Account.Id, request.Container, ct);
                     await using var file = File.OpenRead(serialized);
                     using var reader = new IndexStreamReader(file);
-                    await catalog.ImportVersionAsync(version, identity, reader, ct);
+                    await catalog.ImportVersionAsync(version, identity, reader, ct, seen =>
+                    {
+                        if (seen <= booked)
+                            return;
+                        progress.AdvanceWork(seen - booked);
+                        booked = seen;
+                    });
+                    progress.AdvanceWork(reader.EntryCount - booked);
+                    booked = reader.EntryCount;
                     return;
                 }
                 catch (Exception ex) when (attempt == 1 && ex is not OperationCanceledException)

@@ -595,8 +595,10 @@ without the second and "Paused" from both; a backend older than the second field
 
 Pause and Suspend on a run that is **wrapping up** are the same conflict for a different reason.
 From the index write on (`BackupRunState.WrappingUp`: stage ≥ `WritingIndex`) every upload is done
-and nothing left in the run consults the gate — the index write, the info-file commit and the
-retention cleanup all run straight through. Before the refusal, Pause answered 204 and the row said
+and nothing left in the run consults the gate — the index write, the version commit and the
+retention cleanup all run straight through. The index stage opens right after the run's last stop
+check, as the index is serialized, so there is no stretch where a pause is accepted that nothing
+will ever honour. Before the refusal, Pause answered 204 and the row said
 "Paused" over a run that went on to `Completed`; Suspend held the request for its cap and then handed
 back a `Completed` run labelled "Suspending…". At a few million entries the index write alone is
 minutes, so this is a whole stage rather than a race window. The UI greys the same four controls it

@@ -67,12 +67,21 @@ work — a backup that packs 46,624 files into 4,995 archives is reporting both 
 | Verifying (check) | objects | a pack downloaded, extracted and re-hashed |
 | Local (check) | files | an index entry |
 | Listing (check) | blobs | a blob in the container, orphan or not |
-| Writing index | volumes | one transfer of one 64 MB index volume: up, or back down for verification. A single-blob index is three transfers (temp up, verify down, commit up) |
+| Writing index | volumes | one transfer of one 64 MB index volume: up, or back down for verification. A single-blob index is three transfers (temp up, verify down, commit up). The stage opens **before** there is a transfer to count: it begins as the last object settles, with the final stats query, the index written to disk entry by entry and its encoding — the stretch that grows with the file count, and that used to sit under "Uploading 100%" with every object settled. Until the volumes are planned the counts line reads "preparing the index" rather than "0 volumes so far", and the item line names the version and its entry count ("version 12 (2,675,000 entries)"), then the blob being encoded |
+| Updating catalog | entries | a row of the new version landing in the container's local catalog. The stage is the commit of the version — the info file, the catalog import, the journal, named in turn on the item line ("version 12 → catalog.db (8.2 GB)") — and it is named for the import because that is what takes the time: **every** entry of the new version goes into the catalog, not only the changed ones, and on a history of gigabytes that is minutes. It used to be called Finalizing and carried no figures, so it borrowed the upload's — "Finalizing 100%" for ten minutes, a finish that would not finish. The counts line reads "recording the new version"; completion and remaining time come from the entries, as in Loading versions |
 
 > **The listing stage is named for the work, not for the quarry.** It counts every blob it lists on
 > the way to subtracting the reference set, so the number it reports is the container's size. Called
 > `Orphans`, a six-figure container read as six figures of garbage — right number, right unit, wrong
 > heading. The orphan count itself is not a progress figure at all; it is in the check report.
+
+**The headline percentage is the running stage's own.** The row's headline takes the stage detail's
+byte-based completion, then its item-based one, and for the upload stage alone falls back to the run-level
+item count when the detail cannot give one yet (the first seconds, before a total exists). The stages after
+the upload never take that fallback: by then the run-level count is N of N, so "Writing index" opened at
+100%, fell to 0% the moment its tracker planned the first volume, and "Finalizing" stood at 100% through a
+whole catalog import (field, 2026-09-12). A wrap-up stage with no percentage of its own shows none
+(`headlinePercent` in the web app).
 
 **Completion is computed from source bytes, not from the item count.** One item can be a 6.8 GB
 single file or a pack of several hundred 5 KB files, and counting them equally is meaningless —
