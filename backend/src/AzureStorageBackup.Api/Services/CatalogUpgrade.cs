@@ -50,6 +50,8 @@ internal static class CatalogUpgrade
     private const string PendingVersionsSql =
         "SELECT version, identity, entry_count FROM v1_versions WHERE version NOT IN (SELECT version FROM upgrade_done) ORDER BY version";
     private const string TotalRowsSql = "SELECT COALESCE(SUM(entry_count), 0) FROM v1_versions";
+    private const string TotalVersionsSql = "SELECT COUNT(*) FROM v1_versions";
+    private const string DoneVersionsSql = "SELECT COUNT(*) FROM upgrade_done";
     private const string DoneRowsSql = "SELECT COALESCE(SUM(v.entry_count), 0) FROM v1_versions v JOIN upgrade_done d ON d.version = v.version";
     private const string V1EntriesSql = $"SELECT {EntryRowMapper.Columns} FROM v1_entries WHERE version=@v ORDER BY path_key";
     private const string V1SeqOrderSql = "SELECT seq, path, path_key FROM v1_entries WHERE version=@v ORDER BY seq";
@@ -93,11 +95,16 @@ internal static class CatalogUpgrade
 
         var total = await ScalarAsync(connection, TotalRowsSql, ct);
         var done = await ScalarAsync(connection, DoneRowsSql, ct);
+        // Both counts come off the file, not off the loop: the loop iterates only what is left to convert, so on a
+        // resumed conversion the versions an earlier attempt finished are in neither. Reported, they are what keeps
+        // the counts line whole ("7 of 10 versions" where the readings alone would say "3 of 10").
+        var versionsTotal = (int)await ScalarAsync(connection, TotalVersionsSql, ct);
+        var versionsDone = (int)await ScalarAsync(connection, DoneVersionsSql, ct);
         foreach (var (version, identity, count) in await PendingAsync(connection, ct))
         {
             ct.ThrowIfCancellationRequested();
             var booked = 0L;
-            progress?.Report(new CatalogUpgradeProgress(version, done, total, VersionDone: false));
+            progress?.Report(new CatalogUpgradeProgress(version, done, total, VersionDone: false, versionsDone, versionsTotal));
 
             await catalog.RunInTransactionAsync(async () =>
             {
@@ -108,7 +115,7 @@ internal static class CatalogUpgrade
                     {
                         var landed = Math.Min(n, count);
                         if (landed > booked) { done += landed - booked; booked = landed; }
-                        progress?.Report(new CatalogUpgradeProgress(version, done, total, VersionDone: false));
+                        progress?.Report(new CatalogUpgradeProgress(version, done, total, VersionDone: false, versionsDone, versionsTotal));
                     }, ct);
                 await RecordOrderIfNotPathOrderAsync(catalog, version, ct);
                 await ExecAsync(catalog, CopyIssuesSql, version, ct);
@@ -116,7 +123,8 @@ internal static class CatalogUpgrade
             }, ct);
 
             done += count - booked;
-            progress?.Report(new CatalogUpgradeProgress(version, done, total, VersionDone: true));
+            versionsDone++;   // the upgrade_done row is in: this version is one of the converted from here on
+            progress?.Report(new CatalogUpgradeProgress(version, done, total, VersionDone: true, versionsDone, versionsTotal));
         }
 
         // The other half of the bracket, before the stamp: a file that reads as converted has its indexes.

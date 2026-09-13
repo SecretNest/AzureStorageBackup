@@ -104,6 +104,12 @@ public sealed class CatalogUpgradeTests : IDisposable
         var resumed = new List<CatalogUpgradeProgress>();
         await new VersionCatalogStore(_root).UpgradeAsync(AccountId, Container, new InlineProgress<CatalogUpgradeProgress>(resumed.Add), CancellationToken.None);
         Assert.DoesNotContain(resumed, r => r.Version <= 2 && !r.VersionDone);  // no rows re-imported for 1 and 2
+        // The counts line's two numbers are the whole history's, not this run's: the loop iterates versions 3 and 4
+        // only, so a stage left to count readings would finish at "2 of 4" — or, told the history's size by the
+        // info file, at "2 of 10" against 100% of the rows.
+        Assert.All(resumed, r => Assert.Equal(history.Count, r.VersionsTotal));
+        Assert.Equal(2, resumed[0].VersionsDone);                               // 1 and 2 were already in
+        Assert.Equal(history.Count, resumed[^1].VersionsDone);                  // and the last reading has them all
         await using var catalog = await VersionCatalog.OpenAsync(path, readOnly: true, CancellationToken.None);
         foreach (var index in history)
             Assert.Equal(LegacyIndexSerializer.SerializeIndex(index), await SerializeAsync(catalog, index.Version));

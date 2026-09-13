@@ -781,6 +781,9 @@ public sealed class BackupOrchestrator(
         if (catalogs.NeedsUpgrade(request.Account.Id, request.Container))
         {
             progress?.Report(new BackupProgress(BackupStage.UpgradingCatalog, 0, 0, 0, 0));
+            // The info file's version count is the denominator until the first reading arrives; from there the
+            // accounting settles it from the catalog itself, which is the only side that knows how many versions a
+            // resumed conversion has already put in — and how many the file holds, retired ones included.
             using var upgrading = new StageTracker("UpgradingCatalog", info.Versions.Count, d =>
                 progress?.Report(new BackupProgress(BackupStage.UpgradingCatalog, 0, 0, 0, 0) { Detail = d }));
             var accounting = new CatalogUpgradeAccounting(upgrading);
