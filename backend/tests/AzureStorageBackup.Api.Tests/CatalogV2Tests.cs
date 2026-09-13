@@ -281,6 +281,26 @@ public sealed class CatalogV2Tests : IDisposable
     }
 
     [Fact]
+    public async Task A_version_out_of_path_order_is_stored_merged_and_serialized_in_its_own_order()
+    {
+        await using var catalog = await OpenAsync();
+        var index = new VersionIndex { Version = 1, Entries = [Entry("b.bin", 5, "hb"), Entry("a.bin", 6, "ha"), Entry("a/c.bin", 7, "hc")] };
+        await ImportAsync(catalog, index);                                              // pass 1 notices the order
+
+        Assert.Equal(Bytes(index), await SerializeAsync(catalog, 1));                   // byte-identical, in the given order
+        var walked = await catalog.EntriesAsync(1, CancellationToken.None).ToListAsync();
+        Assert.Equal(["a.bin", "a/c.bin", "b.bin"], walked.Select(e => e.Path));       // the diff cursor still walks in path order
+        Assert.Equal(3, await CountAsync(catalog, "SELECT COUNT(*) FROM entry_order WHERE version=1"));
+
+        // The next version, in path order, merges against it and needs no order table.
+        var v2 = Version(2, Entry("a.bin", 6, "ha"), Entry("a/c.bin", 7, "hc"), Entry("b.bin", 55, "hb2"));
+        await ImportAsync(catalog, v2);
+        Assert.Equal(Bytes(v2), await SerializeAsync(catalog, 2));
+        Assert.Equal(0, await CountAsync(catalog, "SELECT COUNT(*) FROM entry_order WHERE version=2"));
+        Assert.Equal(4, await CountAsync(catalog, "SELECT COUNT(*) FROM entries"));
+    }
+
+    [Fact]
     public async Task A_version_re_imported_in_the_middle_of_the_history_lands_between_its_neighbours()
     {
         await using var catalog = await OpenAsync();
