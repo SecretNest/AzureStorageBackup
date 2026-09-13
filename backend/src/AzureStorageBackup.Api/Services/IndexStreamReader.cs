@@ -20,9 +20,15 @@ public sealed class IndexStreamReader : IDisposable
     public int Version { get; }
     public int EntryCount { get; }
 
+    /// <summary>The stream this reader parses. The catalog's import makes two passes over an index — the lists at
+    /// the tail first, then the entries — and does so by seeking this stream back to zero and building a second
+    /// reader on it; it requires <c>CanSeek</c> and throws otherwise.</summary>
+    public Stream Input { get; }
+
     /// <summary>Reads the header eagerly (format/version/entryCount) so callers can size buffers before pulling entries.</summary>
     public IndexStreamReader(Stream input)
     {
+        Input = input;
         _r = new BinaryReader(input, Encoding.UTF8, leaveOpen: true);
 
         Format = _r.ReadByte();

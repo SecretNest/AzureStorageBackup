@@ -338,6 +338,26 @@ internal static class EntryRowMapper
             ? [.. stored.Split(',').Select(v => long.Parse(v, CultureInfo.InvariantCulture))]
             : [];
 
+    /// <summary>
+    /// Whether two entries are the same row: every field the wire format carries, storage and its volume sizes
+    /// included. Records compare <c>VolumeSizes</c> by reference, so <c>==</c> on <see cref="IndexEntry"/> is not
+    /// this. The v2 catalog decides "unchanged, write nothing" with it, so it must be exactly the wire format's
+    /// notion of equality — a field this misses would be a change the catalog silently drops.
+    /// </summary>
+    public static bool SameEntry(IndexEntry a, IndexEntry b) =>
+        a.Path == b.Path && a.Kind == b.Kind && a.Length == b.Length && a.Mtime == b.Mtime
+        && a.Permissions == b.Permissions && a.HeadHash == b.HeadHash && a.TailHash == b.TailHash
+        && a.FullHash == b.FullHash && a.Target == b.Target && a.UnreadableAt == b.UnreadableAt
+        && SameStorage(a.Storage, b.Storage);
+
+    private static bool SameStorage(StorageRef? a, StorageRef? b)
+    {
+        if (a is null || b is null)
+            return a is null && b is null;
+        return a.Kind == b.Kind && a.Ref == b.Ref && a.EntryName == b.EntryName && a.Volumes == b.Volumes
+            && a.Raw == b.Raw && a.VolumeSizes.SequenceEqual(b.VolumeSizes);
+    }
+
     /// <summary>Sets a parameter, adding it the first time. <see cref="DBNull"/> rather than null, because
     /// <see cref="SqliteParameter"/> treats a null <c>Value</c> as "not supplied" and fails the statement.</summary>
     public static void Set(SqliteCommand command, string name, object? value)
