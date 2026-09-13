@@ -1,3 +1,5 @@
+using Microsoft.Extensions.Logging;
+using System.Diagnostics;
 using System.Threading.Channels;
 using Azure.Storage.Blobs.Models;
 using AzureStorageBackup.Api.Models;
@@ -189,7 +191,8 @@ public sealed class BackupOrchestrator(
     INotifier? notifier = null,
     IOperationLog? opLog = null,
     VerboseFileLog? verboseLog = null,
-    DiffWorkQueueFactory? spillFactory = null)
+    DiffWorkQueueFactory? spillFactory = null,
+    ILogger<BackupOrchestrator>? logger = null)
 {
     /// <summary>
     /// Mutable state for one run: the counters accumulated as it goes, plus this run's pack-id issuer. Passed
@@ -1904,6 +1907,7 @@ public sealed class BackupOrchestrator(
             {
                 // In hand for the whole walk: between two callbacks the differ is reading the disk (hashing a
                 // changed file can be minutes), and only the callback's own park (OnChangeAsync) steps out.
+                var diffClock = Stopwatch.StartNew();
                 using (control?.Gate.BeginWork())
                     diff = await differ.DiffAsync(
                         request.LocalRoot,
@@ -1911,6 +1915,16 @@ public sealed class BackupOrchestrator(
                         last is null ? null : catalogForDiff.EntriesAsync(last.Version, stopProducing.Token),
                         scan.Unreadable, opts.Diff, stopProducing.Token, diffTracker, OnChangeSeededAsync,
                         DeferFullHash);
+                // Where the diff's time went, in the container log: a 61-minute diff over 1.1 M files (2026-09-13)
+                // could not be explained afterwards from a file count alone. Everything settled from metadata means
+                // the minutes were the two cursors (the scan table and the previous version's rows); bytes read in
+                // full mean they were the disk.
+                logger?.LogInformation(
+                    "Backup '{Name}': diff done in {Elapsed} — {Emitted} entries emitted, {PreviousRows} previous rows read, "
+                    + "{ByMetadata} settled by metadata, {HeadHashed} head/tail-hashed, {FullHashed} read in full ({HashedBytes}), "
+                    + "{ChangedFiles} changed ({ChangedBytes}).",
+                    request.Name, diffClock.Elapsed, diff.Emitted, diff.PreviousRows, diff.ByMetadata, diff.HeadHashed,
+                    diff.FullHashed, ByteSize.Human(diff.HashedBytes), diff.ChangedFiles, ByteSize.Human(diff.ChangedBytes));
 
                 // Final sweep: seal the boxes that never filled up. The two cross-directory lanes may each have a
                 // remainder; the per-directory ones were in theory all sealed when their counter hit zero, and this

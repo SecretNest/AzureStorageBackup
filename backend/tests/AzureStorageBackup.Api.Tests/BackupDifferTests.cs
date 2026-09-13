@@ -241,6 +241,38 @@ public sealed class BackupDifferTests : IDisposable
         Assert.Null(c.TailHash);
     }
 
+    /// <summary>
+    /// Where a diff's time went, in five figures. A 61-minute diff over 1.1 M files (2026-09-13) could not be
+    /// explained afterwards: the stage line carried a file count and nothing else. The totals now say how many
+    /// previous-version rows the cursor consumed, how many entries were settled from metadata alone, how many paid a
+    /// head or tail read, how many were read end to end here and how many bytes that was — the orchestrator logs
+    /// them at the end of the stage.
+    /// </summary>
+    [Fact]
+    public async Task The_Totals_Say_How_Each_Entry_Was_Settled()
+    {
+        Write("a.txt", "unchanged");
+        var b = Write("b.txt", "same-length-touched");
+        var c = Write("c.txt", "short");
+        Write("d.txt", "will be deleted");
+        var previous = await SnapshotAsync();
+
+        File.SetLastWriteTimeUtc(b, File.GetLastWriteTimeUtc(b).AddMinutes(1)); // same content, new mtime: head, then the full read
+        File.WriteAllText(c, "now a different length");                          // length changed: settled changed, read in full for its hash
+        File.Delete(Path.Combine(_root, "d.txt"));
+        var e = Write("e.txt", "added");                                         // added: read in full for its hash
+
+        var diff = await new BackupDiffer(new FileHasher()).RunDiffAsync(_root, previous);
+
+        var t = diff.Totals;
+        Assert.Equal(4, t.PreviousRows);                        // a, b, c, d
+        Assert.Equal(1, t.ByMetadata);                          // a
+        Assert.Equal(1, t.HeadHashed);                          // b: same length, new mtime
+        Assert.Equal(3, t.FullHashed);                          // b (to tell touched from changed), c, e
+        Assert.Equal(new FileInfo(b).Length + new FileInfo(c).Length + new FileInfo(e).Length, t.HashedBytes);
+        Assert.Equal(5, t.Emitted);                             // a b c e + the deletion of d
+    }
+
     [Fact]
     public async Task First_Backup_Marks_Everything_Added()
     {
