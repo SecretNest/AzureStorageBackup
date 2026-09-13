@@ -340,10 +340,14 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
         {
             using var connection = new SqliteConnection(CatalogSql.ConnectionString(path, readOnly: true));
             connection.Open();
+            // The pragmas as any other reader takes them, for the busy_timeout above all: without it a writer
+            // holding the file for a moment makes this answer "no conversion needed", and the conversion then runs
+            // unannounced inside whatever write open comes next instead of on its own stage line.
+            CatalogSql.ApplyPragmas(connection, readOnly: true);
             return CatalogSql.FormatOf(connection) < CatalogSql.Format
                 && (CatalogSql.HasTable(connection, "v1_entries") || CatalogSql.HasTable(connection, "entries"));
         }
-        catch (SqliteException)
+        catch (SqliteException ex) when (ex.SqliteErrorCode is 11 /* SQLITE_CORRUPT */ or 26 /* SQLITE_NOTADB */)
         {
             return false;   // unreadable: the write open's recovery path is the one that deals with it
         }

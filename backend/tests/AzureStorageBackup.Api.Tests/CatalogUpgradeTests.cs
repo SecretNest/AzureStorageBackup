@@ -26,6 +26,18 @@ public sealed class CatalogUpgradeTests : IDisposable
         ];
     }
 
+    /// <summary>How many of the content-keyed indexes the file has, read off a half-converted file that no
+    /// <see cref="VersionCatalog"/> would open (it is unstamped, so a read-only open converts it instead).</summary>
+    private static async Task<long> GlobalIndexesOnDiskAsync(string path)
+    {
+        await using var connection = new Microsoft.Data.Sqlite.SqliteConnection(CatalogSql.ConnectionString(path, readOnly: true));
+        await connection.OpenAsync();
+        using var command = connection.CreateCommand();
+        command.CommandText =
+            "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name IN ('entries_content', 'entries_ref', 'entries_head')";
+        return (long)(await command.ExecuteScalarAsync())!;
+    }
+
     private static async Task<byte[]> SerializeAsync(VersionCatalog catalog, int version)
     {
         using var ms = new MemoryStream();
@@ -85,6 +97,9 @@ public sealed class CatalogUpgradeTests : IDisposable
         var stopAfterFirst = new InlineProgress<CatalogUpgradeProgress>(r => { if (r.VersionDone && r.Version == 2) cts.Cancel(); });
         await Assert.ThrowsAnyAsync<OperationCanceledException>(() => store.UpgradeAsync(AccountId, Container, stopAfterFirst, cts.Token));
         Assert.True(store.NeedsUpgrade(AccountId, Container));   // not stamped: versions 1 and 2 are in, 3 and 4 are not
+        // Mid-conversion the content-keyed indexes are down: a version converting with them live inserts its rows
+        // at random into three trees spanning the whole history (CatalogSql.GlobalIndexNames).
+        Assert.Equal(0, await GlobalIndexesOnDiskAsync(path));
 
         var resumed = new List<CatalogUpgradeProgress>();
         await new VersionCatalogStore(_root).UpgradeAsync(AccountId, Container, new InlineProgress<CatalogUpgradeProgress>(resumed.Add), CancellationToken.None);
@@ -92,6 +107,9 @@ public sealed class CatalogUpgradeTests : IDisposable
         await using var catalog = await VersionCatalog.OpenAsync(path, readOnly: true, CancellationToken.None);
         foreach (var index in history)
             Assert.Equal(LegacyIndexSerializer.SerializeIndex(index), await SerializeAsync(catalog, index.Version));
+        // The conversion runs with the content-keyed indexes down and sorts them back at the end; the resumed run
+        // is the one that finishes, so it is the one that owes them.
+        Assert.Equal(CatalogSql.GlobalIndexNames.Count, await catalog.GlobalIndexCountAsync(CancellationToken.None));
     }
 
     [Fact]

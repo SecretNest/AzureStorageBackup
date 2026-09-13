@@ -22,6 +22,12 @@ internal static class CatalogUpgrade
     /// to compare against, and the result would be the format-1 shape written into the format-2 tables — correct,
     /// and not one row smaller. Aside, the new table lists exactly the versions converted so far, which is what makes
     /// each version a merge against the one before it.
+    /// <para>
+    /// The renames carry no <c>IF EXISTS</c> on purpose: format 1's own schema pass created all six tables on every
+    /// write open, so a file this runs on has all six. A file missing one is not a format-1 catalog at all, and
+    /// failing the whole begin transaction on it is the right answer — the store's recovery rebuilds it from the
+    /// cloud rather than converting half a layout.
+    /// </para>
     /// </summary>
     private const string BeginSql = """
         DROP INDEX IF EXISTS entries_seq; DROP INDEX IF EXISTS entries_parent; DROP INDEX IF EXISTS entries_fold;
@@ -77,6 +83,14 @@ internal static class CatalogUpgrade
             await begin.CommitAsync(ct);
         }
 
+        // The same bracket EnsureVersionsAsync takes for a migration, and for the same reason: every version the
+        // loop converts would otherwise insert its rows into three indexes keyed by hash, ref and length, at random
+        // over a history that grows under it — a random page read per row per index (see CatalogSql.GlobalIndexNames
+        // for the measurement). Dropped for the whole conversion and sorted back once at the end. On a resumed
+        // conversion the drop is a no-op, and a conversion that is killed leaves a file without them that only the
+        // next conversion touches, since it is not stamped.
+        await catalog.DropGlobalIndexesAsync(ct);
+
         var total = await ScalarAsync(connection, TotalRowsSql, ct);
         var done = await ScalarAsync(connection, DoneRowsSql, ct);
         foreach (var (version, identity, count) in await PendingAsync(connection, ct))
@@ -105,6 +119,9 @@ internal static class CatalogUpgrade
             progress?.Report(new CatalogUpgradeProgress(version, done, total, VersionDone: true));
         }
 
+        // The other half of the bracket, before the stamp: a file that reads as converted has its indexes.
+        await catalog.RebuildGlobalIndexesAsync(ct);
+
         await using (var end = (SqliteTransaction)await connection.BeginTransactionAsync(ct))
         {
             using var command = connection.CreateCommand();
@@ -115,15 +132,22 @@ internal static class CatalogUpgrade
             await end.CommitAsync(ct);
         }
 
-        // Reclaim the old rows' pages. VACUUM needs temp room for a copy of the file; when there is none it fails
-        // fast with SQLITE_FULL, and the file stays large but correct.
+        // Reclaim the old rows' pages. VACUUM needs temp room for a copy of the file, and it is the one step here
+        // that can fail on a catalog that is already converted, stamped and correct: no temp room (SQLITE_FULL), a
+        // temp volume it cannot open (SQLITE_CANTOPEN), a NAS I/O error (SQLITE_IOERR), a second writer
+        // (SQLITE_BUSY). Every one of them is answered the same way, because the alternative is not answering it
+        // at all: an exception escaping here is wrapped as a CatalogUpgradeException by the store, and its recovery
+        // would delete the finished catalog and re-download the whole history to rebuild what is already on disk.
+        // So the failure is recorded, the store logs it, and the file stays large and correct until the next
+        // VACUUM — a later conversion's, or an operator's. Cancellation is not caught: it is not a VACUUM failure,
+        // and the file is stamped, so the next open finds the work done.
         try
         {
             using var vacuum = connection.CreateCommand();
             vacuum.CommandText = "VACUUM";
             await vacuum.ExecuteNonQueryAsync(ct);
         }
-        catch (SqliteException ex) when (ex.SqliteErrorCode is 13 /* SQLITE_FULL */ or 14 /* SQLITE_CANTOPEN */)
+        catch (SqliteException ex)
         {
             // logged by the store, which knows the path
             catalog.VacuumSkipped = ex.Message;
