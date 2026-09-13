@@ -1,9 +1,48 @@
 using AzureStorageBackup.Api.Services;
+using Microsoft.Extensions.Logging;
+using NSubstitute;
 
 namespace AzureStorageBackup.Api.Tests;
 
 public class BackupRunStateTests
 {
+    /// <summary>Every stage change is one line in the container log. Two days of "is it stuck?" (2026-09-12/13) had
+    /// only the UI or a polling script to answer from, because the product logged nothing between start and finish;
+    /// with one timestamped line per stage the durations are in <c>docker logs</c>. Same-stage snapshots (a thousand
+    /// a minute during upload) log nothing.</summary>
+    [Fact]
+    public void Stage_changes_are_logged_once_each_and_same_stage_snapshots_are_not()
+    {
+        var logger = Substitute.For<ILogger<BackupRunner>>();
+        var log = new StageTransitionLog(logger, "photos", 17);
+
+        log.Observe(new BackupProgress(BackupStage.Scanning, 0, 0, 0, 0));
+        log.Observe(new BackupProgress(BackupStage.Scanning, 0, 0, 0, 0));
+        log.Observe(new BackupProgress(BackupStage.Diffing, 0, 0, 0, 0));
+        log.Observe(new BackupProgress(BackupStage.Diffing, 5, 100, 0, 0));
+        log.Observe(new BackupProgress(BackupStage.Uploading, 5, 100, 0, 0));
+        log.Observe(new BackupProgress(BackupStage.Completed, 5, 100, 3, 3));
+
+        var lines = logger.ReceivedCalls()
+            .Where(c => c.GetMethodInfo().Name == nameof(ILogger.Log))
+            .Select(c => (Level: (LogLevel)c.GetArguments()[0]!, Text: c.GetArguments()[2]!.ToString()!))
+            .ToList();
+        Assert.Equal(4, lines.Count);
+        Assert.All(lines, l => Assert.Equal(LogLevel.Information, l.Level));
+        Assert.Contains("Scanning", lines[0].Text);
+        Assert.Contains("Diffing", lines[1].Text);
+        Assert.Contains("Uploading", lines[2].Text);
+        Assert.Contains("Completed", lines[3].Text);
+        Assert.All(lines, l => Assert.Contains("photos", l.Text));
+    }
+
+    [Fact]
+    public void A_missing_logger_is_tolerated()
+    {
+        var log = new StageTransitionLog(null, "photos", 17);
+        log.Observe(new BackupProgress(BackupStage.Scanning, 0, 0, 0, 0));
+    }
+
     [Fact]
     public void Response_carries_run_id_and_no_pause_by_default()
     {

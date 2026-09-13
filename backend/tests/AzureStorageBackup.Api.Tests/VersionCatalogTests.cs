@@ -64,6 +64,24 @@ public sealed class VersionCatalogTests : IDisposable
         Assert.Equal(8, await catalog.HistoryRowsAsync(CancellationToken.None));
     }
 
+    /// <summary>Microsoft.Data.Sqlite is synchronous underneath: an import of a million rows, a CREATE INDEX over the
+    /// history or a full-file quick_check holds its thread for minutes. On a thread-pool thread that is one worker
+    /// gone for the duration, and Kestrel logged thread-pool starvation for the whole of the 2026-09-13 run. The long
+    /// catalog operations run on a dedicated thread; the row callback is the one place the import's thread is visible.</summary>
+    [Fact]
+    public async Task A_version_import_runs_off_the_thread_pool()
+    {
+        var entries = new List<IndexEntry>();
+        for (var i = 0; i < 10_000; i++)
+            entries.Add(IndexSamples.Sample().Entries[0] with { Path = $"dir/{i:D6}.bin" });
+        var index = IndexSamples.Sample() with { Entries = entries };
+        var onPool = new List<bool>();
+        await using var catalog = await OpenAsync();
+        using var reader = new IndexStreamReader(new MemoryStream(LegacyIndexSerializer.SerializeIndex(index)));
+        await catalog.ImportVersionAsync(1, 1, reader, CancellationToken.None, _ => onPool.Add(Thread.CurrentThread.IsThreadPoolThread));
+        Assert.Equal([false], onPool);
+    }
+
     [Fact]
     public async Task Import_reports_the_running_row_count_every_ten_thousand_rows()
     {
