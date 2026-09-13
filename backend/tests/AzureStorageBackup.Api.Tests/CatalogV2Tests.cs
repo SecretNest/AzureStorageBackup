@@ -207,6 +207,79 @@ public sealed class CatalogV2Tests : IDisposable
         Assert.Equal(0, await CountAsync(catalog, "SELECT COUNT(*) FROM dirs"));
     }
 
+    /// <summary>The other half of the removal: retiring the oldest version leaves the newest's open-ended rows
+    /// exactly where they were. Only a removal that lowers the newest version can strand a row above it, which is
+    /// why that scan is skipped here — and a skip that took the reachable rows with it would show up as a missing
+    /// interval below.</summary>
+    [Fact]
+    public async Task Removing_the_oldest_version_leaves_the_rows_the_newest_still_reaches()
+    {
+        await using var catalog = await OpenAsync();
+        var a1 = Entry("a", 1, "h1");
+        var b = Entry("b", 1, "hb");
+        var v1 = Version(1, a1, b);
+        var v2 = Version(2, a1 with { Length = 2 }, b);
+        var v3 = Version(3, a1 with { Length = 3 }, b);
+        foreach (var index in new[] { v1, v2, v3 })
+            await ImportAsync(catalog, index);
+
+        await catalog.RemoveVersionAsync(1, CancellationToken.None);                    // the oldest
+
+        Assert.Equal(3, await CountAsync(catalog, "SELECT COUNT(*) FROM entries"));    // only a's [1,2) was v1's alone
+        // a's [3,∞) and b's [1,∞): open-ended and untouched, since the newest version did not move.
+        Assert.Equal(2, await CountAsync(catalog, $"SELECT COUNT(*) FROM entries WHERE version_to = {int.MaxValue}"));
+        Assert.Equal(1, await CountAsync(catalog, "SELECT COUNT(*) FROM entries WHERE version_from = 1"));
+        Assert.Equal(Bytes(v2), await SerializeAsync(catalog, 2));
+        Assert.Equal(Bytes(v3), await SerializeAsync(catalog, 3));
+    }
+
+    /// <summary>A patch may not widen the row it lands on. After the middle version goes, the path's first row still
+    /// ends where the path changed; isolating version 1 for a patch must leave that end alone, or a later re-import
+    /// of version 2 would find the path unchanged and give it version 1's entry.</summary>
+    [Fact]
+    public async Task A_patch_does_not_stretch_the_row_over_a_removed_version()
+    {
+        await using var catalog = await OpenAsync();
+        var a = Entry("a", 1, "h1");
+        foreach (var index in new[] { Version(1, a), Version(2, a with { Length = 2 }), Version(3, a with { Length = 3 }) })
+            await ImportAsync(catalog, index);
+        await catalog.RemoveVersionAsync(2, CancellationToken.None);
+        Assert.Equal(2, await CountAsync(catalog, "SELECT COUNT(*) FROM entries"));    // [1,2) and [3,∞)
+
+        await catalog.ApplyPatchesAsync([new CatalogPatch(1, "a", null, true, null)], CancellationToken.None);
+
+        Assert.Equal(2, await CountAsync(catalog, "SELECT COUNT(*) FROM entries"));    // nothing split
+        Assert.Equal(1, await CountAsync(catalog, "SELECT COUNT(*) FROM entries WHERE version_from = 1 AND version_to = 2"));
+
+        // And the re-imported version 2 is its own entry again, not the patched version 1's.
+        var v2 = Version(2, a with { Length = 2 });
+        await ImportAsync(catalog, v2);
+        Assert.Equal(Bytes(v2), await SerializeAsync(catalog, 2));
+        Assert.Equal(2, (await catalog.GetEntryAsync(2, "a", CancellationToken.None))!.Length);
+        Assert.Equal(["a"], await catalog.UnrecoverableAsync(1, CancellationToken.None));
+        Assert.Empty(await catalog.UnrecoverableAsync(2, CancellationToken.None));
+    }
+
+    /// <summary>An import that has to be staged only records its order when that order is not the path order: the
+    /// order table is a row per entry per version, which is the shape this format exists to stop storing.</summary>
+    [Fact]
+    public async Task Only_an_import_that_is_out_of_path_order_records_one()
+    {
+        await using var catalog = await OpenAsync();
+        IndexEntry[] entries = [Entry("a", 1, "h1"), Entry("b", 2, "h2"), Entry("c", 3, "h3")];
+        await catalog.ImportVersionAsync(1, 1, entries.Length, entries.ToAsyncEnumerable(), [], [], CancellationToken.None);
+        Assert.Equal(0, await CountAsync(catalog, "SELECT COUNT(*) FROM entry_order"));
+
+        IndexEntry[] shuffled = [entries[2], entries[0], entries[1]];
+        await catalog.ImportVersionAsync(2, 2, shuffled.Length, shuffled.ToAsyncEnumerable(), [], [], CancellationToken.None);
+        Assert.Equal(3, await CountAsync(catalog, "SELECT COUNT(*) FROM entry_order WHERE version = 2"));
+        Assert.Equal(0, await CountAsync(catalog, "SELECT COUNT(*) FROM entry_order WHERE version = 1"));
+
+        // Both versions serialize in the order they were handed over in.
+        Assert.Equal(Bytes(new VersionIndex { Version = 1, Entries = [.. entries] }), await SerializeAsync(catalog, 1));
+        Assert.Equal(Bytes(new VersionIndex { Version = 2, Entries = [.. shuffled] }), await SerializeAsync(catalog, 2));
+    }
+
     [Fact]
     public async Task A_version_re_imported_in_the_middle_of_the_history_lands_between_its_neighbours()
     {

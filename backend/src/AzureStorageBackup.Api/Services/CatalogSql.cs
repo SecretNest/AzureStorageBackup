@@ -72,20 +72,27 @@ public static class CatalogSql
     /// covers every version from <c>version_from</c> on.</summary>
     public const int OpenEnd = int.MaxValue;
 
-    public static void EnsureSchema(SqliteConnection connection)
+    /// <param name="transaction">The open transaction to run under, when the caller is pairing this with
+    /// <see cref="MarkCurrent"/> — Microsoft.Data.Sqlite refuses a command that does not name the connection's
+    /// pending transaction.</param>
+    public static void EnsureSchema(SqliteConnection connection, SqliteTransaction? transaction = null)
     {
         using var command = connection.CreateCommand();
         command.CommandText = Schema;
+        command.Transaction = transaction;
         command.ExecuteNonQuery();
     }
 
     /// <summary>Stamps the file as this build's format. Separate from <see cref="EnsureSchema"/> because the upgrade
     /// creates the v2 tables first and may be killed before the last version is in; the stamp is the last thing it
-    /// writes, and a file without it is resumed, not trusted.</summary>
-    public static void MarkCurrent(SqliteConnection connection)
+    /// writes, and a file without it is resumed, not trusted. A plain open pairs the two in one transaction instead:
+    /// <c>user_version</c> lives in the database header and is written under the same transaction as the DDL, so a
+    /// crash between them cannot leave a v2 file that reads as a legacy one.</summary>
+    public static void MarkCurrent(SqliteConnection connection, SqliteTransaction? transaction = null)
     {
         using var command = connection.CreateCommand();
         command.CommandText = $"PRAGMA user_version = {Format}";
+        command.Transaction = transaction;
         command.ExecuteNonQuery();
     }
 

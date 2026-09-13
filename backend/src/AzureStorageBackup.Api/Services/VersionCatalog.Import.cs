@@ -47,15 +47,15 @@ public sealed partial class VersionCatalog
     private const string SelectStageSql = $"SELECT {EntryRowMapper.Columns} FROM import_stage ORDER BY path_key, seq";
 
     /// <summary>Records the order the entries were handed over in, which is the order the version has to be written
-    /// back out in. Only the first row of a repeated path is taken: the merge keeps the first and records the rest as
-    /// duplicates, so an order that named a path twice would serialize more entries than the version has.</summary>
-    private const string RecordStageOrderSql = """
-        INSERT INTO entry_order (version, seq, path)
-        SELECT @v, s.seq, s.path FROM import_stage s
-        WHERE s.seq = (SELECT MIN(f.seq) FROM import_stage f WHERE f.path = s.path)
-        ORDER BY s.seq
-        """;
-    private const string DropStageSql = "DELETE FROM import_stage";
+    /// back out in. One row per <em>path</em>, at its first <c>seq</c>: the merge keeps the first of a repeated path
+    /// and records the rest as duplicates, so an order that named a path twice would serialize more entries than the
+    /// version has. Grouped rather than correlated per row — the staging table is indexed by <c>path_key</c>, not by
+    /// <c>path</c>, so a subquery per row would be a scan per row. The gaps a duplicate leaves in <c>seq</c> do not
+    /// matter: the table is read back in <c>seq</c> order, not by position.</summary>
+    private const string RecordStageOrderSql =
+        "INSERT INTO entry_order (version, seq, path) SELECT @v, MIN(seq), path FROM import_stage GROUP BY path";
+
+    private const string ClearStageSql = "DELETE FROM import_stage";
 
     /// <summary>How often <c>onEntries</c> hears from an import, in rows. Coarse enough to cost nothing against the
     /// merge itself, fine enough that a million-row version moves the line a hundred times.</summary>
@@ -118,11 +118,15 @@ public sealed partial class VersionCatalog
             var source = entries;
             if (!ordered)
             {
-                var seen = await StageAsync(entries, ct);
+                var (seen, ascending) = await StageAsync(entries, ct);
                 if (seen != expected)
                     throw new InvalidOperationException($"Version {version} announced {expected} entries but produced {seen}.");
-                using (var order = Command(RecordStageOrderSql))
+                // Only a version whose entries really did arrive out of path order needs its order written down;
+                // for every other one the path order is the order, and the table would be a row per entry per
+                // version — the shape this format exists to stop storing.
+                if (!ascending)
                 {
+                    using var order = Command(RecordStageOrderSql);
                     Set(order, "@v", version);
                     await order.ExecuteNonQueryAsync(ct);
                 }
@@ -153,8 +157,8 @@ public sealed partial class VersionCatalog
 
             if (!ordered)
             {
-                using var drop = Command(DropStageSql);
-                await drop.ExecuteNonQueryAsync(ct);
+                using var clear = Command(ClearStageSql);
+                await clear.ExecuteNonQueryAsync(ct);
             }
 
             await UpsertVersionAsync(version, identity, kept, ct);
@@ -236,8 +240,12 @@ public sealed partial class VersionCatalog
                 var currentFlag = rows.GetInt64(rows.GetOrdinal("unrecoverable")) != 0;
                 if (!EntryRowMapper.SameEntry(current, entry) || currentFlag != flag)
                 {
+                    // The replacement reaches no further than the row it replaces: a row that ended at a
+                    // since-removed version says the path stopped there, and the new entry must not claim the
+                    // versions between, or re-importing that version would find the path present and unchanged.
+                    var end = Math.Min(next, rows.GetInt32(2));
                     await CloseRowAsync(rows, version, next, close, start, delete, copy, ct);
-                    await InsertRowAsync(insert, version, next, entry, flag, key, ct);
+                    await InsertRowAsync(insert, version, end, entry, flag, key, ct);
                 }
                 haveRow = await rows.ReadAsync(ct);
             }
@@ -388,21 +396,30 @@ public sealed partial class VersionCatalog
         }
     }
 
-    private async Task<int> StageAsync(IAsyncEnumerable<IndexEntry> entries, CancellationToken ct)
+    /// <summary>Copies the entries into the staging table so the merge can read them in path order, and says how many
+    /// there were and whether they already arrived in that order — the second answer is free here, next to the key
+    /// each row is stored under, and decides whether the version needs an <c>entry_order</c> table at all.</summary>
+    private async Task<(int Seen, bool Ascending)> StageAsync(IAsyncEnumerable<IndexEntry> entries, CancellationToken ct)
     {
         using (var create = Command(CreateStageSql))
             await create.ExecuteNonQueryAsync(ct);
         using var insert = Command(InsertStageSql);
         var seq = 0;
+        var ascending = true;
+        byte[]? lastKey = null;
         await foreach (var entry in entries.WithCancellation(ct))
         {
             ct.ThrowIfCancellationRequested();
+            var key = CatalogSql.PathKey(entry.Path);
+            if (lastKey is not null && Compare(key, lastKey) < 0)
+                ascending = false;
+            lastKey = key;
             Set(insert, "@seq", seq++);
-            Set(insert, "@path_key", CatalogSql.PathKey(entry.Path));
+            Set(insert, "@path_key", key);
             EntryRowMapper.Bind(insert, entry);
             await insert.ExecuteNonQueryAsync(ct);
         }
-        return seq;
+        return (seq, ascending);
     }
 
     private async IAsyncEnumerable<IndexEntry> QueryStageAsync([EnumeratorCancellation] CancellationToken ct)
@@ -437,10 +454,19 @@ public sealed partial class VersionCatalog
             Set(drop, "@v", version);
             await drop.ExecuteNonQueryAsync(ct);
         }
+        var max = await MaxPresentAsync(ct);
         using (var unreachable = Command(DeleteUnreachableEntriesSql))
         {
-            Set(unreachable, "@max", await MaxPresentAsync(ct));
+            Set(unreachable, "@max", max);
             await unreachable.ExecuteNonQueryAsync(ct);
+        }
+        // The version was the newest, so rows may now start above the maximum; retiring an older one cannot leave
+        // any, and this pair has no index to work with.
+        if (version > max)
+        {
+            using var above = Command(DeleteRowsAboveMaxSql);
+            Set(above, "@max", max);
+            await above.ExecuteNonQueryAsync(ct);
         }
         using var rest = Command(DeletePerVersionRowsSql);
         Set(rest, "@v", version);

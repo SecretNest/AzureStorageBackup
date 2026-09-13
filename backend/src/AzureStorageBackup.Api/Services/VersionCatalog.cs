@@ -57,15 +57,23 @@ public sealed partial class VersionCatalog : IAsyncDisposable
     private const string DeleteVersionSql = "DELETE FROM versions WHERE version=@v";
 
     /// <summary>A row is reachable when some retained version lies in its interval. After a version is dropped, the
-    /// rows nothing reaches go. Only rows that end at or before the newest retained version, or start after it, can
-    /// be unreachable: a row spanning the newest version is reached by it. The two disjuncts are separate
-    /// statements so each can use an index.</summary>
+    /// rows nothing reaches go. A row that ends at or before the newest retained version is a candidate, and the
+    /// <c>(version_to)</c> index bounds the scan to those: a row spanning the newest version is reached by it and is
+    /// never examined. Rows that <em>start</em> after the newest are the other half, and they are
+    /// <see cref="DeleteRowsAboveMaxSql"/>'s, because only a removal that lowered the maximum can create one.</summary>
     private const string DeleteUnreachableEntriesSql = """
         DELETE FROM entries WHERE version_to <= @max
           AND NOT EXISTS (SELECT 1 FROM versions v WHERE v.version >= entries.version_from AND v.version < entries.version_to);
-        DELETE FROM entries WHERE version_from > @max;
         DELETE FROM dirs WHERE version_to <= @max
           AND NOT EXISTS (SELECT 1 FROM versions v WHERE v.version >= dirs.version_from AND v.version < dirs.version_to);
+        """;
+
+    /// <summary>The rows the newest retained version used to reach and nothing reaches now: the open-ended ones the
+    /// removed version had started. There is no index on <c>version_from</c>, so this is a scan of both tables, and
+    /// retention retires one version per call — hence it runs only when the removal actually lowered the maximum,
+    /// which retiring the oldest (the ordinary case) never does.</summary>
+    private const string DeleteRowsAboveMaxSql = """
+        DELETE FROM entries WHERE version_from > @max;
         DELETE FROM dirs WHERE version_from > @max;
         """;
 
@@ -154,8 +162,12 @@ public sealed partial class VersionCatalog : IAsyncDisposable
                 throw new CatalogFormatException(path);
             if (!readOnly && !legacy)
             {
-                CatalogSql.EnsureSchema(connection);
-                CatalogSql.MarkCurrent(connection);
+                // One transaction: a crash between the two would leave a file with the v2 tables and no stamp,
+                // which the check above reads as a legacy catalog waiting to be converted.
+                using var schema = connection.BeginTransaction();
+                CatalogSql.EnsureSchema(connection, schema);
+                CatalogSql.MarkCurrent(connection, schema);
+                schema.Commit();
             }
 
             return new VersionCatalog(path, connection) { NeedsUpgrade = legacy };
@@ -435,15 +447,20 @@ public sealed partial class VersionCatalog : IAsyncDisposable
 
     /// <summary>
     /// The row that covers (<paramref name="version"/>, <paramref name="path"/>), narrowed to that one version: a row
-    /// <c>[a, b)</c> with <c>a &lt; version</c> or <c>b &gt; next</c> — <c>next</c> being the retained version after
-    /// this one, or <see cref="CatalogSql.OpenEnd"/> — is split into up to three. The outer pieces keep the old values
-    /// under new ids, the original becomes <c>[version, next)</c> and is the one returned. The split lands on version
-    /// boundaries rather than on <c>version + 1</c> so that no piece covers a version that does not exist: such a
-    /// piece is reachable by nothing, survives retention (which only deletes what no version reaches) and would still
-    /// answer the content lookups, which carry no version predicate. Splits are never merged back; a repaired path
-    /// gains at most two rows per patch. Null when the version has no entry at the path. The original is shrunk
-    /// before the copies are inserted, or the copy that keeps <c>version_from = a</c> would collide with it on the
-    /// unique <c>(path, version_from)</c>.
+    /// <c>[a, b)</c> that reaches outside <c>[version, end)</c> is split into up to three. The outer pieces keep the
+    /// old values under new ids, the original becomes <c>[version, end)</c> and is the one returned. Splits are never
+    /// merged back; a repaired path gains at most two rows per patch. Null when the version has no entry at the path.
+    /// The original is shrunk before the copies are inserted, or the copy that keeps <c>version_from = a</c> would
+    /// collide with it on the unique <c>(path, version_from)</c>.
+    /// <para>
+    /// <c>end</c> is the smaller of <c>b</c> and the retained version after this one (<see cref="CatalogSql.OpenEnd"/>
+    /// when there is none), never <c>version + 1</c>. The next retained version, because a piece
+    /// <c>[version + 1, …)</c> covering a version that does not exist is reachable by nothing, survives retention
+    /// (which only deletes what no version reaches) and still answers the content lookups, which carry no version
+    /// predicate. Bounded by <c>b</c>, because widening the row past where the entry stopped would make it describe
+    /// versions it never did — a since-removed <c>b</c> that is later re-imported would find the path present and
+    /// unchanged rather than absent.
+    /// </para>
     /// </summary>
     private async Task<long?> IsolateAsync(int version, string path, CancellationToken ct)
     {
@@ -460,15 +477,15 @@ public sealed partial class VersionCatalog : IAsyncDisposable
             to = reader.GetInt32(2);
         }
 
-        var next = await NextPresentAsync(version, ct) ?? CatalogSql.OpenEnd;
-        if (from == version && to == next)
+        var end = Math.Min(await NextPresentAsync(version, ct) ?? CatalogSql.OpenEnd, to);
+        if (from == version && to == end)
             return id;
 
         using (var shrink = Command(ShrinkRowToVersionSql))
         {
             Set(shrink, "@id", id);
             Set(shrink, "@from", version);
-            Set(shrink, "@to", next);
+            Set(shrink, "@to", end);
             await shrink.ExecuteNonQueryAsync(ct);
         }
 
@@ -480,9 +497,9 @@ public sealed partial class VersionCatalog : IAsyncDisposable
             Set(copy, "@to", version);
             await copy.ExecuteNonQueryAsync(ct);
         }
-        if (to > next)
+        if (to > end)
         {
-            Set(copy, "@from", next);
+            Set(copy, "@from", end);
             Set(copy, "@to", to);
             await copy.ExecuteNonQueryAsync(ct);
         }

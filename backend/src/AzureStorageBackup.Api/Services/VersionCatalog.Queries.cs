@@ -62,15 +62,20 @@ public sealed partial class VersionCatalog
         ORDER BY path_fold, path
         """;
 
-    // Last version wins, mirroring the in-memory map that was rebuilt version by version and overwritten as it went.
+    // The most recently introduced copy wins: on interval rows a row carries the version the entry first appeared
+    // at, not every version that still holds it, so "greatest version_from" is the latest time this content was
+    // written somewhere — which is the answer the in-memory map (rebuilt version by version, each overwriting the
+    // last) used to give, for every case where the content is still current. A copy that was introduced earlier and
+    // survives into newer versions loses to one introduced later, and either is a correct address for the content.
     private const string FindBlobByContentSql = """
         SELECT storage_ref, raw, volumes, volume_sizes FROM entries
         WHERE full_hash=@f AND length=@l AND head_hash IS @h AND tail_hash IS @t AND storage_kind='blob' AND unrecoverable=0
         ORDER BY version_from DESC LIMIT 1
         """;
 
-    // Healthy rows first (latest wins among them), damaged rows only as a fallback (earliest wins) — the precedence
-    // the in-memory build had from "normal rows overwrite, damaged rows TryAdd".
+    // Healthy rows first (the most recently introduced wins among them), damaged rows only as a fallback (the
+    // earliest introduced wins) — the precedence the in-memory build had from "normal rows overwrite, damaged rows
+    // TryAdd", read off each row's own version_from rather than off every version that holds it.
     //
     // The three lookups below all require a full hash, because the in-memory build skipped an entry that had none
     // before it ever looked at its storage (`if (e.FullHash is null) continue;`): such an entry owns no address,
@@ -92,8 +97,8 @@ public sealed partial class VersionCatalog
         "SELECT EXISTS (SELECT 1 FROM entries WHERE length=@l AND head_hash=@h AND storage_kind='blob' " +
         "AND unrecoverable=0 AND full_hash IS NOT NULL)";
 
-    // First version wins: references pile onto the oldest pack holding the content, which is the one compaction is
-    // least likely to rewrite.
+    // The earliest introduced wins, with the path order to break a tie inside one version: references pile onto the
+    // oldest pack holding the content, which is the one compaction is least likely to rewrite.
     private const string FindPackMemberSql = """
         SELECT storage_ref, COALESCE(entry_name, path), tail_hash FROM entries
         WHERE full_hash=@f AND length=@l AND head_hash=@h AND storage_kind='pack' AND unrecoverable=0
@@ -471,7 +476,8 @@ public sealed partial class VersionCatalog
     }
 
     /// <summary>Every pack member still referenced by some version, once each: what compaction weighs a pack's dead
-    /// weight against. The newest version's copy of a member wins, since that is the one a restore would extract.</summary>
+    /// weight against. The most recently introduced row for a member wins, since that is the one a restore would
+    /// extract; the deduplication is on (pack, member name), so the other rows only repeat what it already says.</summary>
     public async IAsyncEnumerable<(string PackId, string EntryName, long Length, string FullHash)> LivePackMembersAsync(
         [EnumeratorCancellation] CancellationToken ct)
     {
@@ -484,7 +490,7 @@ public sealed partial class VersionCatalog
             var pack = reader.GetString(0);
             var name = reader.GetString(1);
             if (pack == lastPack && name == lastName)
-                continue;   // the same member in an older version — the rows are ordered so the winner comes first
+                continue;   // another row for the same member — the rows are ordered so the winner comes first
 
             lastPack = pack;
             lastName = name;
