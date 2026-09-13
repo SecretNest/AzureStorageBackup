@@ -621,6 +621,13 @@ public sealed class StageTracker(
     private long _activeSince = -1;
     // A timer that runs only inside an active segment. Stopped during compression, it emits not one redundant snapshot.
     private Timer? _heartbeat;
+    // The trailing edge of the throttle: a one-shot timer armed when a publish is refused inside the window, due at
+    // the window's end, so the state a burst ended on reaches the screen even if nothing else ever happens. The
+    // heartbeat cannot cover this — it runs only while a stream is open — and without it the version-loading
+    // probe's thirteen Present reports published once ("1 of 14") and then stood for the forty minutes it took the
+    // next event to arrive (2026-09-13). Null under an injected clock, like the heartbeat: a test drives time by hand.
+    private Timer? _trailing;
+    private bool _publishPending;
     // Late callbacks arriving after Complete() (already queued on the thread pool, and Dispose cannot call them back) must be voided on the spot —
     // see how it is used in Tick().
     private bool _completed;
@@ -1364,6 +1371,40 @@ public sealed class StageTracker(
     {
         _heartbeat?.Dispose();
         _heartbeat = null;
+        _trailing?.Dispose();
+        _trailing = null;
+    }
+
+    /// <summary>Owe one publish at the end of the current throttle window. Must be called while holding <c>_gate</c>.
+    /// Re-armed by every refused publish, so it lands once, carrying whatever state the burst ended on; a real publish
+    /// in the meantime clears the debt. Under an injected clock nothing is armed — the test calls <see cref="Tick"/>.</summary>
+    private void ArmTrailingPublish(long dueInMs)
+    {
+        _publishPending = true;
+        if (Clock is not null || _completed)
+            return;
+        // Same shape and the same reasons as the heartbeat's callback: a throw here is on a timer thread with nobody to
+        // catch it, so it is swallowed and the timer retired rather than left to fail once per window.
+        _trailing ??= new Timer(_ =>
+        {
+            try
+            {
+                lock (_gate)
+                {
+                    if (_publishPending && !_completed)
+                        PublishIfDue(force: true);
+                }
+            }
+            catch
+            {
+                lock (_gate)
+                {
+                    _trailing?.Dispose();
+                    _trailing = null;
+                }
+            }
+        }, null, Timeout.Infinite, Timeout.Infinite);
+        _trailing.Change(Math.Max(1, dueInMs), Timeout.Infinite);
     }
 
     /// <summary>Wrap up the stage: publish once unconditionally so the progress is settled, and stop the heartbeat.</summary>
@@ -1403,8 +1444,12 @@ public sealed class StageTracker(
     {
         var now = NowMs();
         if (!force && now - _lastPublishMs < ThrottleMs)
+        {
+            ArmTrailingPublish(ThrottleMs - (now - _lastPublishMs));
             return;
+        }
         _lastPublishMs = now;
+        _publishPending = false;
 
         // Throttling uses the wall clock (it governs "how often to refresh the UI"), the speed uses the virtual axis (it governs "how much transfer time these bytes took").
         var tick = SpeedNow(now);

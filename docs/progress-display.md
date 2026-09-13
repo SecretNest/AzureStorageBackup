@@ -396,6 +396,17 @@ Mutating the active set and toggling the clock happen inside the same critical s
 speed does not decay to zero during a silence — it holds "the speed during the most recent stretch of
 uploading". The `nothing on the wire right now` beside it already states that nothing is moving.
 
+**The trailing edge of the throttle**: publishes are throttled to one per 200 ms, and a burst used to
+lose its tail — the first report went out, the rest were refused, and nothing published again until
+the caller's next event. On 2026-09-13 that next event was 37 minutes away: the version-loading probe
+reported thirteen versions present within a millisecond, the screen showed "1 of 14 · 1,862 entries",
+and it stood there through the whole catalog check over a run that was at 13 of 14. The same refusal
+swallowed the "rebuilding content indexes" label set right after an import's last row. A refused
+publish now arms a one-shot timer due at the end of the window, carrying whatever state the burst
+ended on; a real publish in the meantime cancels the debt, and a completed stage owes nothing (the
+final snapshot stays final). Under an injected clock nothing is armed, as with the heartbeat: the test
+drives time by hand.
+
 **The heartbeat**: a stall produces no events, so a 1-second timer does one publish. It runs **while
 the stage holds work** — not merely while a stream is open. Two guards are not optional — the callback
 first checks whether the stage is complete (a finished stage must not get a late extra snapshot, and

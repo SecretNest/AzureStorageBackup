@@ -1063,6 +1063,68 @@ public sealed class StageProgressTests
     }
 
     /// <summary>
+    /// The throttle must not eat the tail of a burst. Field, 2026-09-13: the version-loading probe reported thirteen
+    /// versions Present within a millisecond; the first publish went through, the other twelve were throttled, and
+    /// nothing published again until the next event — after a 37-minute catalog check. "1 of 14 · 1,862 entries"
+    /// stood for forty minutes over a run that was at 13 of 14. Without a stream open there is no heartbeat, so the
+    /// tracker itself has to owe a trailing publish at the end of the window.
+    /// </summary>
+    [Fact]
+    public async Task A_Throttled_Burst_Is_Published_At_The_End_Of_The_Window_With_No_Further_Event()
+    {
+        var seen = new ConcurrentQueue<StageProgress>();
+        var tracker = new StageTracker("LoadingVersions", total: 14, seen.Enqueue);
+
+        // Thirteen versions present, reported back to back, as VersionLoadAccounting does at the probe.
+        for (var i = 0; i < 13; i++)
+            tracker.Advance(0, work: 1000);
+
+        // Inside the window the screen may legitimately still show the first report. A comfortable margin past it —
+        // the trailing publish is due at 200 ms — and it must show the whole burst, with nothing having happened since.
+        await Task.Delay(600);
+        Assert.True(seen.TryPeek(out _));
+        var last = seen.Last();
+        tracker.Complete();
+        Assert.Equal(13, last.Processed);
+        Assert.Equal(13_000, last.WorkDone);
+    }
+
+    /// <summary>The same for a label: a <see cref="StageTracker.Touch"/> that follows a publish inside the window
+    /// ("… rebuilding content indexes", set right after the import's last row was booked) used to be the label the
+    /// screen never showed for the fifteen minutes it applied.</summary>
+    [Fact]
+    public async Task A_Touch_Inside_The_Window_Still_Reaches_The_Screen()
+    {
+        var seen = new ConcurrentQueue<StageProgress>();
+        var tracker = new StageTracker("UpdatingCatalog", total: 1, seen.Enqueue);
+        tracker.DeclareWork(10);
+        tracker.AdvanceWork(10);           // publishes
+        tracker.Touch("rebuilding");       // inside the window: throttled
+
+        await Task.Delay(600);
+        var last = seen.Last();
+        tracker.Complete();
+        Assert.Equal("rebuilding", last.CurrentItem);
+    }
+
+    /// <summary>A trailing publish owed at the moment the stage completes must not land after the final snapshot:
+    /// Complete() publishes the settled state and promises it is the last thing the UI sees.</summary>
+    [Fact]
+    public async Task No_Trailing_Publish_Lands_After_Complete()
+    {
+        var seen = new ConcurrentQueue<StageProgress>();
+        var tracker = new StageTracker("Diffing", total: 2, seen.Enqueue);
+        tracker.Advance(1);
+        tracker.Advance(1);                // throttled: a trailing publish is now owed
+        tracker.Complete();
+        var countAtComplete = seen.Count;
+
+        await Task.Delay(600);
+        Assert.Equal(countAtComplete, seen.Count);
+        Assert.Equal(2, seen.Last().Processed);
+    }
+
+    /// <summary>
     /// The heartbeat tests above all inject a fake clock — <c>Heartbeat(bool)</c> sees <c>Clock is not null</c> and
     /// returns early, never newing up the production <see cref="System.Threading.Timer"/> at all. Which means that if
     /// someone deleted the <c>Heartbeat(on: true)</c> line inside <c>BeginItem</c>, every test above would stay green
