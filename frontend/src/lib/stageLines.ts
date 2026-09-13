@@ -54,8 +54,8 @@ const STAGE_LABELS: Record<string, string> = {
   UpgradingCatalog: 'Upgrading catalog',
   Assessing: 'Assessing damage',
   WritingIndex: 'Writing index',
-  // The commit of the new version, named for the catalog import because that is what takes the time — minutes
-  // on a history of gigabytes. As "Finalizing", a stage that long read as a finish that would not finish.
+  // The commit of the new version, named for the catalog import: the step that is counted, in entries read off
+  // the index. As "Finalizing", a stage that long read as a finish that would not finish.
   UpdatingCatalog: 'Updating catalog',
 }
 

@@ -79,6 +79,18 @@ public sealed class CatalogV2Tests : IDisposable
         return (long)(await command.ExecuteScalarAsync())!;
     }
 
+    /// <summary>A version the catalog does not hold is not "the nearest version below it" and not "the newest": it
+    /// is nothing at all. Asked through every per-version reader, since the guard that says so is spelled into each
+    /// of their statements separately.</summary>
+    private static async Task AssertVersionAnswersNothingAsync(VersionCatalog catalog, int version)
+    {
+        Assert.Null(await catalog.GetEntryAsync(version, "a", CancellationToken.None));
+        Assert.Null(await catalog.GetEntryAsync(version, "b", CancellationToken.None));
+        Assert.Empty(await catalog.EntriesAsync(version, CancellationToken.None).ToListAsync());
+        Assert.Equal((0L, 0L), await catalog.StatsAsync(version, CancellationToken.None));
+        Assert.Empty(await catalog.ChildrenAsync(version, "", CancellationToken.None));
+    }
+
     private static VersionIndex Version(int version, params IndexEntry[] entries) => new()
     {
         Version = version,
@@ -197,6 +209,12 @@ public sealed class CatalogV2Tests : IDisposable
         Assert.Equal(3, await CountAsync(catalog, "SELECT COUNT(*) FROM entries"));   // a's [2,3) is unreachable
         Assert.Equal(Bytes(v1), await SerializeAsync(catalog, 1));
         Assert.Equal(Bytes(v3), await SerializeAsync(catalog, 3));
+
+        // The gap the removal left answers nothing, and neither does a version above the newest. Both are rows this
+        // fixture still holds — b's [1,∞) covers 2 and 99, and a's [3,∞) covers 99 — so what keeps them quiet is the
+        // per-version queries' "this version is retained" clause and nothing else.
+        await AssertVersionAnswersNothingAsync(catalog, 2);
+        await AssertVersionAnswersNothingAsync(catalog, 99);
 
         await catalog.RemoveVersionAsync(3, CancellationToken.None);                   // the newest
         Assert.Equal(2, await CountAsync(catalog, "SELECT COUNT(*) FROM entries"));   // a's [3,∞) goes; b stays as [1,∞)

@@ -445,7 +445,10 @@ It is never wrong: the indexes are derived from the rows, and no query depends o
 layout, and it is converted in place, without downloading anything, by the first write open that
 finds it:
 
-1. In one transaction: the old indexes are dropped and all six old tables are renamed aside to
+1. In one transaction: the old indexes are dropped — all but the two the conversion itself reads the old
+   rows through, `entries_seq` `(version, seq)` and `entries_path_key` `(version, path_key)`, which follow
+   their table through the rename below and keep both of step 3's reads a `SEARCH … USING INDEX` instead
+   of a primary-key search and a temp B-tree over the whole version — and all six old tables are renamed aside to
    `v1_versions`, `v1_entries`, `v1_dirs`, `v1_empty_dirs`, `v1_unrecoverable`, `v1_import_issues`; a
    bookkeeping table `upgrade_done` is created; and the v2 schema is created under the real names.
    `versions` goes aside with the rest, and that is the step the whole conversion turns on — the merge
@@ -454,7 +457,10 @@ finds it:
    current to compare against, and the result would be the format-1 shape written into the format-2
    tables: correct, and not one row smaller. The renames carry no `IF EXISTS`, because format 1's own
    schema pass created all six on every write open; a file missing one is not a format-1 catalog, and
-   failing here is the right answer.
+   failing here is the right answer. `entries_path_key` is a name format 2 uses too, on its own table and
+   its own key, and a `CREATE INDEX IF NOT EXISTS` under a name already taken is a silent no-op — so for
+   as long as the old table is being read the new one carries the same index under a name of the
+   conversion's own, and step 4 puts the real one back.
 2. The three content-keyed indexes are dropped for the whole conversion, for the reason above — every
    version would otherwise insert its rows into them at random over a history growing underneath it.
 3. Each version the `upgrade_done` table does not yet name, in ascending order, in a transaction of
@@ -463,7 +469,9 @@ finds it:
    legacy order is written if its `seq` order is not its path order, its import issues are copied, and
    its `upgrade_done` row goes in. One transaction per version is what makes the conversion resumable
    at a version boundary.
-4. The three indexes are rebuilt, before the stamp: a file that reads as converted has its indexes.
+4. The old table's `entries_path_key` is dropped, the real one is sorted onto the converted table and the
+   stand-in goes; then the three content-keyed indexes are rebuilt. Both before the stamp: a file that
+   reads as converted has exactly the indexes a catalog created by this build has.
 5. In one transaction: the `v1_*` tables and `upgrade_done` are dropped and `user_version` is set to
    2. **The stamp is the last thing written**, so a file without it is resumed rather than trusted.
 6. `VACUUM`, to reclaim the old rows' pages.

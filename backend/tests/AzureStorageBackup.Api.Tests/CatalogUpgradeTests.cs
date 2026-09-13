@@ -38,6 +38,51 @@ public sealed class CatalogUpgradeTests : IDisposable
         return (long)(await command.ExecuteScalarAsync())!;
     }
 
+    /// <summary>Every index the file declares, as (name, table) pairs — read off <c>sqlite_master</c>, so an index
+    /// that ended up on the wrong table, or under a name nothing creates, shows up as a difference.</summary>
+    private static async Task<List<(string Name, string Table)>> IndexesOnDiskAsync(string path)
+    {
+        await using var connection = new Microsoft.Data.Sqlite.SqliteConnection(CatalogSql.ConnectionString(path, readOnly: true));
+        await connection.OpenAsync();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT name, tbl_name FROM sqlite_master WHERE type='index' AND sql IS NOT NULL ORDER BY name";
+        await using var reader = await command.ExecuteReaderAsync();
+        var found = new List<(string, string)>();
+        while (await reader.ReadAsync())
+            found.Add((reader.GetString(0), reader.GetString(1)));
+        return found;
+    }
+
+    /// <summary>The columns an index is keyed by, in order: the v1 <c>entries_path_key</c> is <c>(version, path_key)</c>
+    /// and the v2 one is <c>(path_key)</c>, so this tells a borrowed name from the real thing.</summary>
+    private static async Task<List<string>> IndexColumnsAsync(string path, string index)
+    {
+        await using var connection = new Microsoft.Data.Sqlite.SqliteConnection(CatalogSql.ConnectionString(path, readOnly: true));
+        await connection.OpenAsync();
+        using var command = connection.CreateCommand();
+        command.CommandText = $"SELECT name FROM pragma_index_info('{index}') ORDER BY seqno";
+        await using var reader = await command.ExecuteReaderAsync();
+        var columns = new List<string>();
+        while (await reader.ReadAsync())
+            columns.Add(reader.GetString(0));
+        return columns;
+    }
+
+    /// <summary>The plan SQLite makes for a statement, as one line — <c>EXPLAIN QUERY PLAN</c>'s detail column.</summary>
+    private static async Task<string> PlanForAsync(string path, string sql)
+    {
+        await using var connection = new Microsoft.Data.Sqlite.SqliteConnection(CatalogSql.ConnectionString(path, readOnly: true));
+        await connection.OpenAsync();
+        using var command = connection.CreateCommand();
+        command.CommandText = "EXPLAIN QUERY PLAN " + sql;
+        command.Parameters.AddWithValue("@v", 1);
+        await using var reader = await command.ExecuteReaderAsync();
+        var lines = new List<string>();
+        while (await reader.ReadAsync())
+            lines.Add(reader.GetString(reader.GetOrdinal("detail")));
+        return string.Join(" | ", lines);
+    }
+
     private static async Task<byte[]> SerializeAsync(VersionCatalog catalog, int version)
     {
         using var ms = new MemoryStream();
@@ -70,6 +115,64 @@ public sealed class CatalogUpgradeTests : IDisposable
         Assert.Equal(5, await CatalogV2Tests.CountAsync(catalog, "SELECT COUNT(*) FROM entries"));
         var rows = await catalog.HistoryRowsAsync(CancellationToken.None);   // versions' declared counts survive
         Assert.Equal(history.Sum(v => v.Entries.Count), rows);
+    }
+
+    /// <summary>The conversion reads every version of the old table twice, once in path order and once in seq order.
+    /// Both reads have to come off a format-1 index: without one, each is a primary-key search plus a temp B-tree
+    /// over the whole version — the path-ordered one carrying the entire entry payload — and a sorter that runs out
+    /// of temp room raises a plain SqliteException, which the store answers by deleting the catalog and downloading
+    /// the history again.</summary>
+    [Fact]
+    public async Task The_conversion_reads_the_old_table_through_the_indexes_it_kept()
+    {
+        var store = new VersionCatalogStore(_root);
+        var path = store.PathFor(AccountId, Container);
+        await LegacyCatalogFixture.WriteAsync(path, History());
+
+        // Stop mid-conversion, so the file still holds the old tables the reads below are planned against.
+        using var cts = new CancellationTokenSource();
+        var stopAfterFirst = new InlineProgress<CatalogUpgradeProgress>(r => { if (r.VersionDone && r.Version == 1) cts.Cancel(); });
+        await Assert.ThrowsAnyAsync<OperationCanceledException>(() => store.UpgradeAsync(AccountId, Container, stopAfterFirst, cts.Token));
+
+        var byPath = await PlanForAsync(path, CatalogUpgrade.V1EntriesSql);
+        Assert.Contains("USING INDEX entries_path_key", byPath, StringComparison.Ordinal);
+        Assert.DoesNotContain("TEMP B-TREE", byPath, StringComparison.Ordinal);
+
+        var bySeq = await PlanForAsync(path, CatalogUpgrade.V1SeqOrderSql);
+        Assert.Contains("USING INDEX entries_seq", bySeq, StringComparison.Ordinal);
+        Assert.DoesNotContain("TEMP B-TREE", bySeq, StringComparison.Ordinal);
+
+        // And the other side of the same merge: the new table's covering cursor, which walks the rows current at the
+        // version being converted in path_key order. The real entries_path_key's name is still on the old table
+        // while the conversion runs, which is why the new table carries the same index under a name of its own.
+        var covering = await PlanForAsync(path,
+            "SELECT id, path_key FROM entries WHERE version_from <= @v AND version_to > @v ORDER BY path_key");
+        Assert.DoesNotContain("TEMP B-TREE", covering, StringComparison.Ordinal);
+    }
+
+    /// <summary>A converted file is indexed exactly like one this build created from scratch. The conversion borrows
+    /// the name <c>entries_path_key</c> for the old table for as long as it reads it, and a
+    /// <c>CREATE INDEX IF NOT EXISTS</c> under a borrowed name is a silent no-op — so "the schema pass ran" is not
+    /// evidence that the index is there, or that it is keyed the way format 2 needs.</summary>
+    [Fact]
+    public async Task A_converted_catalog_carries_exactly_the_indexes_a_fresh_one_does()
+    {
+        var store = new VersionCatalogStore(_root);
+        var path = store.PathFor(AccountId, Container);
+        await LegacyCatalogFixture.WriteAsync(path, History());
+        await store.UpgradeAsync(AccountId, Container, progress: null, CancellationToken.None);
+
+        var fresh = Path.Combine(_root, "fresh", "catalog.db");
+        Directory.CreateDirectory(Path.GetDirectoryName(fresh)!);
+        await (await VersionCatalog.OpenAsync(fresh, readOnly: false, CancellationToken.None)).DisposeAsync();
+
+        var converted = await IndexesOnDiskAsync(path);
+        Assert.Equal(await IndexesOnDiskAsync(fresh), converted);
+        Assert.Contains(("entries_path_key", "entries"), converted);
+        Assert.Contains(("entries_parent", "entries"), converted);
+        Assert.Contains(("dirs_parent", "dirs"), converted);
+        Assert.Equal(["path_key"], await IndexColumnsAsync(path, "entries_path_key"));       // not the v1 (version, path_key)
+        Assert.Equal(["parent", "path_key"], await IndexColumnsAsync(path, "entries_parent"));
     }
 
     [Fact]

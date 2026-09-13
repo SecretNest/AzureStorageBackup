@@ -29,9 +29,28 @@ internal static class CatalogUpgrade
     /// cloud rather than converting half a layout.
     /// </para>
     /// </summary>
+    /// <remarks>
+    /// Two of format 1's indexes stay up, because they are the ones this conversion reads the old rows through:
+    /// <c>entries_seq</c> <c>(version, seq)</c> for <see cref="V1SeqOrderSql"/> and <c>entries_path_key</c>
+    /// <c>(version, path_key)</c> for <see cref="V1EntriesSql"/>. An index follows its table through a rename, so
+    /// after the <c>ALTER</c>s below both sit on <c>v1_entries</c> and both queries stay a
+    /// <c>SEARCH … USING INDEX (version=?)</c>. Dropped, each of the two becomes a primary-key search plus a
+    /// <c>USE TEMP B-TREE FOR ORDER BY</c> — a sort of the whole version per version, the first of them carrying the
+    /// entire entry payload through the temp directory, where a sorter that runs out of room is an ordinary
+    /// <see cref="SqliteException"/> that the store answers by deleting the catalog and re-downloading the history.
+    /// <para>
+    /// <c>entries_seq</c> is free to keep: format 2 has no index of that name. <c>entries_path_key</c> is not — the
+    /// name is format 2's too, on a different table and a different key, and a <c>CREATE INDEX IF NOT EXISTS</c>
+    /// under a taken name is a silent no-op, so leaving it here would hand the converted file an entries table with
+    /// no <c>path_key</c> index at all. The name is therefore borrowed for the length of the conversion: the v2
+    /// table gets the same index under <see cref="UpgradeIndexSql"/>'s temporary name (free — it is created on an
+    /// empty table and filled as the versions land), and <see cref="SwapPathKeyIndexSql"/> puts the real one in its
+    /// place once the last old row has been read. Both halves are idempotent, so a conversion killed anywhere
+    /// resumes: the loop's own reads need the v1 index, and it is only dropped after the loop has none left to do.
+    /// </para>
+    /// </remarks>
     private const string BeginSql = """
-        DROP INDEX IF EXISTS entries_seq; DROP INDEX IF EXISTS entries_parent; DROP INDEX IF EXISTS entries_fold;
-        DROP INDEX IF EXISTS entries_path_key; DROP INDEX IF EXISTS entries_storage;
+        DROP INDEX IF EXISTS entries_parent; DROP INDEX IF EXISTS entries_fold; DROP INDEX IF EXISTS entries_storage;
         DROP INDEX IF EXISTS entries_content; DROP INDEX IF EXISTS entries_ref; DROP INDEX IF EXISTS entries_head;
         DROP INDEX IF EXISTS dirs_parent;
         ALTER TABLE versions RENAME TO v1_versions;
@@ -41,6 +60,25 @@ internal static class CatalogUpgrade
         ALTER TABLE unrecoverable RENAME TO v1_unrecoverable;
         ALTER TABLE import_issues RENAME TO v1_import_issues;
         CREATE TABLE upgrade_done (version INTEGER PRIMARY KEY);
+        """;
+
+    /// <summary>The v2 <c>entries (path_key)</c> index under a name of the conversion's own, because the real name is
+    /// still on the old table (see <see cref="BeginSql"/>). The merge every version goes through reads the rows
+    /// current at its predecessor in <c>path_key</c> order (<c>VersionCatalog.Import</c>'s covering cursor), so
+    /// without it the conversion would trade the old table's sort for a sort of the new one, per version. Created in
+    /// the same transaction as the schema, on a table that is still empty, so it costs nothing but the inserts it
+    /// then takes — which is what the real index would have cost anyway.</summary>
+    private const string UpgradeIndexSql = "CREATE INDEX IF NOT EXISTS upgrade_entries_path_key ON entries (path_key);";
+
+    /// <summary>Gives format 2 its <c>entries_path_key</c> back, once the loop has read the last old row: the name
+    /// goes down with the v1 index that held it, the real index is sorted onto the converted table (one sort and one
+    /// sequential write, like the content-keyed rebuild it runs next to), and the conversion's stand-in goes. Run
+    /// after the loop and before the stamp, so a kill in the middle leaves an unstamped file that the next open
+    /// resumes — its loop has nothing left to convert, and running this again simply rebuilds the index.</summary>
+    private const string SwapPathKeyIndexSql = """
+        DROP INDEX IF EXISTS entries_path_key;
+        CREATE INDEX IF NOT EXISTS entries_path_key ON entries (path_key);
+        DROP INDEX IF EXISTS upgrade_entries_path_key;
         """;
     private const string EndSql = """
         DROP TABLE v1_versions; DROP TABLE v1_entries; DROP TABLE v1_dirs; DROP TABLE v1_empty_dirs;
@@ -53,12 +91,12 @@ internal static class CatalogUpgrade
     private const string TotalVersionsSql = "SELECT COUNT(*) FROM v1_versions";
     private const string DoneVersionsSql = "SELECT COUNT(*) FROM upgrade_done";
     private const string DoneRowsSql = "SELECT COALESCE(SUM(v.entry_count), 0) FROM v1_versions v JOIN upgrade_done d ON d.version = v.version";
-    private const string V1EntriesSql = $"SELECT {EntryRowMapper.Columns} FROM v1_entries WHERE version=@v ORDER BY path_key";
-    private const string V1SeqOrderSql = "SELECT seq, path, path_key FROM v1_entries WHERE version=@v ORDER BY seq";
+    internal const string V1EntriesSql = $"SELECT {EntryRowMapper.Columns} FROM v1_entries WHERE version=@v ORDER BY path_key";
+    internal const string V1SeqOrderSql = "SELECT path_key FROM v1_entries WHERE version=@v ORDER BY seq";
+    private const string CopyOrderSql = "INSERT INTO entry_order (version, seq, path) SELECT @v, seq, path FROM v1_entries WHERE version=@v";
     private const string V1EmptyDirsSql = "SELECT path FROM v1_empty_dirs WHERE version=@v ORDER BY seq";
     private const string V1UnrecoverableSql = "SELECT path FROM v1_unrecoverable WHERE version=@v ORDER BY seq";
     private const string CopyIssuesSql = "INSERT OR IGNORE INTO import_issues (version, path, issue) SELECT version, path, issue FROM v1_import_issues WHERE version=@v";
-    private const string InsertOrderSql = "INSERT INTO entry_order (version, seq, path) VALUES (@v, @seq, @path)";
     private const string MarkDoneSql = "INSERT INTO upgrade_done (version) VALUES (@v)";
 
     /// <summary>On a thread of its own, like the import and the index rebuild it is made of: Microsoft.Data.Sqlite is
@@ -82,6 +120,12 @@ internal static class CatalogUpgrade
                 await command.ExecuteNonQueryAsync(ct);
             }
             CatalogSql.EnsureSchema(connection, begin);
+            using (var index = connection.CreateCommand())
+            {
+                index.Transaction = begin;
+                index.CommandText = UpgradeIndexSql;
+                await index.ExecuteNonQueryAsync(ct);
+            }
             await begin.CommitAsync(ct);
         }
 
@@ -127,6 +171,13 @@ internal static class CatalogUpgrade
             progress?.Report(new CatalogUpgradeProgress(version, done, total, VersionDone: true, versionsDone, versionsTotal));
         }
 
+        // The old rows have all been read, so the borrowed name goes back to format 2 (see SwapPathKeyIndexSql).
+        using (var swap = connection.CreateCommand())
+        {
+            swap.CommandText = SwapPathKeyIndexSql;
+            await swap.ExecuteNonQueryAsync(ct);
+        }
+
         // The other half of the bracket, before the stamp: a file that reads as converted has its indexes.
         await catalog.RebuildGlobalIndexesAsync(ct);
 
@@ -163,10 +214,13 @@ internal static class CatalogUpgrade
     }
 
     /// <summary>A version whose <c>seq</c> order is not its path order (pre-M4 builds) gets an order table, so it
-    /// serializes as it came. The check is one pass over the version's rows in seq order.</summary>
+    /// serializes as it came. The check is one pass over the version's <c>path_key</c>s in seq order, and nothing
+    /// else: almost every version is in path order, and a version that is holds no order table at all, so reading
+    /// the rows into a list to decide that would be a hundred megabytes of live allocation per million entries —
+    /// inside the version's own transaction — thrown away. The rare version that does need the table is copied
+    /// across in SQL (<see cref="CopyOrderSql"/>), one statement, nothing of it in memory.</summary>
     private static async Task RecordOrderIfNotPathOrderAsync(VersionCatalog catalog, int version, CancellationToken ct)
     {
-        var order = new List<(int Seq, string Path)>();
         var inPathOrder = true;
         byte[]? last = null;
         using (var command = catalog.CreateCommand(V1SeqOrderSql))
@@ -175,23 +229,18 @@ internal static class CatalogUpgrade
             await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
             while (await reader.ReadAsync(ct))
             {
-                var key = (byte[])reader["path_key"];
+                var key = (byte[])reader[0];
                 if (last is not null && key.AsSpan().SequenceCompareTo(last) < 0)
+                {
                     inPathOrder = false;
+                    break;
+                }
                 last = key;
-                order.Add((reader.GetInt32(0), reader.GetString(1)));
             }
         }
         if (inPathOrder)
             return;
-        using var insert = catalog.CreateCommand(InsertOrderSql);
-        foreach (var (seq, path) in order)
-        {
-            EntryRowMapper.Set(insert, "@v", version);
-            EntryRowMapper.Set(insert, "@seq", seq);
-            EntryRowMapper.Set(insert, "@path", path);
-            await insert.ExecuteNonQueryAsync(ct);
-        }
+        await ExecAsync(catalog, CopyOrderSql, version, ct);
     }
 
     private static async IAsyncEnumerable<IndexEntry> V1Entries(VersionCatalog catalog, int version, [EnumeratorCancellation] CancellationToken ct)
