@@ -45,6 +45,12 @@ Two bounds apply at once: **member count and byte total**.
 > of members costs real memory in the 7z process regardless of how small those members are. A byte
 > bound alone misses the first; a count bound alone misses the second.
 
+`GroupCapBytes` also sets the 7z process's **peak memory**, and by far the larger share of it: 7-Zip
+sizes its dictionary from the input, so a full 100 MB pack tops out at `-mx9`'s 64 MB dictionary and
+costs roughly 800 MB resident — per pack, once per pack, in a process the backend's own memory
+figures do not count. Measured, with the sizing rule for `mem_limit`, in
+[operations.md](operations.md) § *Memory*.
+
 ## Member deduplication
 
 Three layers, each covering what the one before it cannot:
