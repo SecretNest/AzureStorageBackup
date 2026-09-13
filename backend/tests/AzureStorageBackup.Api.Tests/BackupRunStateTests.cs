@@ -115,6 +115,23 @@ public class BackupRunStateTests
         Assert.True(At(BackupStage.CleaningUp).WrappingUp);
     }
 
+    /// <summary>
+    /// One stage further on, the pipeline itself is over and only the run's own bookkeeping is left — the change
+    /// counts, the operation log, the success webhook, the status write — while the state still reports Running.
+    /// That window is what put "Completed (0 changed)" on the row next to a live Stop button, and Stop is refused
+    /// from here because its meaning was "skip the cleanup" and the cleanup has already run.
+    /// </summary>
+    [Fact]
+    public void PipelineFinished_is_the_terminal_stage_alone()
+    {
+        Assert.False(new BackupRunState().PipelineFinished);   // nothing reported yet: a run still starting
+        Assert.False(At(BackupStage.UpdatingCatalog).PipelineFinished);
+        Assert.False(At(BackupStage.CleaningUp).PipelineFinished);
+        Assert.True(At(BackupStage.Completed).PipelineFinished);
+        // It narrows the older predicate rather than replacing it: Pause is still refused for the whole wrap-up.
+        Assert.True(At(BackupStage.Completed).WrappingUp);
+    }
+
     /// <summary>The conversion of a format-1 catalog runs between the scan and the version load — before the load,
     /// whose write open would otherwise do it silently — and is emphatically not the wrap-up: every upload is still
     /// ahead of it, and a run that answered "wrapping up" here would refuse Suspend for the length of the history.</summary>

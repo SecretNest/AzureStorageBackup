@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'vitest'
-import { windDownControls, windDownFromServer } from './windDownControls'
+import { BackupStage } from '../api/backupConfigs'
+import { runIsSettled, windDownControls, windDownFromServer } from './windDownControls'
 
 describe('windDownFromServer', () => {
   /**
@@ -146,5 +147,24 @@ describe('loading the version history', () => {
     const c = windDownControls('suspend', false, 'LoadingVersions')
     expect(c.canPause).toBe(false)
     expect(c.pauseHint).toBeUndefined()
+  })
+})
+
+describe('a run whose pipeline has finished', () => {
+  test('settles only at the terminal stage: the wrap-up still has controls worth offering', () => {
+    expect(runIsSettled(BackupStage.Uploading)).toBe(false)
+    expect(runIsSettled(BackupStage.WritingIndex)).toBe(false)
+    expect(runIsSettled(BackupStage.UpdatingCatalog)).toBe(false)
+    expect(runIsSettled(BackupStage.CleaningUp)).toBe(false)
+    expect(runIsSettled(BackupStage.Completed)).toBe(true)
+  })
+
+  test('the wrap-up rule alone left Stop live, which is what put a live button under "Completed"', () => {
+    // Pause and Suspend were already refused from the index write on; Stop was not, because it still
+    // meant "skip the cleanup" — a meaning that runs out exactly when the cleanup does.
+    const wrappingUp = windDownControls(undefined, true)
+    expect(wrappingUp.canActOnGate).toBe(false)
+    expect(wrappingUp.canStop).toBe(true)
+    expect(runIsSettled(BackupStage.Completed)).toBe(true)
   })
 })

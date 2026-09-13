@@ -605,6 +605,16 @@ minutes, so this is a whole stage rather than a race window. The UI greys the sa
 greys during a wind-down (`windDownControls`), with a tooltip saying why. Stop is left alone: it still
 means "skip the cleanup", which is a real thing to ask for.
 
+**And one stage further on, the controls go rather than grey.** The pipeline reports `Completed` when
+it ends, but the run stays `Running` while it records its result — the change counts in three SQL
+passes over the draft, the operation-log line, the success webhook (over the network, and the long one
+of the four), the config's status write. For all of that the row said "Completed (0 changed)" above a
+live Stop button, because Stop's exemption above was written for a cleanup that has by then already
+run. `BackupRunState.PipelineFinished` (stage = `Completed`) refuses every stop kind in `RequestStop`,
+the cancel endpoint answers it apart from "nothing is running" — the row says Running, so that wording
+would contradict the screen — and the UI drops the whole button group (`runIsSettled`) rather than
+greying a fourth control under a word that says the work is over.
+
 **Loading versions** (between the scan and the diff) greys Pause alone. The pass consults no gate —
 an import is one transaction per version, and parking inside one would hold the container's write
 lock for the length of the pause — so it is counted as in hand like the scan, and a Pause pressed
