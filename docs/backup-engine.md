@@ -84,9 +84,9 @@ and the next run resyncs.
 
 Once the info file is committed, the version is imported into the container's local catalog by
 reading back the very file that went to the cloud (see [content-identity.md](content-identity.md)),
-and only then is the journal deleted. The import is the long part: every entry of the new version
-goes in, not only the changed ones, and on a history of gigabytes that is minutes of random B-tree
-inserts. On screen the whole step is the **Updating catalog** stage, counted in entries
+and only then is the journal deleted. The import walks that file against the rows the catalog already
+holds for the previous version and writes only the changes ([storage-format.md](storage-format.md)).
+On screen the whole step is the **Updating catalog** stage, counted in entries
 ([progress-display.md](progress-display.md)) — it was called Finalizing until 2026-09-12, and under
 that name a ten-minute import read as a finish that would not finish.
 

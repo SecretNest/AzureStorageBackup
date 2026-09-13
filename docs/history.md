@@ -78,6 +78,7 @@ interruptibility under real data volumes. All of it is merged into `main`.
 | 09-13 | One container-log line per stage change of a backup run (`Backup 'name' (config N): Stage`), so a run's timeline is in `docker logs` rather than only on the screen | [progress-display.md](progress-display.md) |
 | 09-13 | The catalog's long SQLite operations — version import, index rebuild, `quick_check` — run on a dedicated thread instead of a thread-pool worker (Kestrel had logged thread-pool starvation through a whole run) | [storage-format.md](storage-format.md) |
 | 09-13 | The diff logs where its time went when it ends: previous rows read, entries settled by metadata, head/tail-hashed, read in full and the bytes — a 61-minute diff over 1.1 M files had only a file count to explain it | [progress-display.md](progress-display.md) |
+| 09-13 | Catalog format 2: one `entries` row per path per change over a version interval, an integer key so the eight indexes carry a pointer instead of a path copy, imports as a path-ordered merge that writes only the changes, in-place conversion of format-1 files on their own stage | [storage-format.md](storage-format.md) |
 
 ### The migration that read 30 GB to write 1 GB (2026.9.8.3)
 

@@ -145,9 +145,9 @@ public enum BackupStage
     Diffing,
     Uploading,
     WritingIndex,
-    /// <summary>The new version being committed: the info file, then every one of its entries into the local
-    /// catalog, then the journal. Named for the import because that is what takes the time — minutes on a
-    /// history of gigabytes — and as "Finalizing" a stage that long read as a finish that would not finish.</summary>
+    /// <summary>The new version being committed: the info file, then the version into the local catalog, then the
+    /// journal. Named for the import, which is the step that is counted (in entries read off the index) — and as
+    /// "Finalizing" a stage that long read as a finish that would not finish.</summary>
     UpdatingCatalog,
     CleaningUp,
     Completed,
@@ -2277,11 +2277,10 @@ public sealed class BackupOrchestrator(
 
         // The info file is committed → record the version in the local catalog, by reading back the very file that
         // went to the cloud rather than by re-deriving the entries from the draft. That is what makes "the catalog
-        // holds exactly what the container holds" true by construction, seq order included, instead of true as long
+        // holds exactly what the container holds" true by construction, entry order included, instead of true as long
         // as two pieces of code keep agreeing.
-        var catalogLabel = $"version {version} → catalog.db ({ByteSize.Human(catalogs.CatalogBytes(request.Account.Id, request.Container))})";
-        committing.Touch(catalogLabel);
-        await ImportIntoCatalogAsync(request, version, identity, serialized, committing, catalogLabel, ct);
+        committing.Touch($"version {version} → catalog.db ({ByteSize.Human(catalogs.CatalogBytes(request.Account.Id, request.Container))})");
+        await ImportIntoCatalogAsync(request, version, identity, serialized, committing, ct);
         // The last reader of it is gone. Dropped here rather than left to the scope below, because what follows is
         // retention cleanup, which downloads and repacks archives onto the same temp volume — an index at a few
         // million entries is hundreds of MB, and there is no reason for it to be lying there while that runs.
@@ -2500,7 +2499,7 @@ public sealed class BackupOrchestrator(
     /// </para>
     /// </summary>
     private async Task ImportIntoCatalogAsync(
-        BackupRequest request, int version, long identity, string serialized, StageTracker progress, string catalogLabel,
+        BackupRequest request, int version, long identity, string serialized, StageTracker progress,
         CancellationToken ct)
     {
         // Rows booked on the tracker so far. Kept across the retry rather than reset with it: the second attempt's
@@ -2519,15 +2518,9 @@ public sealed class BackupOrchestrator(
                         held, request.Account.Id, request.Container, ct);
                     await using var file = File.OpenRead(serialized);
                     using var reader = new IndexStreamReader(file);
-                    // The same bracket the migration takes, by size: a version that is a real share of the history
-                    // goes in with the content-keyed indexes down and sorts them back once, instead of a random
-                    // page read per row per index (VersionCatalog.PrefersRebuild for the numbers). Outside the
-                    // import's transaction, as in EnsureVersionsAsync: a process that dies between the two leaves a
-                    // catalog without the three, slower to query and never wrong, and the next write open's schema
-                    // pass puts them back. The retry's DROP IF EXISTS is a no-op on a catalog already without them.
-                    var bulk = VersionCatalog.PrefersRebuild(reader.EntryCount, await catalog.HistoryRowsAsync(ct));
-                    if (bulk)
-                        await catalog.DropGlobalIndexesAsync(ct);
+                    // On format 2 a version inserts only its changes into the content-keyed indexes, so the run's
+                    // own import takes no bracket. EnsureVersionsAsync keeps one for a migration of several
+                    // missing versions (VersionCatalog.PrefersRebuild).
                     await catalog.ImportVersionAsync(version, identity, reader, ct, seen =>
                     {
                         if (seen <= booked)
@@ -2537,13 +2530,6 @@ public sealed class BackupOrchestrator(
                     });
                     progress.AdvanceWork(reader.EntryCount - booked);
                     booked = reader.EntryCount;
-                    if (bulk)
-                    {
-                        // Minutes on a big history, with the entries figure already at its total: the item line has
-                        // to say what the wait is, or 100% standing still is the hang this stage was renamed over.
-                        progress.Touch($"{catalogLabel}, rebuilding content indexes");
-                        await catalog.RebuildGlobalIndexesAsync(ct);
-                    }
                     return;
                 }
                 catch (Exception ex) when (attempt == 1 && ex is not OperationCanceledException)
