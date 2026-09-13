@@ -7,47 +7,58 @@ namespace AzureStorageBackup.Api.Services;
 
 /// <summary>
 /// The read side of the catalog: browsing one directory at a time, the dedup lookups that used to be in-memory
-/// dictionaries, and the whole-file questions retention and repair ask. Split off <c>VersionCatalog.cs</c> (which
-/// holds opening, import, serialization and patching) purely for size — one class, two files.
+/// dictionaries, and the whole-file questions retention and repair ask. Split off <c>VersionCatalog.cs</c> (opening,
+/// versions, serialization and patching) and <c>VersionCatalog.Import.cs</c> (the merge that writes a version) purely
+/// for size — one class, three files.
 /// </summary>
 public sealed partial class VersionCatalog
 {
-    private const string SelectEntrySql = $"SELECT {EntryRowMapper.Columns} FROM entries WHERE version=@v AND path=@path";
+    /// <summary>A version the catalog does not hold answers nothing at all, as it did when every row named one
+    /// version. Without this an open-ended row would report the newest version's content under any later number, and
+    /// a gap retention left behind would report its predecessor's. Uncorrelated, so SQLite evaluates it once per
+    /// statement against the <c>versions</c> primary key.</summary>
+    private const string Retained = "EXISTS (SELECT 1 FROM versions WHERE version=@v)";
+
+    /// <summary>The interval filter every per-version query wears: the row whose <c>[version_from, version_to)</c>
+    /// contains <c>@v</c> is what the path looked like at that version.</summary>
+    private const string Current = $"version_from <= @v AND version_to > @v AND {Retained}";
+
+    private const string SelectEntrySql = $"SELECT {EntryRowMapper.Columns} FROM entries WHERE path=@path AND {Current}";
 
     /// <summary>Ordered by the UTF-16BE <c>path_key</c>, not the <c>path</c> TEXT column: this is the cursor the diff
     /// merges against the run's scan cursor (<c>RunWorkDb.ScanOrderedAsync</c>), and both have to agree on ordinal
     /// order for a surrogate pair to land in the same place on each side. See <see cref="CatalogSql.PathKey"/>.</summary>
-    private const string SelectEntriesByPathSql = $"SELECT {EntryRowMapper.Columns} FROM entries WHERE version=@v ORDER BY path_key";
+    private const string SelectEntriesByPathSql = $"SELECT {EntryRowMapper.Columns} FROM entries WHERE {Current} ORDER BY path_key";
 
     private const string SelectEntriesByStorageSql =
-        $"SELECT {EntryRowMapper.Columns} FROM entries WHERE version=@v ORDER BY storage_kind, storage_ref, seq";
+        $"SELECT {EntryRowMapper.Columns} FROM entries WHERE {Current} ORDER BY storage_ref, storage_kind, path_key";
 
     /// <summary>A directory's subdirectories, each already told whether it is worth expanding, so the UI's next click is a lookup rather than a guess.</summary>
-    private const string SelectChildDirsSql = """
+    private const string SelectChildDirsSql = $"""
         SELECT d.path,
-               EXISTS (SELECT 1 FROM entries e WHERE e.version=@v AND e.parent=d.path)
-            OR EXISTS (SELECT 1 FROM dirs c WHERE c.version=@v AND c.parent=d.path)
-        FROM dirs d WHERE d.version=@v AND d.parent=@parent ORDER BY d.path
+               EXISTS (SELECT 1 FROM entries e WHERE e.parent=d.path AND e.version_from <= @v AND e.version_to > @v)
+            OR EXISTS (SELECT 1 FROM dirs c WHERE c.parent=d.path AND c.version_from <= @v AND c.version_to > @v)
+        FROM dirs d WHERE d.parent=@parent AND d.version_from <= @v AND d.version_to > @v AND {Retained} ORDER BY d.path
         """;
 
-    private const string SelectChildEntriesSql = $"SELECT {EntryRowMapper.Columns} FROM entries WHERE version=@v AND parent=@parent ORDER BY path";
+    private const string SelectChildEntriesSql = $"SELECT {EntryRowMapper.Columns} FROM entries WHERE parent=@parent AND {Current} ORDER BY path";
 
     private const string SelectUnreadableSql =
-        "SELECT path, unreadable_ticks, unreadable_offset FROM entries WHERE version=@v AND unreadable_ticks IS NOT NULL ORDER BY seq";
+        $"SELECT path, unreadable_ticks, unreadable_offset FROM entries WHERE {Current} AND unreadable_ticks IS NOT NULL ORDER BY path_key";
 
-    private const string SelectStatsSql = "SELECT COUNT(*), COALESCE(SUM(length), 0) FROM entries WHERE version=@v";
+    private const string SelectStatsSql = $"SELECT COUNT(*), COALESCE(SUM(length), 0) FROM entries WHERE {Current}";
 
     private const string IsUnrecoverableSql = "SELECT EXISTS (SELECT 1 FROM unrecoverable WHERE version=@v AND path=@path)";
 
     /// <summary>The entries a local-root comparison may look at: everything except the ones whose size and mtime were
     /// carried over from an earlier version and so were never guaranteed to match the disk.</summary>
     private const string SelectComparableEntriesSql =
-        $"SELECT {EntryRowMapper.Columns} FROM entries WHERE version=@v AND unreadable_ticks IS NULL ORDER BY seq";
+        $"SELECT {EntryRowMapper.Columns} FROM entries WHERE {Current} AND unreadable_ticks IS NULL ORDER BY path_key";
 
     /// <summary>Paths that differ only in case: on a case-insensitive restore target they would overwrite one another, so a check has to report them.</summary>
-    private const string SelectCaseCollisionsSql = """
-        SELECT path, version FROM entries WHERE version=@v AND path_fold IN
-          (SELECT path_fold FROM entries WHERE version=@v GROUP BY path_fold HAVING COUNT(*) > 1)
+    private const string SelectCaseCollisionsSql = $"""
+        SELECT path, @v FROM entries WHERE {Current} AND path_fold IN
+          (SELECT path_fold FROM entries WHERE {Current} GROUP BY path_fold HAVING COUNT(*) > 1)
         ORDER BY path_fold, path
         """;
 
@@ -55,7 +66,7 @@ public sealed partial class VersionCatalog
     private const string FindBlobByContentSql = """
         SELECT storage_ref, raw, volumes, volume_sizes FROM entries
         WHERE full_hash=@f AND length=@l AND head_hash IS @h AND tail_hash IS @t AND storage_kind='blob' AND unrecoverable=0
-        ORDER BY version DESC LIMIT 1
+        ORDER BY version_from DESC LIMIT 1
         """;
 
     // Healthy rows first (latest wins among them), damaged rows only as a fallback (earliest wins) — the precedence
@@ -70,7 +81,7 @@ public sealed partial class VersionCatalog
     private const string FindRefOwnerSql = """
         SELECT full_hash, length, head_hash, tail_hash, unrecoverable FROM entries
         WHERE storage_ref=@r AND storage_kind='blob' AND full_hash IS NOT NULL
-        ORDER BY unrecoverable ASC, CASE WHEN unrecoverable THEN version ELSE -version END ASC LIMIT 1
+        ORDER BY unrecoverable ASC, CASE WHEN unrecoverable THEN version_from ELSE -version_from END ASC LIMIT 1
         """;
 
     private const string IsDamagedRefSql =
@@ -86,7 +97,7 @@ public sealed partial class VersionCatalog
     private const string FindPackMemberSql = """
         SELECT storage_ref, COALESCE(entry_name, path), tail_hash FROM entries
         WHERE full_hash=@f AND length=@l AND head_hash=@h AND storage_kind='pack' AND unrecoverable=0
-        ORDER BY version ASC, seq ASC LIMIT 1
+        ORDER BY version_from ASC, path_key ASC LIMIT 1
         """;
 
     /// <summary>One row per (kind, ref, volume count), not per ref: the orphan sweep protects <b>every volume</b> of
@@ -103,14 +114,22 @@ public sealed partial class VersionCatalog
     private const string SelectLivePackMembersSql = """
         SELECT storage_ref, COALESCE(entry_name, path), length, full_hash FROM entries
         WHERE storage_kind='pack' AND full_hash IS NOT NULL
-        ORDER BY storage_ref, COALESCE(entry_name, path), version DESC
+        ORDER BY storage_ref, COALESCE(entry_name, path), version_from DESC
         """;
 
-    private const string SelectEntriesReferencingSql =
-        $"SELECT version, {EntryRowMapper.Columns} FROM entries WHERE storage_ref=@r ORDER BY version, seq";
+    /// <summary>One interval row stands for every version in its interval; the join with <c>versions</c> expands it
+    /// back to the one-row-per-version shape repair reads.</summary>
+    private static readonly string SelectEntriesReferencingSql = $"""
+        SELECT v.version, {EntryRowMapper.PrefixedColumns("e.")} FROM entries e
+        JOIN versions v ON v.version >= e.version_from AND v.version < e.version_to
+        WHERE e.storage_ref=@r ORDER BY v.version, e.path_key
+        """;
 
-    private const string SelectPackMembersSql =
-        $"SELECT version, {EntryRowMapper.Columns} FROM entries WHERE storage_kind='pack' AND storage_ref=@r ORDER BY version, seq";
+    private static readonly string SelectPackMembersSql = $"""
+        SELECT v.version, {EntryRowMapper.PrefixedColumns("e.")} FROM entries e
+        JOIN versions v ON v.version >= e.version_from AND v.version < e.version_to
+        WHERE e.storage_kind='pack' AND e.storage_ref=@r ORDER BY v.version, e.path_key
+        """;
 
     private const string SelectUnrecoverableAnyVersionSql = "SELECT DISTINCT path FROM unrecoverable ORDER BY path";
 
@@ -131,9 +150,9 @@ public sealed partial class VersionCatalog
     /// its download denominator (that total is all-or-nothing by design).
     /// </para>
     /// Grouped, so the result is bounded by the number of packs and blobs rather than by the entry count.</summary>
-    private const string SelectStorageGroupSizesSql = """
+    private const string SelectStorageGroupSizesSql = $"""
         SELECT storage_kind, storage_ref, NULL AS entry_name, volumes, raw, volume_sizes, SUM(length)
-        FROM entries WHERE version=@v AND storage_kind IS NOT NULL AND unrecoverable=0
+        FROM entries WHERE {Current} AND storage_kind IS NOT NULL AND unrecoverable=0
         GROUP BY storage_kind, storage_ref ORDER BY storage_kind, storage_ref
         """;
 
@@ -200,7 +219,7 @@ public sealed partial class VersionCatalog
         {
             ct.ThrowIfCancellationRequested();
             var placeholders = string.Join(", ", Enumerable.Range(0, chunk.Length).Select(i => $"@p{i}"));
-            using var command = Command($"SELECT {EntryRowMapper.Columns} FROM entries WHERE version=@v AND path IN ({placeholders})");
+            using var command = Command($"SELECT {EntryRowMapper.Columns} FROM entries WHERE {Current} AND path IN ({placeholders})");
             Set(command, "@v", version);
             for (var i = 0; i < chunk.Length; i++)
                 Set(command, $"@p{i}", chunk[i]);
@@ -263,7 +282,7 @@ public sealed partial class VersionCatalog
         for (var bucket = 0; bucket < counts.Length; bucket++)
         {
             using var count = Command(
-                $"SELECT COUNT(*) FROM entries WHERE version=@v AND unreadable_ticks IS NULL AND {SamplePlan.Predicate(bucket)}");
+                $"SELECT COUNT(*) FROM entries WHERE {Current} AND unreadable_ticks IS NULL AND {SamplePlan.Predicate(bucket)}");
             Set(count, "@v", version);
             counts[bucket] = Convert.ToInt32(await count.ExecuteScalarAsync(ct));
             pool += counts[bucket];
@@ -290,8 +309,8 @@ public sealed partial class VersionCatalog
             // One prepared statement per bucket, re-bound per offset: the picked positions are spread across the
             // bucket, so they cannot be collapsed into a single range.
             using var pick = Command(
-                $"SELECT {EntryRowMapper.Columns} FROM entries WHERE version=@v AND unreadable_ticks IS NULL " +
-                $"AND {SamplePlan.Predicate(bucket)} ORDER BY seq LIMIT 1 OFFSET @n");
+                $"SELECT {EntryRowMapper.Columns} FROM entries WHERE {Current} AND unreadable_ticks IS NULL " +
+                $"AND {SamplePlan.Predicate(bucket)} ORDER BY path_key LIMIT 1 OFFSET @n");
             Set(pick, "@v", version);
             foreach (var offset in SamplePlan.Offsets(counts[bucket], quotas[bucket]))
             {
@@ -317,10 +336,10 @@ public sealed partial class VersionCatalog
         return rows;
     }
 
-    /// <summary>What the import had to drop on the floor, path by path. Today that is only <c>duplicate</c>: the
-    /// primary key cannot hold the same path twice, so the first row won and the rest were recorded here — which is
-    /// how a reader still learns that the version contradicted itself at that path, rather than being handed the
-    /// arbitrary survivor as if it were authoritative.</summary>
+    /// <summary>What the import had to drop on the floor, path by path. Today that is only <c>duplicate</c>: a path
+    /// the version names twice gets one row, the first one won, and the rest were recorded here — which is how a
+    /// reader still learns that the version contradicted itself at that path, rather than being handed the arbitrary
+    /// survivor as if it were authoritative.</summary>
     public async Task<IReadOnlyList<(string Path, string Issue)>> ImportIssuesAsync(int version, CancellationToken ct)
     {
         using var command = Command(SelectImportIssuesSql);
@@ -425,7 +444,8 @@ public sealed partial class VersionCatalog
             yield return (reader.GetString(0), reader.GetString(1), reader.GetInt32(2));
     }
 
-    /// <summary>Refs these versions reference and no other version does — exactly what may be deleted when they are retired.</summary>
+    /// <summary>Refs whose every row is reachable only through these versions — exactly what may be deleted when they
+    /// are retired.</summary>
     public async Task<IReadOnlyList<string>> RefsOnlyInAsync(IReadOnlyCollection<int> versions, string kind, CancellationToken ct)
     {
         if (versions.Count == 0)
@@ -435,9 +455,11 @@ public sealed partial class VersionCatalog
         // ints straight off the info file's version numbers, so there is nothing here a string could smuggle in.
         var list = string.Join(", ", versions.Select(v => v.ToString(CultureInfo.InvariantCulture)));
         using var command = Command($"""
-            SELECT DISTINCT e.storage_ref FROM entries e
-            WHERE e.version IN ({list}) AND e.storage_kind=@k AND e.storage_ref IS NOT NULL
-              AND NOT EXISTS (SELECT 1 FROM entries o WHERE o.storage_ref=e.storage_ref AND o.storage_kind=@k AND o.version NOT IN ({list}))
+            SELECT e.storage_ref FROM entries e
+            WHERE e.storage_kind=@k AND e.storage_ref IS NOT NULL
+            GROUP BY e.storage_ref
+            HAVING SUM(EXISTS (SELECT 1 FROM versions v WHERE v.version NOT IN ({list}) AND v.version >= e.version_from AND v.version < e.version_to)) = 0
+               AND SUM(EXISTS (SELECT 1 FROM versions v WHERE v.version IN ({list}) AND v.version >= e.version_from AND v.version < e.version_to)) > 0
             ORDER BY e.storage_ref
             """);
         Set(command, "@k", kind);

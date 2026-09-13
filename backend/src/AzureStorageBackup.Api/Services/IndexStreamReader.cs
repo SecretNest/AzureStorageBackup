@@ -21,14 +21,21 @@ public sealed class IndexStreamReader : IDisposable
     public int EntryCount { get; }
 
     /// <summary>The stream this reader parses. The catalog's import makes two passes over an index — the lists at
-    /// the tail first, then the entries — and does so by seeking this stream back to zero and building a second
-    /// reader on it; it requires <c>CanSeek</c> and throws otherwise.</summary>
+    /// the tail first, then the entries — and does so by seeking this stream back to <see cref="Start"/> and building
+    /// a second reader on it; it requires <c>CanSeek</c> and throws otherwise.</summary>
     public Stream Input { get; }
+
+    /// <summary>Where the index begins in <see cref="Input"/>, which is not always zero: a cached <c>.idx</c> file
+    /// carries its own 24-byte header, and <see cref="VersionIndexFileStore.OpenBodyAsync"/> hands over the stream
+    /// positioned just past it. Zero for a stream that cannot seek, which is a stream nobody may make a second pass
+    /// over anyway.</summary>
+    public long Start { get; }
 
     /// <summary>Reads the header eagerly (format/version/entryCount) so callers can size buffers before pulling entries.</summary>
     public IndexStreamReader(Stream input)
     {
         Input = input;
+        Start = input.CanSeek ? input.Position : 0;
         _r = new BinaryReader(input, Encoding.UTF8, leaveOpen: true);
 
         Format = _r.ReadByte();

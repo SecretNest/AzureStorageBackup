@@ -270,15 +270,19 @@ public sealed class VersionCatalogTests : IDisposable
         await using var catalog = await OpenAsync();
         using (var reader = new IndexStreamReader(new MemoryStream(LegacyIndexSerializer.SerializeIndex(index))))
             await catalog.ImportVersionAsync(1, identity: 1, reader, CancellationToken.None);
-        foreach (var table in Tables)
+        foreach (var table in VersionTables)
             Assert.True(CountRows(table, 1) > 0, $"{table} should have rows before the version is removed");
+        foreach (var table in IntervalTables)
+            Assert.True(CountAll(table) > 0, $"{table} should have rows before the version is removed");
 
         await catalog.RemoveVersionAsync(1, CancellationToken.None);
 
         Assert.Empty(await catalog.ListVersionsAsync(CancellationToken.None));
         Assert.Null(await catalog.GetVersionAsync(1, CancellationToken.None));
-        foreach (var table in Tables)
+        foreach (var table in VersionTables)
             Assert.Equal(0, CountRows(table, 1));
+        foreach (var table in IntervalTables)
+            Assert.Equal(0, CountAll(table));
     }
 
     // ---- Test 9: repair's patches ----------------------------------------------------------------------------
@@ -465,12 +469,18 @@ public sealed class VersionCatalogTests : IDisposable
         Assert.Equal(3, (await catalog.GetEntryAsync(1, "kept.txt", CancellationToken.None))!.Length);
         Assert.Empty(await catalog.EmptyDirsAsync(1, CancellationToken.None));
         Assert.Empty(await catalog.UnrecoverableAsync(1, CancellationToken.None));
-        Assert.Equal(0, CountRows("dirs", 1));
+        // The empty directory the first import made browsable is gone with it: the version's only child is the file.
+        Assert.Equal(["kept.txt"], (await catalog.ChildrenAsync(1, "", CancellationToken.None)).Select(c => c.Name));
     }
 
     // ---- Helpers ------------------------------------------------------------------------------------------------
 
-    private static readonly string[] Tables = ["entries", "dirs", "empty_dirs", "unrecoverable", "import_issues"];
+    /// <summary>The tables that name one version per row, and so can be counted for a version.</summary>
+    private static readonly string[] VersionTables = ["empty_dirs", "unrecoverable", "import_issues"];
+
+    /// <summary>The tables whose rows span a range of versions instead of naming one. "Nothing left behind" is a
+    /// count of the whole table here, which these tests can make because they retire the only version there is.</summary>
+    private static readonly string[] IntervalTables = ["entries", "dirs"];
 
     private static IndexEntry Entry(string path, long length, string? hash = null, StorageRef? storage = null) => new()
     {
@@ -547,6 +557,16 @@ public sealed class VersionCatalogTests : IDisposable
 
     /// <summary>Reads the tables the public API deliberately does not expose (row counts, import issues) through a second connection.</summary>
     private long CountRows(string table, int version) => Scalar<long>($"SELECT COUNT(*) FROM {table} WHERE version=@v", version);
+
+    /// <summary>The same, for a table whose rows do not name a version (see <see cref="IntervalTables"/>).</summary>
+    private long CountAll(string table)
+    {
+        using var connection = new SqliteConnection(CatalogSql.ConnectionString(DbPath, readOnly: true));
+        connection.Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = $"SELECT COUNT(*) FROM {table}";
+        return (long)command.ExecuteScalar()!;
+    }
 
     private IReadOnlyList<string> Issues(int version)
     {

@@ -63,11 +63,45 @@ public static class CatalogSql
         command.ExecuteNonQuery();
     }
 
+    /// <summary>The catalog file format this build writes; <c>PRAGMA user_version</c> carries it. A file at 0 is
+    /// format 1 (one row per version per path, an <c>entries.seq</c> column) and is converted by
+    /// <c>CatalogUpgrade</c> on its first write open.</summary>
+    public const int Format = 2;
+
+    /// <summary>The <c>version_to</c> of a row that is still current: the interval <c>[version_from, OpenEnd)</c>
+    /// covers every version from <c>version_from</c> on.</summary>
+    public const int OpenEnd = int.MaxValue;
+
     public static void EnsureSchema(SqliteConnection connection)
     {
         using var command = connection.CreateCommand();
         command.CommandText = Schema;
         command.ExecuteNonQuery();
+    }
+
+    /// <summary>Stamps the file as this build's format. Separate from <see cref="EnsureSchema"/> because the upgrade
+    /// creates the v2 tables first and may be killed before the last version is in; the stamp is the last thing it
+    /// writes, and a file without it is resumed, not trusted.</summary>
+    public static void MarkCurrent(SqliteConnection connection)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = $"PRAGMA user_version = {Format}";
+        command.ExecuteNonQuery();
+    }
+
+    public static int FormatOf(SqliteConnection connection)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = "PRAGMA user_version";
+        return Convert.ToInt32(command.ExecuteScalar());
+    }
+
+    public static bool HasTable(SqliteConnection connection, string name)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=@n";
+        command.Parameters.AddWithValue("@n", name);
+        return Convert.ToInt64(command.ExecuteScalar()) > 0;
     }
 
     /// <summary>The identity of the object an entry's content lives in: a pack and a blob may perfectly well share a
@@ -122,58 +156,69 @@ public static class CatalogSql
     internal static byte[] PathKey(string path) => Encoding.BigEndianUnicode.GetBytes(path);
 
     /// <summary>
-    /// The secondary indexes are the whole point of the file: <c>entries_content</c> and <c>entries_head</c> answer
-    /// dedup, <c>entries_parent</c> answers browsing, <c>entries_ref</c> answers retention and repair,
-    /// <c>entries_seq</c> preserves the source order a serialized index has to be written back in, and
-    /// <c>entries_path_key</c> is the order <see cref="VersionCatalog.EntriesAsync"/> streams in — see
-    /// <see cref="PathKey"/> for why that is a BLOB column and not the <c>path</c> TEXT column's own collation.
-    /// <c>WITHOUT ROWID</c> on the tables whose primary key is the whole row's identity saves the extra rowid index
-    /// and stores entries clustered by (version, path), which is the order the diff walks.
+    /// One <c>entries</c> row is one path's complete entry together with the half-open version interval
+    /// <c>[version_from, version_to)</c> over which that entry is what the path looked like — a path unchanged over
+    /// fifty versions is one row, a path modified at every version is one row per version. The table is an ordinary
+    /// rowid table so that every secondary index carries an 8-byte pointer rather than a copy of the path: on the
+    /// previous <c>WITHOUT ROWID</c> layout the eight indexes were 1,150 of a row's 1,765 bytes (measured on the
+    /// production schema, 68-character paths). <c>(path, version_from)</c> is unique — a version starts at most one
+    /// row per path. <c>path_key</c> (UTF-16BE bytes, see <see cref="PathKey"/>) is the ordinal order both diff
+    /// cursors walk; <c>dirs</c> carries it too, so the import's directory merge walks in the same order as its
+    /// entry merge. The three content-keyed indexes are unchanged in meaning (see <see cref="GlobalIndexNames"/>);
+    /// on this layout a version inserts only its changes into them.
     /// </summary>
     private const string Schema = $"""
         CREATE TABLE IF NOT EXISTS versions (
           version INTEGER PRIMARY KEY, identity INTEGER NOT NULL, entry_count INTEGER NOT NULL, imported_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS entries (
-          version INTEGER NOT NULL, seq INTEGER NOT NULL, parent TEXT NOT NULL, path_fold TEXT NOT NULL,
-          path_key BLOB NOT NULL, {EntryRowMapper.ColumnDefinitions}, unrecoverable INTEGER NOT NULL DEFAULT 0,
-          PRIMARY KEY (version, path)) WITHOUT ROWID;
-        CREATE INDEX IF NOT EXISTS entries_seq      ON entries (version, seq);
-        CREATE INDEX IF NOT EXISTS entries_parent   ON entries (version, parent);
-        CREATE INDEX IF NOT EXISTS entries_fold     ON entries (version, path_fold);
-        CREATE INDEX IF NOT EXISTS entries_path_key ON entries (version, path_key);
-        CREATE INDEX IF NOT EXISTS entries_storage  ON entries (version, storage_kind, storage_ref, seq);
+          id INTEGER PRIMARY KEY, version_from INTEGER NOT NULL, version_to INTEGER NOT NULL,
+          parent TEXT NOT NULL, path_fold TEXT NOT NULL, path_key BLOB NOT NULL,
+          {EntryRowMapper.ColumnDefinitions}, unrecoverable INTEGER NOT NULL DEFAULT 0);
+        CREATE UNIQUE INDEX IF NOT EXISTS entries_path_from ON entries (path, version_from);
+        CREATE INDEX IF NOT EXISTS entries_path_key ON entries (path_key);
+        CREATE INDEX IF NOT EXISTS entries_parent   ON entries (parent, path_key);
+        CREATE INDEX IF NOT EXISTS entries_fold     ON entries (path_fold);
+        CREATE INDEX IF NOT EXISTS entries_to       ON entries (version_to);
         {GlobalIndexSchema}
-        CREATE TABLE IF NOT EXISTS dirs (version INTEGER NOT NULL, path TEXT NOT NULL, parent TEXT NOT NULL, PRIMARY KEY (version, path)) WITHOUT ROWID;
-        CREATE INDEX IF NOT EXISTS dirs_parent ON dirs (version, parent);
+        CREATE TABLE IF NOT EXISTS dirs (
+          id INTEGER PRIMARY KEY, version_from INTEGER NOT NULL, version_to INTEGER NOT NULL,
+          path TEXT NOT NULL, parent TEXT NOT NULL, path_key BLOB NOT NULL);
+        CREATE UNIQUE INDEX IF NOT EXISTS dirs_path_from ON dirs (path, version_from);
+        CREATE INDEX IF NOT EXISTS dirs_parent ON dirs (parent, path_key);
+        CREATE INDEX IF NOT EXISTS dirs_to ON dirs (version_to);
         CREATE TABLE IF NOT EXISTS empty_dirs (version INTEGER NOT NULL, path TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (version, path)) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS unrecoverable (version INTEGER NOT NULL, path TEXT NOT NULL, seq INTEGER NOT NULL, PRIMARY KEY (version, path)) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS import_issues (version INTEGER NOT NULL, path TEXT NOT NULL, issue TEXT NOT NULL, PRIMARY KEY (version, path, issue)) WITHOUT ROWID;
+        CREATE TABLE IF NOT EXISTS entry_order (version INTEGER NOT NULL, seq INTEGER NOT NULL, path TEXT NOT NULL, PRIMARY KEY (version, seq)) WITHOUT ROWID;
         """;
 
     /// <summary>
-    /// The three indexes whose key does <b>not</b> start with <c>version</c>. They are the dedup and retention
-    /// lookups' whole reason to exist, and they are also the one part of the schema that makes a bulk import slow:
-    /// every other index is keyed by version first, so a new version (always the highest number) appends at the
-    /// tail of each B-tree and costs nothing to keep up; these three are keyed by content hash, storage ref and
-    /// length, so a new version's rows land at random over the entire history, and each insert reads a random
-    /// page of a tree that spans every version already there. Measured (see history.md, 2026.9.8.3): with all
-    /// indexes live, importing ten versions read 1.2 GB of pages through a 64 MiB cache; with only the
-    /// version-keyed indexes live, one page. A NAS on spinning disks with ZFS's 128 KiB records turned that into
-    /// 30 GB of reads and hours of wall time for one container's migration.
+    /// The three indexes keyed by content rather than by path. They are the dedup and retention lookups' whole
+    /// reason to exist, and they are also the one part of the schema that makes a <em>bulk</em> import slow: they
+    /// are keyed by content hash, storage ref and length, so rows land at random over the entire history, and each
+    /// insert reads a random page of a tree that spans every version already there. Measured (see history.md,
+    /// 2026.9.8.3): with all indexes live, importing ten versions read 1.2 GB of pages through a 64 MiB cache; with
+    /// only the path-keyed indexes live, one page. A NAS on spinning disks with ZFS's 128 KiB records turned that
+    /// into 30 GB of reads and hours of wall time for one container's migration.
     /// <para>
-    /// <see cref="DropGlobalIndexes"/> and <see cref="EnsureSchema"/> are the pair a bulk import brackets its work
-    /// with: drop, import every missing version, rebuild — a <c>CREATE INDEX</c> sorts the rows once and writes
-    /// the tree sequentially. A process that dies between the two leaves a catalog without them, which is slower
-    /// to query but never wrong, and the next write open's <see cref="EnsureSchema"/> puts them back.
+    /// On the v2 layout a version inserts only its changes into them, so a single routine import touches a few
+    /// thousand rows rather than a million and needs no bracket at all. What is left is
+    /// <c>VersionCatalogs.EnsureVersionsAsync</c>'s migration of several missing versions, where the merge would
+    /// otherwise touch the three indexes once per version: <see cref="DropGlobalIndexesSql"/> and
+    /// <see cref="EnsureSchema"/> are the pair it brackets its work with — drop, import every missing version,
+    /// rebuild — since a <c>CREATE INDEX</c> sorts the rows once and writes the tree sequentially. A process that
+    /// dies between the two leaves a catalog without them, which is slower to query but never wrong, and the next
+    /// write open's <see cref="EnsureSchema"/> puts them back.
     /// </para>
     /// </summary>
     internal static readonly IReadOnlyList<string> GlobalIndexNames = ["entries_content", "entries_ref", "entries_head"];
 
     /// <summary>The <c>CREATE INDEX</c> half of the bracket, part of <see cref="Schema"/> so a plain open recreates
-    /// whatever a bulk import dropped.</summary>
+    /// whatever a bulk import dropped. <c>entries_ref</c> leads with the ref and carries the kind and the path order,
+    /// so "every row of this object" and "this version's rows grouped by object" both come off it.</summary>
     internal const string GlobalIndexSchema = """
         CREATE INDEX IF NOT EXISTS entries_content  ON entries (full_hash, length);
-        CREATE INDEX IF NOT EXISTS entries_ref      ON entries (storage_ref);
+        CREATE INDEX IF NOT EXISTS entries_ref      ON entries (storage_ref, storage_kind, path_key);
         CREATE INDEX IF NOT EXISTS entries_head     ON entries (length, head_hash);
         """;
 

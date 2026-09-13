@@ -46,59 +46,74 @@ public sealed partial class VersionCatalog : IAsyncDisposable
     private const string SelectVersionSql = "SELECT version, identity, entry_count, imported_at FROM versions WHERE version=@v";
     private const string SelectVersionsSql = "SELECT version, identity, entry_count, imported_at FROM versions ORDER BY version";
     private const string SelectEntryCountSql = "SELECT entry_count FROM versions WHERE version=@v";
+    private const string SelectNextPresentSql = "SELECT MIN(version) FROM versions WHERE version > @v";
+    private const string SelectMaxPresentSql = "SELECT MAX(version) FROM versions";
 
     private const string UpsertVersionSql = """
         INSERT INTO versions (version, identity, entry_count, imported_at) VALUES (@v, @identity, @count, @at)
           ON CONFLICT (version) DO UPDATE SET identity=@identity, entry_count=@count, imported_at=@at
         """;
 
-    private const string DeleteVersionRowsSql = """
-        DELETE FROM entries WHERE version=@v;
-        DELETE FROM dirs WHERE version=@v;
+    private const string DeleteVersionSql = "DELETE FROM versions WHERE version=@v";
+
+    /// <summary>A row is reachable when some retained version lies in its interval. After a version is dropped, the
+    /// rows nothing reaches go. Only rows that end at or before the newest retained version, or start after it, can
+    /// be unreachable: a row spanning the newest version is reached by it. The two disjuncts are separate
+    /// statements so each can use an index.</summary>
+    private const string DeleteUnreachableEntriesSql = """
+        DELETE FROM entries WHERE version_to <= @max
+          AND NOT EXISTS (SELECT 1 FROM versions v WHERE v.version >= entries.version_from AND v.version < entries.version_to);
+        DELETE FROM entries WHERE version_from > @max;
+        DELETE FROM dirs WHERE version_to <= @max
+          AND NOT EXISTS (SELECT 1 FROM versions v WHERE v.version >= dirs.version_from AND v.version < dirs.version_to);
+        DELETE FROM dirs WHERE version_from > @max;
+        """;
+
+    private const string DeletePerVersionRowsSql = """
         DELETE FROM empty_dirs WHERE version=@v;
         DELETE FROM unrecoverable WHERE version=@v;
         DELETE FROM import_issues WHERE version=@v;
+        DELETE FROM entry_order WHERE version=@v;
         """;
 
-    private const string DeleteVersionSql = "DELETE FROM versions WHERE version=@v";
-
-    // OR IGNORE, not OR REPLACE: a duplicate path inside one version keeps the first row (see ImportCoreAsync).
-    private const string InsertEntrySql =
-        $"INSERT OR IGNORE INTO entries (version, seq, parent, path_fold, path_key, {EntryRowMapper.Columns}) " +
-        $"VALUES (@version, @seq, @parent, @path_fold, @path_key, {EntryRowMapper.Parameters})";
-
-    private const string InsertDirSql = "INSERT OR IGNORE INTO dirs (version, path, parent) VALUES (@v, @path, @parent)";
     private const string InsertEmptyDirSql = "INSERT OR IGNORE INTO empty_dirs (version, path, seq) VALUES (@v, @path, @seq)";
     private const string InsertIssueSql = "INSERT OR IGNORE INTO import_issues (version, path, issue) VALUES (@v, @path, @issue)";
-
-    private const string MarkUnrecoverableSql = """
-        INSERT OR IGNORE INTO unrecoverable (version, path, seq) VALUES (@v, @path, @seq);
-        UPDATE entries SET unrecoverable=1 WHERE version=@v AND path=@path;
-        """;
+    private const string InsertUnrecoverableListSql = "INSERT OR IGNORE INTO unrecoverable (version, path, seq) VALUES (@v, @path, @seq)";
 
     /// <summary>Appends at the end of the version's list, reproducing the <c>List.Add</c> order the check and repair
     /// flows write their unrecoverable paths in — that order is part of the index's bytes.</summary>
-    private const string AddUnrecoverableSql = """
+    private const string AppendUnrecoverableListSql = """
         INSERT OR IGNORE INTO unrecoverable (version, path, seq)
-          VALUES (@v, @path, (SELECT COALESCE(MAX(seq), -1) + 1 FROM unrecoverable WHERE version=@v));
-        UPDATE entries SET unrecoverable=1 WHERE version=@v AND path=@path;
+          VALUES (@v, @path, (SELECT COALESCE(MAX(seq), -1) + 1 FROM unrecoverable WHERE version=@v))
         """;
+    private const string RemoveUnrecoverableListSql = "DELETE FROM unrecoverable WHERE version=@v AND path=@path";
 
-    private const string ClearUnrecoverableSql = """
-        DELETE FROM unrecoverable WHERE version=@v AND path=@path;
-        UPDATE entries SET unrecoverable=0 WHERE version=@v AND path=@path;
+    private const string SelectCoveringRowSql =
+        "SELECT id, version_from, version_to FROM entries WHERE path=@path AND version_from <= @v AND version_to > @v";
+    private const string ShrinkRowToVersionSql = "UPDATE entries SET version_from=@from, version_to=@to WHERE id=@id";
+    private const string CopyRowSql = $"""
+        INSERT INTO entries (version_from, version_to, parent, path_fold, path_key, {EntryRowMapper.Columns}, unrecoverable)
+        SELECT @from, @to, parent, path_fold, path_key, {EntryRowMapper.Columns}, unrecoverable FROM entries WHERE id=@id
         """;
-
     private const string PatchUnreadableSql =
-        "UPDATE entries SET unreadable_ticks=@unreadable_ticks, unreadable_offset=@unreadable_offset WHERE version=@v AND path=@path";
-
+        "UPDATE entries SET unreadable_ticks=@unreadable_ticks, unreadable_offset=@unreadable_offset WHERE id=@id";
     private const string PatchStorageSql =
         "UPDATE entries SET storage_kind=@storage_kind, storage_ref=@storage_ref, entry_name=@entry_name, " +
-        "volumes=@volumes, raw=@raw, volume_sizes=@volume_sizes WHERE version=@v AND path=@path";
+        "volumes=@volumes, raw=@raw, volume_sizes=@volume_sizes WHERE id=@id";
+    private const string PatchUnrecoverableFlagSql = "UPDATE entries SET unrecoverable=@flag WHERE id=@id";
 
-    private const string SelectEntriesBySeqSql = $"SELECT {EntryRowMapper.Columns} FROM entries WHERE version=@v ORDER BY seq";
     private const string SelectEmptyDirsSql = "SELECT path FROM empty_dirs WHERE version=@v ORDER BY seq";
     private const string SelectUnrecoverableSql = "SELECT path FROM unrecoverable WHERE version=@v ORDER BY seq";
+    private const string HasEntryOrderSql = "SELECT EXISTS (SELECT 1 FROM entry_order WHERE version=@v)";
+
+    /// <summary>The columns are named <c>e.</c> because <c>entry_order</c> carries a <c>path</c> too and an
+    /// unqualified one would be ambiguous; SQLite still reports each result column under its bare name, which is what
+    /// <see cref="EntryRowMapper.Read"/> looks for.</summary>
+    private static readonly string SelectEntriesByOrderSql = $"""
+        SELECT {EntryRowMapper.PrefixedColumns("e.")} FROM entry_order o
+        JOIN entries e ON e.path = o.path AND e.version_from <= @v AND e.version_to > @v
+        WHERE o.version=@v ORDER BY o.seq
+        """;
 
     private readonly SqliteConnection _connection;
 
@@ -133,17 +148,29 @@ public sealed partial class VersionCatalog : IAsyncDisposable
         {
             await connection.OpenAsync(ct);
             CatalogSql.ApplyPragmas(connection, readOnly);
-            if (!readOnly)
+            var legacy = CatalogSql.FormatOf(connection) < CatalogSql.Format
+                && (CatalogSql.HasTable(connection, "v1_entries") || CatalogSql.HasTable(connection, "entries"));
+            if (legacy && readOnly)
+                throw new CatalogFormatException(path);
+            if (!readOnly && !legacy)
+            {
                 CatalogSql.EnsureSchema(connection);
+                CatalogSql.MarkCurrent(connection);
+            }
+
+            return new VersionCatalog(path, connection) { NeedsUpgrade = legacy };
         }
         catch
         {
             await connection.DisposeAsync();
             throw;
         }
-
-        return new VersionCatalog(path, connection);
     }
+
+    /// <summary>True when the file is format 1 (or a conversion was interrupted): the schema has not been applied
+    /// and every query would fail. <see cref="VersionCatalogStore"/> runs the conversion before handing such a
+    /// catalog out; nothing else opens one.</summary>
+    public bool NeedsUpgrade { get; private init; }
 
     /// <summary>
     /// Takes the content-keyed indexes (<see cref="CatalogSql.GlobalIndexNames"/>) down ahead of a bulk import, so
@@ -280,126 +307,9 @@ public sealed partial class VersionCatalog : IAsyncDisposable
         return versions;
     }
 
-    /// <summary>Imports a version's index straight off the stream it was downloaded as. One transaction: either the
-    /// version is wholly in the catalog or it is not there at all, so an interrupted import cannot leave half a
-    /// version for dedup to trust.</summary>
-    public Task ImportVersionAsync(int version, long identity, IndexStreamReader reader, CancellationToken ct, Action<long>? onEntries = null) =>
-        // The empty-dirs and unrecoverable sections sit after the last entry in the stream, so they can only be read
-        // once the entries have been consumed — hence the callback rather than two arguments.
-        ImportCoreAsync(version, identity, reader.EntryCount, ToAsync(reader.Entries()),
-            () => (reader.ReadEmptyDirs(), reader.ReadUnrecoverable()), ct, onEntries);
-
-    /// <summary>Imports the version a finishing run just produced, straight from the emission order, without building an index object first.</summary>
-    public Task ImportVersionAsync(int version, long identity, int entryCount, IAsyncEnumerable<IndexEntry> entries,
-        IReadOnlyList<string> emptyDirs, IReadOnlyList<string> unrecoverable, CancellationToken ct) =>
-        ImportCoreAsync(version, identity, entryCount, entries, () => (emptyDirs, unrecoverable), ct, onEntries: null);
-
-    /// <summary>How often <c>onEntries</c> hears from an import, in rows. Coarse enough to cost nothing against the
-    /// insert itself, fine enough that a million-row version moves the line a hundred times.</summary>
-    internal const int EntryProgressEvery = 10_000;
-
-    /// <param name="onEntries">Called with the running row count every <see cref="EntryProgressEvery"/> rows, on the
-    /// importing thread; null when nobody is watching.</param>
-    private Task ImportCoreAsync(int version, long identity, int expected, IAsyncEnumerable<IndexEntry> entries,
-        Func<(IReadOnlyList<string> EmptyDirs, IReadOnlyList<string> Unrecoverable)> tail, CancellationToken ct,
-        Action<long>? onEntries) =>
-        OffThePoolAsync(() => ImportOnThisThreadAsync(version, identity, expected, entries, tail, ct, onEntries), ct);
-
-    private async Task ImportOnThisThreadAsync(int version, long identity, int expected, IAsyncEnumerable<IndexEntry> entries,
-        Func<(IReadOnlyList<string> EmptyDirs, IReadOnlyList<string> Unrecoverable)> tail, CancellationToken ct,
-        Action<long>? onEntries)
-    {
-        await using var transaction = (SqliteTransaction)await _connection.BeginTransactionAsync(ct);
-        _transaction = transaction;
-        try
-        {
-            // Re-importing a version replaces it wholesale: a repair rewrites an index in place, and merging the old
-            // rows with the new ones would leave entries no version references any more.
-            await DeleteVersionRowsAsync(version, ct);
-
-            using var insert = Command(InsertEntrySql);
-            using var dir = Command(InsertDirSql);
-            var seen = 0;
-            var kept = 0;
-            await foreach (var entry in entries.WithCancellation(ct))
-            {
-                ct.ThrowIfCancellationRequested();
-                Set(insert, "@version", version);
-                Set(insert, "@seq", seen++);
-                if (onEntries is not null && seen % EntryProgressEvery == 0)
-                    onEntries(seen);
-                Set(insert, "@parent", ParentOf(entry.Path));
-                Set(insert, "@path_fold", entry.Path.ToUpperInvariant());
-                Set(insert, "@path_key", CatalogSql.PathKey(entry.Path));
-                EntryRowMapper.Bind(insert, entry);
-                if (await insert.ExecuteNonQueryAsync(ct) != 1)
-                {
-                    // The primary key cannot hold the same path twice. The first one wins (it is the one every
-                    // earlier in-memory reader would have found first too), and the loss is recorded rather than
-                    // swallowed, because it makes this version's serialization no longer byte-identical.
-                    await RecordIssueAsync(version, entry.Path, "duplicate", ct);
-                    continue;
-                }
-
-                kept++;
-                await InsertAncestorsAsync(dir, version, entry.Path, ct);
-            }
-
-            if (seen != expected)
-                throw new InvalidOperationException($"Version {version} announced {expected} entries but produced {seen}.");
-
-            var (emptyDirs, unrecoverable) = tail();
-            using var emptyDir = Command(InsertEmptyDirSql);
-            for (var i = 0; i < emptyDirs.Count; i++)
-            {
-                Set(emptyDir, "@v", version);
-                Set(emptyDir, "@path", emptyDirs[i]);
-                Set(emptyDir, "@seq", i);
-                await emptyDir.ExecuteNonQueryAsync(ct);
-                // The empty dir has to become a browsable node itself, and InsertAncestors only inserts a path's
-                // ancestors — so it is handed a notional child of the empty dir.
-                await InsertAncestorsAsync(dir, version, emptyDirs[i] + "/x", ct);
-            }
-
-            using var mark = Command(MarkUnrecoverableSql);
-            for (var i = 0; i < unrecoverable.Count; i++)
-            {
-                Set(mark, "@v", version);
-                Set(mark, "@path", unrecoverable[i]);
-                Set(mark, "@seq", i);
-                await mark.ExecuteNonQueryAsync(ct);
-            }
-
-            await UpsertVersionAsync(version, identity, kept, ct);
-            await transaction.CommitAsync(ct);
-        }
-        finally
-        {
-            _transaction = null;
-        }
-    }
-
-    public async Task RemoveVersionAsync(int version, CancellationToken ct)
-    {
-        await using var transaction = (SqliteTransaction)await _connection.BeginTransactionAsync(ct);
-        _transaction = transaction;
-        try
-        {
-            await DeleteVersionRowsAsync(version, ct);
-            using var command = Command(DeleteVersionSql);
-            Set(command, "@v", version);
-            await command.ExecuteNonQueryAsync(ct);
-            await transaction.CommitAsync(ct);
-        }
-        finally
-        {
-            _transaction = null;
-        }
-    }
-
     /// <summary>
-    /// Writes the version back out in the frozen cloud format (§3.2), entry by entry in <c>seq</c> order, so a version
-    /// imported from the cloud and written back is the same bytes.
+    /// Writes the version back out in the frozen cloud format (§3.2), entry by entry in the order the index was read
+    /// in, so a version imported from the cloud and written back is the same bytes.
     /// </summary>
     /// <param name="patches">Changes to apply on the way out without having been stored yet: repair writes the fixed
     /// index to the cloud first and only records it in the catalog once that upload succeeded.</param>
@@ -411,7 +321,10 @@ public sealed partial class VersionCatalog : IAsyncDisposable
 
         using var writer = new IndexStreamWriter(output);
         writer.WriteHeader(version, count);
-        await foreach (var entry in QueryEntriesAsync(SelectEntriesBySeqSql, version, ct))
+        // Path order is the order an index has been written in since the M4 diff; only a version whose entries
+        // arrived in some other order carries an entry_order table, and then that table is the authority.
+        var ordered = await ExistsAsync(HasEntryOrderSql, ct, ("@v", version));
+        await foreach (var entry in QueryEntriesAsync(ordered ? SelectEntriesByOrderSql : SelectEntriesByPathSql, version, ct))
             writer.WriteEntry(byPath is not null && byPath.TryGetValue(entry.Path, out var patch) ? Apply(entry, patch) : entry);
 
         writer.WriteEmptyDirs(await EmptyDirsAsync(version, ct));
@@ -449,15 +362,21 @@ public sealed partial class VersionCatalog : IAsyncDisposable
         {
             using var unreadable = Command(PatchUnreadableSql);
             using var storage = Command(PatchStorageSql);
-            using var add = Command(AddUnrecoverableSql);
-            using var clear = Command(ClearUnrecoverableSql);
+            using var flag = Command(PatchUnrecoverableFlagSql);
+            using var append = Command(AppendUnrecoverableListSql);
+            using var remove = Command(RemoveUnrecoverableListSql);
             foreach (var patch in patches)
             {
                 ct.ThrowIfCancellationRequested();
+                // The row that covers (version, path) may span other versions; the patch must not leak into them.
+                // A path the version does not have gets no row and no patch, as the old UPDATE … WHERE affected none.
+                var id = await IsolateAsync(patch.Version, patch.Path, ct);
+                if (id is null)
+                    continue;
+
                 if (patch.UnreadableAt is { } at)
                 {
-                    Set(unreadable, "@v", patch.Version);
-                    Set(unreadable, "@path", patch.Path);
+                    Set(unreadable, "@id", id);
                     Set(unreadable, "@unreadable_ticks", at.UtcTicks);
                     Set(unreadable, "@unreadable_offset", (int)at.Offset.TotalMinutes);
                     await unreadable.ExecuteNonQueryAsync(ct);
@@ -465,18 +384,20 @@ public sealed partial class VersionCatalog : IAsyncDisposable
 
                 if (patch.Storage is not null)
                 {
-                    Set(storage, "@v", patch.Version);
-                    Set(storage, "@path", patch.Path);
+                    Set(storage, "@id", id);
                     EntryRowMapper.BindStorage(storage, patch.Storage);
                     await storage.ExecuteNonQueryAsync(ct);
                 }
 
-                if (patch.Unrecoverable is { } flag)
+                if (patch.Unrecoverable is { } on)
                 {
-                    var command = flag ? add : clear;
-                    Set(command, "@v", patch.Version);
-                    Set(command, "@path", patch.Path);
-                    await command.ExecuteNonQueryAsync(ct);
+                    Set(flag, "@id", id);
+                    Set(flag, "@flag", on ? 1 : 0);
+                    await flag.ExecuteNonQueryAsync(ct);
+                    var list = on ? append : remove;
+                    Set(list, "@v", patch.Version);
+                    Set(list, "@path", patch.Path);
+                    await list.ExecuteNonQueryAsync(ct);
                 }
             }
 
@@ -512,11 +433,78 @@ public sealed partial class VersionCatalog : IAsyncDisposable
         reader.GetInt32(0), reader.GetInt64(1), reader.GetInt32(2),
         DateTimeOffset.Parse(reader.GetString(3), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind));
 
-    private async Task DeleteVersionRowsAsync(int version, CancellationToken ct)
+    /// <summary>
+    /// The row that covers (<paramref name="version"/>, <paramref name="path"/>), narrowed to that one version: a row
+    /// <c>[a, b)</c> with <c>a &lt; version</c> or <c>b &gt; next</c> — <c>next</c> being the retained version after
+    /// this one, or <see cref="CatalogSql.OpenEnd"/> — is split into up to three. The outer pieces keep the old values
+    /// under new ids, the original becomes <c>[version, next)</c> and is the one returned. The split lands on version
+    /// boundaries rather than on <c>version + 1</c> so that no piece covers a version that does not exist: such a
+    /// piece is reachable by nothing, survives retention (which only deletes what no version reaches) and would still
+    /// answer the content lookups, which carry no version predicate. Splits are never merged back; a repaired path
+    /// gains at most two rows per patch. Null when the version has no entry at the path. The original is shrunk
+    /// before the copies are inserted, or the copy that keeps <c>version_from = a</c> would collide with it on the
+    /// unique <c>(path, version_from)</c>.
+    /// </summary>
+    private async Task<long?> IsolateAsync(int version, string path, CancellationToken ct)
     {
-        using var command = Command(DeleteVersionRowsSql);
+        long id; int from, to;
+        using (var find = Command(SelectCoveringRowSql))
+        {
+            Set(find, "@path", path);
+            Set(find, "@v", version);
+            await using var reader = (SqliteDataReader)await find.ExecuteReaderAsync(ct);
+            if (!await reader.ReadAsync(ct))
+                return null;
+            id = reader.GetInt64(0);
+            from = reader.GetInt32(1);
+            to = reader.GetInt32(2);
+        }
+
+        var next = await NextPresentAsync(version, ct) ?? CatalogSql.OpenEnd;
+        if (from == version && to == next)
+            return id;
+
+        using (var shrink = Command(ShrinkRowToVersionSql))
+        {
+            Set(shrink, "@id", id);
+            Set(shrink, "@from", version);
+            Set(shrink, "@to", next);
+            await shrink.ExecuteNonQueryAsync(ct);
+        }
+
+        using var copy = Command(CopyRowSql);
+        Set(copy, "@id", id);
+        if (from < version)
+        {
+            Set(copy, "@from", from);
+            Set(copy, "@to", version);
+            await copy.ExecuteNonQueryAsync(ct);
+        }
+        if (to > next)
+        {
+            Set(copy, "@from", next);
+            Set(copy, "@to", to);
+            await copy.ExecuteNonQueryAsync(ct);
+        }
+
+        return id;
+    }
+
+    /// <summary>The retained version after <paramref name="version"/>, or null when it is the newest: where a row
+    /// started at <paramref name="version"/> ends when the version stops describing the path.</summary>
+    internal async Task<int?> NextPresentAsync(int version, CancellationToken ct)
+    {
+        using var command = Command(SelectNextPresentSql);
         Set(command, "@v", version);
-        await command.ExecuteNonQueryAsync(ct);
+        return await command.ExecuteScalarAsync(ct) is long next ? (int)next : null;
+    }
+
+    /// <summary>The newest retained version, or -1 when none is left — the bound
+    /// <see cref="DeleteUnreachableEntriesSql"/> judges reachability against.</summary>
+    private async Task<int> MaxPresentAsync(CancellationToken ct)
+    {
+        using var command = Command(SelectMaxPresentSql);
+        return await command.ExecuteScalarAsync(ct) is long max ? (int)max : -1;
     }
 
     private async Task UpsertVersionAsync(int version, long identity, int entryCount, CancellationToken ct)
@@ -538,23 +526,6 @@ public sealed partial class VersionCatalog : IAsyncDisposable
         Set(command, "@path", path);
         Set(command, "@issue", issue);
         await command.ExecuteNonQueryAsync(ct);
-    }
-
-    /// <summary>Inserts every directory prefix of <paramref name="path"/> ("a/b/c.txt" → "a", "a/b"), which is what
-    /// makes browsing one level at a time a single indexed lookup instead of a scan over every path in the version.</summary>
-    private static async Task InsertAncestorsAsync(SqliteCommand command, int version, string path, CancellationToken ct)
-    {
-        for (var slash = path.IndexOf('/'); slash >= 0; slash = path.IndexOf('/', slash + 1))
-        {
-            if (slash == 0)
-                continue;   // a leading slash would make an empty directory name
-
-            var dir = path[..slash];
-            Set(command, "@v", version);
-            Set(command, "@path", dir);
-            Set(command, "@parent", ParentOf(dir));
-            await command.ExecuteNonQueryAsync(ct);
-        }
     }
 
     internal static string ParentOf(string path)
@@ -591,12 +562,12 @@ public sealed partial class VersionCatalog : IAsyncDisposable
         while (await reader.ReadAsync(ct))
             yield return EntryRowMapper.Read(reader);
     }
+}
 
-    /// <summary>Adapts the synchronous stream reader to the one import path, so both entry sources share the transaction and duplicate handling.</summary>
-    private static async IAsyncEnumerable<IndexEntry> ToAsync(IEnumerable<IndexEntry> entries)
-    {
-        await Task.CompletedTask;
-        foreach (var entry in entries)
-            yield return entry;
-    }
+/// <summary>A read-only open met a format-1 catalog. Readers cannot convert (they hold no write lock), so the
+/// store answers this by taking the lock, converting, and opening again.</summary>
+public sealed class CatalogFormatException(string path)
+    : IOException($"Catalog '{path}' is in an older format and has to be upgraded by a write open first.")
+{
+    public string Path { get; } = path;
 }
