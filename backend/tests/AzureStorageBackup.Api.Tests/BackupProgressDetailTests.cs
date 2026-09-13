@@ -81,7 +81,12 @@ public sealed class BackupProgressDetailTests : IDisposable
                 await File.WriteAllTextAsync(Path.Combine(dir, $"f{i:D3}.txt"), new string('x', 500 + i));
             }
 
-            var authority = new TestLocalAuthority(store);
+            // A reader saw damage on this container's catalog: the run owes the full check, and it has to stand on
+            // its own stage **ahead of** the version load — the load's write open would otherwise run it unannounced,
+            // under "Loading versions 0%", which on an 8 GB catalog was 37 minutes read as a hang (2026-09-13).
+            var catalogStore = TestCatalogs.NewStore();
+            catalogStore.ForgetChecked(account.Id, name);
+            var authority = new TestLocalAuthority(store, catalogStore);
             var orchestrator = new BackupOrchestrator(
                 new LocalFileScanner(), new BackupDiffer(new FileHasher()), new GroupingPlanner(),
                 new SevenZipCompressor(), new BlobUploader(factory), factory, store, staging,
@@ -95,6 +100,12 @@ public sealed class BackupProgressDetailTests : IDisposable
 
             var diffing = progress.Reports.Where(r => r.Stage == BackupStage.Diffing && r.Detail is not null).ToList();
             var scanning = progress.Reports.Where(r => r.Stage == BackupStage.Scanning && r.Detail is not null).ToList();
+
+            var stages = progress.Reports.Select(r => r.Stage).ToList();
+            var checking = stages.IndexOf(BackupStage.CheckingCatalog);
+            var loading = stages.IndexOf(BackupStage.LoadingVersions);
+            Assert.True(checking >= 0, "the owed check reports its own stage");
+            Assert.True(loading > checking, "the check runs before the version load, not inside its write open");
 
             // The core: the diff stage must report "which file is being processed" — when it hangs this is the only thing that says where.
             Assert.NotEmpty(diffing);

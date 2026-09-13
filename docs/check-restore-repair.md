@@ -104,8 +104,8 @@ files.
 
 The check opens by checking the one local thing it depends on: the container's catalog
 ([storage-format.md](storage-format.md)), on its own stage, "Checking catalog". Two questions. Does the
-file pass a full `PRAGMA quick_check`? A backup only pays that read after an unclean exit; the check is
-where an operator asks on purpose, so it runs it every time, owed or not. And does the catalog's
+file pass a full `PRAGMA quick_check`? A backup only pays that read after a reader saw damage; the check
+is where an operator asks on purpose, so it runs it every time, owed or not. And does the catalog's
 version list agree with the backup's info file? A retention cleanup interrupted between deleting blobs
 and removing rows leaves versions in the catalog that the info file no longer has, and a backup drops
 them before its diff for the same reason.

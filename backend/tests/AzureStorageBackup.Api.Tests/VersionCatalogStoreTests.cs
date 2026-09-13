@@ -64,9 +64,12 @@ public sealed class VersionCatalogStoreTests : IDisposable
     }
 
     private static List<NSubstitute.Core.ICall> WarningCalls(ILogger<VersionCatalogStore> logger) =>
+        LogCalls(logger, LogLevel.Warning);
+
+    private static List<NSubstitute.Core.ICall> LogCalls(ILogger<VersionCatalogStore> logger, LogLevel level) =>
         [.. logger.ReceivedCalls()
             .Where(c => c.GetMethodInfo().Name == nameof(ILogger.Log))
-            .Where(c => c.GetArguments()[0] is LogLevel.Warning)];
+            .Where(c => c.GetArguments()[0] is LogLevel actual && actual == level)];
 
     // ---- Test 1: a fresh open creates the file and an empty schema -------------------------------------------
 
@@ -140,7 +143,7 @@ public sealed class VersionCatalogStoreTests : IDisposable
         // Unlike Test 3's random bytes, this file passes ApplyPragmas' own statements (its header is intact) — only
         // a full quick_check scan finds the damage, which is the path this test exists to exercise.
         await BuildMultiPageCatalogAsync(path);
-        await LeaveUncleanExitBehindAsync(); // the check is only owed after an unclean exit
+        store.ForgetChecked(AccountId, Container); // the check is owed only once a reader saw damage
         CorruptPage2(path);
 
         using (var held = await store.LockForWriteAsync(AccountId, Container, CancellationToken.None))
@@ -161,7 +164,7 @@ public sealed class VersionCatalogStoreTests : IDisposable
         var store = new VersionCatalogStore(_root);
         var path = store.PathFor(AccountId, Container);
         await BuildMultiPageCatalogAsync(path);
-        await LeaveUncleanExitBehindAsync(); // the check is only owed after an unclean exit
+        store.ForgetChecked(AccountId, Container); // the check is owed only once a reader saw damage
 
         // First open through the store: the path is unchecked, so quick_check runs — and, correctly, finds nothing
         // wrong yet — and marks the path checked.
@@ -180,9 +183,11 @@ public sealed class VersionCatalogStoreTests : IDisposable
         await using (var catalog = await store.OpenForWriteAsync(held, AccountId, Container, CancellationToken.None))
             Assert.NotNull(catalog);
 
-        // A fresh store instance starts with an empty checked set: it runs quick_check again against the same path,
-        // catches the same corruption, and rebuilds the file.
+        // A fresh store instance starts with an empty checked set, and owes nothing until a reader reports damage
+        // (the first store's marker is still on disk — an unclean exit — and that alone no longer triggers the read).
+        // Told of damage, it runs quick_check against the same path, catches the corruption, and rebuilds the file.
         var freshStore = new VersionCatalogStore(_root);
+        freshStore.ForgetChecked(AccountId, Container);
         using (var held = await freshStore.LockForWriteAsync(AccountId, Container, CancellationToken.None))
         await using (var catalog = await freshStore.OpenForWriteAsync(held, AccountId, Container, CancellationToken.None))
             Assert.Empty(await catalog.ListVersionsAsync(CancellationToken.None));
@@ -198,7 +203,7 @@ public sealed class VersionCatalogStoreTests : IDisposable
         var path = store.PathFor(AccountId, Container);
 
         await BuildMultiPageCatalogAsync(path);
-        await LeaveUncleanExitBehindAsync(); // the check is only owed after an unclean exit
+        store.ForgetChecked(AccountId, Container); // the check is owed only once a reader saw damage
         CorruptPage2(path);
 
         // EVERY production write open happens inside this lock — the import at the end of a run, the checker's and
@@ -303,15 +308,18 @@ public sealed class VersionCatalogStoreTests : IDisposable
         Assert.False(Directory.Exists(Path.GetDirectoryName(path)));
     }
 
-    // ---- quick_check runs only after an unclean exit, and the run asks beforehand so it can show a stage ------------
+    // ---- quick_check is owed only once a reader saw damage; an unclean exit is logged, not re-read -------------------
 
-    /// <summary>A write open leaves an "open" marker beside the catalog that a clean shutdown (disposing the store)
-    /// removes. The full-file <c>quick_check</c> is owed only when the marker is still there at the next start — the
-    /// last process that wrote this catalog did not exit cleanly — or when a reader found damage (<see cref="VersionCatalogStore.ForgetChecked"/>).
-    /// A catalog nobody has opened, or one the last process closed cleanly, is not re-read: for an 8 GB catalog that
-    /// read is minutes at the start of every backup after a restart, and a clean exit is exactly the case it guards nothing against.</summary>
+    /// <summary>The full-file <c>quick_check</c> is owed only when a reader found damage
+    /// (<see cref="VersionCatalogStore.ForgetChecked"/>). An unclean exit — the "open" marker a write open leaves and
+    /// only a clean shutdown removes, still there at the next start — is no longer a reason: SQLite's write-ahead log
+    /// covers a kill or a crash on its own (the 2.5 GB of an interrupted import was discarded cleanly on
+    /// 2026-09-13), and the read it used to trigger cost 37 minutes on an 8 GB catalog, with the run standing still,
+    /// after every <c>docker stop</c> that landed mid-import. The marker is kept for what it can still say: one log
+    /// line that the last writer did not close this file, which is the fact a day of file-date archaeology was spent
+    /// establishing. A catalog nobody has opened, or one the last process closed cleanly, says nothing.</summary>
     [Fact]
-    public async Task QuickCheck_is_owed_only_after_an_unclean_exit_or_when_damage_was_seen()
+    public async Task QuickCheck_is_owed_only_when_damage_was_seen_and_an_unclean_exit_is_logged_not_re_read()
     {
         var first = new VersionCatalogStore(_root);
         Assert.False(first.NeedsCheck(AccountId, Container)); // never opened: nothing to distrust
@@ -321,20 +329,32 @@ public sealed class VersionCatalogStoreTests : IDisposable
             Assert.Empty(await catalog.ListVersionsAsync(CancellationToken.None));
         Assert.False(first.NeedsCheck(AccountId, Container)); // its own open is not a reason
 
-        // A second process while the first never exited cleanly (never disposed): the check is owed once.
-        var next = new VersionCatalogStore(_root);
+        // A second process while the first never exited cleanly (never disposed): nothing is owed, and the open says
+        // so once, in the log.
+        var logger = Substitute.For<ILogger<VersionCatalogStore>>();
+        var next = new VersionCatalogStore(_root, logger);
+        Assert.False(next.NeedsCheck(AccountId, Container));
+        using (var held = await next.LockForWriteAsync(AccountId, Container, CancellationToken.None))
+        await using (var catalog = await next.OpenForWriteAsync(held, AccountId, Container, CancellationToken.None))
+            Assert.Empty(await catalog.ListVersionsAsync(CancellationToken.None));
+        Assert.Single(LogCalls(logger, LogLevel.Information));
+        Assert.Empty(WarningCalls(logger));
+
+        // A reader that saw damage is the one reason.
+        next.ForgetChecked(AccountId, Container);
         Assert.True(next.NeedsCheck(AccountId, Container));
         await next.EnsureCheckedAsync(AccountId, Container, CancellationToken.None);
         Assert.False(next.NeedsCheck(AccountId, Container));
 
-        // A reader that saw damage puts it back on the table, marker or not.
-        next.ForgetChecked(AccountId, Container);
-        Assert.True(next.NeedsCheck(AccountId, Container));
-
-        // A clean shutdown takes the marker with it: the process after that owes nothing.
+        // A clean shutdown takes the marker with it: the process after that has nothing to say either.
         next.Dispose();
         first.Dispose();
-        Assert.False(new VersionCatalogStore(_root).NeedsCheck(AccountId, Container));
+        var quiet = Substitute.For<ILogger<VersionCatalogStore>>();
+        var after = new VersionCatalogStore(_root, quiet);
+        Assert.False(after.NeedsCheck(AccountId, Container));
+        using (var held = await after.LockForWriteAsync(AccountId, Container, CancellationToken.None))
+        await using (var _ = await after.OpenForWriteAsync(held, AccountId, Container, CancellationToken.None)) { }
+        Assert.Empty(LogCalls(quiet, LogLevel.Information));
     }
 
     /// <summary>What a process that dies with the catalog open leaves behind: the marker a write open creates and only

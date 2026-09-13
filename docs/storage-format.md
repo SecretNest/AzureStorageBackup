@@ -222,9 +222,13 @@ read are opened `ReadWrite` at the SQLite level, because a `ReadOnly` handle is 
 
 Beside it, `catalog.db.open` is the clean-shutdown marker: a write open creates it, and disposing the
 store at host shutdown removes it. Found at the next start, it says the last process that wrote this
-catalog did not exit cleanly, and that — or a reader hitting `SQLITE_CORRUPT` — is the only thing that
-makes the next write open pay the full-file `PRAGMA quick_check` (the backup's "Checking catalog"
-stage). A catalog closed cleanly is not re-read; at 8 GB that read is minutes.
+catalog did not exit cleanly, and the first write open logs one line to that effect. It used to make
+that open pay the full-file `PRAGMA quick_check` as well; since 2026-09-13 it does not. SQLite's
+write-ahead log covers a kill or a crash on its own — an interrupted import's 2.5 GB of uncommitted
+frames was discarded cleanly on the next open — while the read cost 37 minutes on an 8 GB catalog
+with the run standing still, after every `docker stop` that landed mid-import. The full check is owed
+only once a reader has hit `SQLITE_CORRUPT` on the file (the backup's "Checking catalog" stage, which
+then runs ahead of the version load), and the check operation runs it on purpose every time.
 
 It holds:
 
@@ -338,18 +342,16 @@ It is never wrong: the indexes are derived from the rows, and no query depends o
 
 **The catalog is derived data.** The index blobs in the container are the recovery copy; the catalog
 is a queryable copy of them and can be rebuilt from them at any time. That is what lets it run with
-`synchronous=NORMAL`, and it is what makes corruption a cache miss rather than an incident: the
-first read-write open of a path in a process runs `PRAGMA quick_check` once, and a file that fails
-it — or that SQLite refuses as `SQLITE_CORRUPT` or `SQLITE_NOTADB` — is deleted with a warning and
-rebuilt from the cloud on demand. That holds on the read path too: the cheap read-only probe every
+`synchronous=NORMAL`, and it is what makes corruption a cache miss rather than an incident: a
+reader that hits `SQLITE_CORRUPT` makes the next write open run `PRAGMA quick_check`, and a file that
+fails it — or that SQLite refuses as `SQLITE_CORRUPT` or `SQLITE_NOTADB` outright — is deleted with a
+warning and rebuilt from the cloud on demand. That holds on the read path too: the cheap read-only probe every
 reader starts with treats an unreadable file as a miss and falls through to the write path, which is
 where the rebuild happens — and if the probe is the one that finds the corruption, on a path this
 process already opened for writing earlier, it forgets that earlier pass so the write open re-runs
 the check instead of trusting it. Deleting the whole `index-cache/` directory costs downloads, never
-data. In a backup run, the first write open of a container's catalog is the start-of-run reconcile
-against the info file (below), so `quick_check`'s one-time cost lands there, before anything is
-scanned — not at end-of-run import, which is where a run's only other write of the catalog used to
-fall before the reconcile moved in front of it.
+data. In a backup run an owed `quick_check` runs on its own stage before the version load — the
+first thing that opens the catalog for writing — so its cost never hides inside another stage's open.
 
 **One writer per container.** Every writer — a run's finish, retention, the check's and the
 repairer's marks — takes the container's write lock for the duration, and the write open demands

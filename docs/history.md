@@ -73,6 +73,8 @@ interruptibility under real data volumes. All of it is merged into `main`.
 | 09-08 | The version under import is named with its dates on the browser's clock, as the check and restore lists name versions | [progress-display.md](progress-display.md) |
 | 09-12 | The wrap-up has names and numbers: Writing index opens as the index is serialized ("preparing the index"), Finalizing becomes Updating catalog and counts the import in entries, and the row's headline stops borrowing the upload's N-of-N for the stages after it (it read 100% → 0% → 100% for a hang that was three unnamed stretches) | [progress-display.md](progress-display.md) |
 | 09-12 | One version's catalog import takes the drop-and-rebuild bracket when it is at least a hundredth of the history (`VersionCatalog.PrefersRebuild`), on the run's own import and on a single missing version alike; the live-index assumption held for a 1 GB catalog and read 1.2 GB/min for over an hour on an 8 GB one | [storage-format.md](storage-format.md) |
+| 09-13 | The progress throttle owes a trailing publish: a burst's last state lands at the end of the 200 ms window with no further event (the version-loading probe's thirteen Present reports published once and stood as "1 of 14" through a 37-minute catalog check) | [progress-display.md](progress-display.md) |
+| 09-13 | An unclean exit no longer triggers the catalog's full `quick_check` — logged, and left to SQLite's write-ahead log; the check is owed only once a reader saw damage, and it runs on its own stage ahead of Loading versions rather than inside that stage's write open | [storage-format.md](storage-format.md) |
 
 ### The migration that read 30 GB to write 1 GB (2026.9.8.3)
 

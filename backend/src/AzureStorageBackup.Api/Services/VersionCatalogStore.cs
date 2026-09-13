@@ -30,7 +30,8 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
     /// is empty) rather than being trusted purely because the old, bad file at that path once passed.</summary>
     private readonly ConcurrentDictionary<string, byte> _checkedPaths = new();
 
-    /// <summary>Paths a reader found damage on (<see cref="ForgetChecked"/>): the check is owed regardless of the marker.</summary>
+    /// <summary>Paths a reader found damage on (<see cref="ForgetChecked"/>): the one thing that makes the full-file
+    /// check owed.</summary>
     private readonly ConcurrentDictionary<string, byte> _damageSeen = new();
 
     /// <summary>Paths this process has opened for writing — the ones whose "open" marker (<see cref="OpenMarkerFor"/>)
@@ -39,9 +40,14 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
 
     /// <summary>
     /// The file a write open leaves beside the catalog and only a clean shutdown removes. Found at the next start, it
-    /// says the last process that wrote this catalog did not exit cleanly — a kill, a crash, a power cut — and that is
-    /// the one case the full-file <c>quick_check</c> is for. A catalog closed cleanly is not re-read: for an 8 GB
-    /// catalog that read is minutes at the start of every backup after a restart, spent guarding against nothing.
+    /// says the last process that wrote this catalog did not exit cleanly — a kill, a crash, a power cut. It used to
+    /// make the next write open pay the full-file <c>quick_check</c>; it no longer does. SQLite's write-ahead log
+    /// covers a kill or a crash by itself (an interrupted import's 2.5 GB of uncommitted frames was discarded
+    /// cleanly on the next open, 2026-09-13), and the read cost 37 minutes on an 8 GB catalog with the run standing
+    /// still, after every <c>docker stop</c> that landed mid-import — spent guarding against a case the journal
+    /// already guards. What the marker still buys is one log line saying so, which is the fact a day of file-date
+    /// archaeology was spent establishing. The full check is owed only once a reader has seen damage
+    /// (<see cref="ForgetChecked"/>), and the check operation runs it on purpose every time.
     /// </summary>
     private static string OpenMarkerFor(string path) => path + ".open";
 
@@ -138,6 +144,11 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
     /// handle by the time a caller deletes it) and forgets the path was ever checked, before rethrowing.</summary>
     private async Task<VersionCatalog> OpenCheckedAsync(string path, CancellationToken ct)
     {
+        // Said once per path per process, on the first write open that finds another process's marker still there.
+        if (!_openedHere.ContainsKey(path) && File.Exists(OpenMarkerFor(path)))
+            logger?.LogInformation(
+                "Catalog {Path} was not closed cleanly by the last process that wrote it; SQLite's write-ahead log has "
+                + "been recovered on open and the file is not re-read. The check operation verifies it in full.", path);
         var catalog = await VersionCatalog.OpenAsync(path, readOnly: false, ct);
         if (NeedsCheck(path))
         {
@@ -160,7 +171,7 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
     }
 
     private bool NeedsCheck(string path) =>
-        !_checkedPaths.ContainsKey(path) && (_damageSeen.ContainsKey(path) || File.Exists(OpenMarkerFor(path)));
+        !_checkedPaths.ContainsKey(path) && _damageSeen.ContainsKey(path);
 
     private void MarkOpen(string path)
     {
@@ -172,16 +183,16 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            // Without the marker the next start will not check this catalog. Said in the log rather than failing the
-            // open: the catalog is a cache, and a read that finds damage still recovers it (ForgetChecked).
+            // Without the marker the next start cannot say this catalog was left open. Said in the log rather than
+            // failing the open: the catalog is a cache, and a read that finds damage still recovers it (ForgetChecked).
             _openedHere.TryRemove(path, out _);
-            logger?.LogWarning(ex, "Could not write the open marker beside catalog {Path}; the next start will not re-check it.", path);
+            logger?.LogWarning(ex, "Could not write the open marker beside catalog {Path}; an unclean exit will go unmentioned at the next start.", path);
         }
     }
 
-    /// <summary>The clean shutdown: takes away the "open" marker of every catalog this process wrote, so the next start
-    /// trusts them. Registered as a singleton, the host disposes it on the way down; a process that dies before this
-    /// runs leaves the markers, and the next start pays the check for exactly those catalogs.</summary>
+    /// <summary>The clean shutdown: takes away the "open" marker of every catalog this process wrote. Registered as a
+    /// singleton, the host disposes it on the way down; a process that dies before this runs leaves the markers, and
+    /// the next start logs one line for exactly those catalogs.</summary>
     public void Dispose()
     {
         foreach (var path in _openedHere.Keys)
@@ -208,10 +219,9 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
     }
 
     /// <summary>Whether the next write open of this container's catalog will run the full-file
-    /// <see cref="VersionCatalog.QuickCheckAsync"/>: not yet this process, and either the last process that wrote it
-    /// did not exit cleanly (<see cref="OpenMarkerFor"/>) or a reader saw damage (<see cref="ForgetChecked"/>). The run
-    /// asks this **before** it opens, so the check can be shown on a stage line of its own instead of running
-    /// unannounced inside whatever open happens to come first.</summary>
+    /// <see cref="VersionCatalog.QuickCheckAsync"/>: not yet this process, and a reader saw damage
+    /// (<see cref="ForgetChecked"/>). The run asks this **before** it opens anything, so the check can be shown on a
+    /// stage line of its own instead of running unannounced inside whatever open happens to come first.</summary>
     public bool NeedsCheck(int accountId, string container) => NeedsCheck(PathFor(accountId, container));
 
     /// <summary>Runs the check now, under the container's write lock, if it is still due — the write open that follows
