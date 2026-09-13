@@ -397,11 +397,13 @@ public sealed class ChaosMatrixTests(TestWebAppFactory factory, ITestOutputHelpe
             Log(worker, $"start refused: {(int)res.StatusCode}"); // busy or gated — both fine
             return null;
         }
+        // Judge the run this POST returned (fresh or adopted), never a later one that replaced it in the meantime.
+        var started = await res.Content.ReadFromJsonAsync<CheckRunResponse>(CancellationToken.None);
         for (var waited = 0; waited < 180_000; waited += 250)
         {
             var run = await (await _client.GetAsync($"/api/backup-configs/{configId}/check", CancellationToken.None))
                 .Content.ReadFromJsonAsync<CheckRunResponse>(CancellationToken.None);
-            if (run is null || run.Status == "Running")
+            if (run is null || run.Status == "Running" || (started is not null && run.RunId != started.RunId))
             {
                 await Task.Delay(250, CancellationToken.None);
                 continue;
@@ -791,6 +793,16 @@ public sealed class ChaosMatrixTests(TestWebAppFactory factory, ITestOutputHelpe
         var sw = System.Diagnostics.Stopwatch.StartNew();
         while (sw.Elapsed < TimeSpan.FromMinutes(3))
         {
+            // The same echo dance the backup side does. CheckRunner.Start hands an already-running check back to a
+            // second caller by design, and the checker worker starts checks all the time — so a POST here can be
+            // answered with a run that probed the victim BEFORE the vandal damaged it, whose clean verdict is
+            // then read as "damage not detected" (CI, 2026-09-12 seed 1616764657 and 2026-09-13 seed 1977346309,
+            // both a truncation followed 250 ms later by a Completed check with bad=0). Only a run that did not
+            // exist before the POST can have seen the damage.
+            var beforeRes = await _client.GetAsync($"/api/backup-configs/{configId}/check", CancellationToken.None);
+            var before = beforeRes.StatusCode == System.Net.HttpStatusCode.NoContent
+                ? null // never checked: 204, no body
+                : await beforeRes.Content.ReadFromJsonAsync<CheckRunResponse>(CancellationToken.None);
             var res = await _client.PostAsync(
                 $"/api/backup-configs/{configId}/check?cloud=ExistenceSize&version={version}", null, CancellationToken.None);
             if (!res.IsSuccessStatusCode)
@@ -798,15 +810,21 @@ public sealed class ChaosMatrixTests(TestWebAppFactory factory, ITestOutputHelpe
                 await Task.Delay(300, CancellationToken.None);
                 continue;
             }
+            var started = await res.Content.ReadFromJsonAsync<CheckRunResponse>(CancellationToken.None);
+            if (started is null)
+                continue;
+            var adopted = before is not null && before.RunId == started.RunId;
             while (sw.Elapsed < TimeSpan.FromMinutes(3))
             {
                 var run = await (await _client.GetAsync($"/api/backup-configs/{configId}/check", CancellationToken.None))
                     .Content.ReadFromJsonAsync<CheckRunResponse>(CancellationToken.None);
-                if (run is null || run.Status == "Running")
+                if (run is null || run.RunId != started.RunId || run.Status == "Running")
                 {
                     await Task.Delay(250, CancellationToken.None);
                     continue;
                 }
+                if (adopted)
+                    break; // somebody else's run, now settled: ask again for one of our own
                 if (run.Status == "Failed" && run.Error?.Contains("busy", StringComparison.OrdinalIgnoreCase) == true)
                     break; // lost the busy race after acceptance — start over
                 return run;
