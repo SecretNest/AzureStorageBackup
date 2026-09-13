@@ -4,6 +4,9 @@ import type { WindDownKind } from './windDownControls'
 
 const STAGE_UNITS: Record<string, string> = {
   Scanning: 'entries',
+  // The conversion of a format-1 catalog, counted like the version load it runs ahead of: versions on the counts
+  // line, entries on the done line (its workload is the whole history's rows, which is what the time goes into).
+  UpgradingCatalog: 'versions',
   // The backup's pre-diff pass over the retained versions (its own token: the check's LoadingIndex counts
   // entries of one index, this counts versions of a container's history).
   LoadingVersions: 'versions',
@@ -48,6 +51,7 @@ const STAGE_LABELS: Record<string, string> = {
   LoadingIndex: 'Loading index',
   LoadingVersions: 'Loading versions',
   CheckingCatalog: 'Checking catalog',
+  UpgradingCatalog: 'Upgrading catalog',
   Assessing: 'Assessing damage',
   WritingIndex: 'Writing index',
   // The commit of the new version, named for the catalog import because that is what takes the time — minutes
@@ -479,10 +483,12 @@ export function stageLines(detail: StageProgress, hold?: PipelineHold) {
             : detail.workDone > 0 &&
               `${formatBytes(detail.workDone)} ${detail.stage === 'Verifying' ? 'verified' : 'restored'}`,
         ]
-      : detail.stage === 'LoadingVersions' || detail.stage === 'UpdatingCatalog'
+      : detail.stage === 'LoadingVersions' ||
+          detail.stage === 'UpdatingCatalog' ||
+          detail.stage === 'UpgradingCatalog'
         ? [
-            // The version-loading pass and the finish's catalog import declare their workload in **entries**
-            // (index rows), not bytes: an import's
+            // The version-loading pass, the format-1 conversion and the finish's catalog import declare their
+            // workload in **entries** (index rows), not bytes: an import's
             // cost is per row, and versions differ in rows by orders of magnitude, so the row fraction is what the
             // percentage and the remaining time are computed from. Formatting it as bytes would print "1.2 MB /
             // 5.0 MB original" over a stage that moves no bytes at all.

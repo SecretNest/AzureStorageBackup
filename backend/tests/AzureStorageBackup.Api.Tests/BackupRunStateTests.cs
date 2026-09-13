@@ -107,9 +107,6 @@ public class BackupRunStateTests
     [Fact]
     public void WrappingUp_starts_at_the_index_write_and_never_before()
     {
-        static BackupRunState At(BackupStage stage) =>
-            new() { Progress = new BackupProgress(stage, 0, 0, 0, 0) };
-
         Assert.False(new BackupRunState().WrappingUp);   // nothing reported yet: a run still starting
         Assert.False(At(BackupStage.Scanning).WrappingUp);
         Assert.False(At(BackupStage.Uploading).WrappingUp);
@@ -117,6 +114,21 @@ public class BackupRunStateTests
         Assert.True(At(BackupStage.UpdatingCatalog).WrappingUp);
         Assert.True(At(BackupStage.CleaningUp).WrappingUp);
     }
+
+    /// <summary>The conversion of a format-1 catalog runs between the scan and the version load — before the load,
+    /// whose write open would otherwise do it silently — and is emphatically not the wrap-up: every upload is still
+    /// ahead of it, and a run that answered "wrapping up" here would refuse Suspend for the length of the history.</summary>
+    [Fact]
+    public void Upgrading_the_catalog_sits_between_scanning_and_the_version_load_and_is_not_wrapping_up()
+    {
+        Assert.Equal(1, (int)BackupStage.UpgradingCatalog);
+        Assert.True(BackupStage.UpgradingCatalog < BackupStage.LoadingVersions);
+        Assert.False(At(BackupStage.UpgradingCatalog).WrappingUp);
+    }
+
+    /// <summary>A run state at a stage and nothing else, for the predicates that read only the stage.</summary>
+    private static BackupRunState At(BackupStage stage) =>
+        new() { Progress = new BackupProgress(stage, 0, 0, 0, 0) };
 
     // While paused the status is still Running (a sub-state), or the scheduler would conclude the round had ended and start another one on top of it.
     [Fact]

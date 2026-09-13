@@ -2304,7 +2304,9 @@ function RunStatus({
             ? 'LoadingVersions'
             : p.stage === BackupStage.CheckingCatalog
               ? 'CheckingCatalog'
-              : undefined
+              : p.stage === BackupStage.UpgradingCatalog
+                ? 'UpgradingCatalog'
+                : undefined
         }
       />
       {/* Details are folded into an expandable area: the path being processed can be very long and would

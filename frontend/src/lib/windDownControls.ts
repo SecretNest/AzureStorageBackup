@@ -59,15 +59,17 @@ export function windDownFromServer(stop: StopRequested | string | null | undefin
  * answer success and show "Paused" over a run that went on to Completed, and Suspend hung for its cap and
  * then handed back a Completed run labelled "Suspending…". At a few million entries the index write is
  * minutes, a whole stage rather than a race window. Stop stays live: it still skips the cleanup.
- * @param catalogPass The run is between its scan and its diff, in one of the two catalog passes that consult
+ * @param catalogPass The run is between its scan and its diff, in one of the three catalog passes that consult
  * no gate. `LoadingVersions`: making sure every retained version is in the catalog — on the first run after an
  * upgrade, the migration of the container's whole history, hours for a big one; an import is one transaction
  * per version, so a Pause pressed against it would read "Pausing…" for the rest of the stage. `CheckingCatalog`:
- * the once-per-process full read of the catalog file, one SQL statement with nothing to park in. In both,
- * Pause alone goes grey; Suspend and Stop stay live, since both end the run here (the check is interrupted,
- * the load keeps every version already imported).
+ * the once-per-process full read of the catalog file, one SQL statement with nothing to park in.
+ * `UpgradingCatalog`: the conversion of a format-1 catalog to the current format, likewise one transaction per
+ * version. In all three, Pause alone goes grey; Suspend and Stop stay live, since both end the run here (the
+ * check is interrupted, the load keeps every version already imported, the conversion every version already
+ * converted).
  */
-export type CatalogPass = 'LoadingVersions' | 'CheckingCatalog'
+export type CatalogPass = 'LoadingVersions' | 'CheckingCatalog' | 'UpgradingCatalog'
 
 export function windDownControls(
   kind: WindDownKind | undefined,
@@ -108,7 +110,9 @@ export function windDownControls(
         ? 'The backup is loading its version history and cannot pause until the diff starts. Suspend or Stop end it now and keep every version already loaded.'
         : canActOnGate && catalogPass === 'CheckingCatalog'
           ? 'The backup is checking its catalog file and cannot pause until the diff starts. Suspend or Stop end it now; the check simply runs again next time.'
-          : undefined),
+          : canActOnGate && catalogPass === 'UpgradingCatalog'
+            ? 'The backup is upgrading its catalog to the current format and cannot pause until the diff starts. Suspend or Stop end it now; the upgrade resumes from the last finished version next time.'
+            : undefined),
     // 'Stopping…' is claimed only where it is the whole truth. Under 'finish' a stop is indeed running,
     // but the button is still live and pressing it still does something, and a disabled-looking label on
     // a live button is the same lie in the other direction.

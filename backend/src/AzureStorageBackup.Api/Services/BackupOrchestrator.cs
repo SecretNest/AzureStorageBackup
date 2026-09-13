@@ -128,6 +128,11 @@ public sealed record BackupRunResult(int Version, int ChangedFiles, long Changed
 public enum BackupStage
 {
     Scanning,
+    /// <summary>A format-1 catalog being converted in place to the current format, one version at a time, before
+    /// anything else opens it (see docs/storage-format.md, "Converting a format-1 catalog"). Its own stage because
+    /// it runs once per container after the upgrade and is as long as the history is big; inside another stage's
+    /// write open it would read as that stage hanging.</summary>
+    UpgradingCatalog,
     /// <summary>Between the scan and the diff: every retained version is being made sure of in the catalog. Nothing
     /// on the first run after an upgrade — the lazy migration of a container's whole history — and its own stage
     /// because for as long as it sat under Scanning, a migration that took hours read as a scan that had hung.</summary>
@@ -767,6 +772,27 @@ public sealed class BackupOrchestrator(
         // indexes down when it is about to import a whole history (see CatalogSql.GlobalIndexNames), and it is what
         // can count versions for the stage line — the number the UI shows while this runs, in place of the scan's
         // final count standing still for hours.
+
+        // A format-1 catalog is converted before anything opens it. Every write open converts on its own (a check
+        // or a restore that comes first does it silently); the backup is where it is expected, so it stands under
+        // its own name with the history's entries as its workload. Pause is greyed as for the version load — one
+        // transaction per version, nothing to park in — and Suspend or Stop end the run between versions; the
+        // conversion resumes from the first version not yet in at the next open.
+        if (catalogs.NeedsUpgrade(request.Account.Id, request.Container))
+        {
+            progress?.Report(new BackupProgress(BackupStage.UpgradingCatalog, 0, 0, 0, 0));
+            using var upgrading = new StageTracker("UpgradingCatalog", info.Versions.Count, d =>
+                progress?.Report(new BackupProgress(BackupStage.UpgradingCatalog, 0, 0, 0, 0) { Detail = d }));
+            var accounting = new CatalogUpgradeAccounting(upgrading);
+            using (control?.Gate.BeginWork())
+                await BeforeUploadAsync(async t =>
+                {
+                    await catalogs.UpgradeAsync(request.Account.Id, request.Container, accounting, t);
+                    return 0;
+                });
+            upgrading.Complete();
+        }
+
         // The catalog's full-file quick_check, when it is owed — a reader saw damage on it (VersionCatalogStore.NeedsCheck;
         // an unclean exit no longer counts, see VersionCatalogStore.OpenMarkerFor). It runs **ahead of** the version
         // load: that load opens the catalog for writing whenever a version is missing, and the check would otherwise
