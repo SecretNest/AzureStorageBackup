@@ -353,6 +353,13 @@ the check instead of trusting it. Deleting the whole `index-cache/` directory co
 data. In a backup run an owed `quick_check` runs on its own stage before the version load — the
 first thing that opens the catalog for writing — so its cost never hides inside another stage's open.
 
+**The long operations run on their own thread.** Microsoft.Data.Sqlite is synchronous underneath,
+so a million-row import, a `CREATE INDEX` over the history or a full-file `quick_check` holds its
+thread for minutes; on a thread-pool thread that was one worker gone for the duration, and Kestrel
+logged thread-pool starvation through the whole of a 2026-09-13 run. Those three start on a
+long-running task's dedicated thread (`VersionCatalog.OffThePoolAsync`) and, since nothing inside
+truly yields, stay there to the end.
+
 **One writer per container.** Every writer — a run's finish, retention, the check's and the
 repairer's marks — takes the container's write lock for the duration, and the write open demands
 that lock as an argument, so "the caller holds it" is checked by the compiler rather than promised

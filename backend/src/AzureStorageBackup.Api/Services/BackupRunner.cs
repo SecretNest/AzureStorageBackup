@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using System.Runtime;
 using AzureStorageBackup.Api.Models;
 
@@ -744,7 +745,8 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             ran = true;
             var result = await sp.GetRequiredService<BackupOrchestrator>().RunAsync(
                 BackupRequestMapper.From(config, account, password, settings, sp.GetService<PackLimits>()),
-                new StateProgress(state), ct, control);
+                new StateProgress(state, new StageTransitionLog(sp.GetService<ILogger<BackupRunner>>(), config.Name, configId)),
+                ct, control);
             state.Version = result.Version;
             state.UnreadableFiles = result.UnreadableFiles;
             state.NewFiles = result.NewFiles;
@@ -825,8 +827,32 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
         GC.Collect(GC.MaxGeneration, GCCollectionMode.Aggressive, blocking: true, compacting: true);
     }
 
-    private sealed class StateProgress(BackupRunState state) : IProgress<BackupProgress>
+    private sealed class StateProgress(BackupRunState state, StageTransitionLog log) : IProgress<BackupProgress>
     {
-        public void Report(BackupProgress value) => state.Progress = value;
+        public void Report(BackupProgress value)
+        {
+            state.Progress = value;
+            log.Observe(value);
+        }
+    }
+}
+
+/// <summary>
+/// One line in the container log per stage change of a run. The progress snapshots themselves are memory only
+/// and polled by the UI (see progress-display.md); nothing between a run's start and its finish reached the log,
+/// so two days of "is it stuck?" (2026-09-12/13) could only be answered from the screen or a polling script,
+/// and the stage durations had to be reconstructed from file dates. With one timestamped line per stage,
+/// <c>docker logs</c> has them. Same-stage snapshots — a thousand a minute during upload — log nothing.
+/// </summary>
+internal sealed class StageTransitionLog(ILogger? logger, string name, int configId)
+{
+    private BackupStage? _last;
+
+    public void Observe(BackupProgress value)
+    {
+        if (_last == value.Stage)
+            return;
+        _last = value.Stage;
+        logger?.LogInformation("Backup '{Name}' (config {ConfigId}): {Stage}", name, configId, value.Stage);
     }
 }

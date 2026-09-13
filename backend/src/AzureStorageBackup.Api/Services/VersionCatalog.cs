@@ -160,12 +160,23 @@ public sealed partial class VersionCatalog : IAsyncDisposable
 
     /// <summary>Recreates whatever <see cref="DropGlobalIndexesAsync"/> took down: one sort and one sequential write
     /// per index, in place of a random read per row per index.</summary>
-    public async Task RebuildGlobalIndexesAsync(CancellationToken ct)
+    public Task RebuildGlobalIndexesAsync(CancellationToken ct) => OffThePoolAsync(async () =>
     {
         using var command = _connection.CreateCommand();
         command.CommandText = CatalogSql.GlobalIndexSchema;
         await command.ExecuteNonQueryAsync(ct);
-    }
+    }, ct);
+
+    /// <summary>
+    /// Runs one of the catalog's long operations on a dedicated thread. Microsoft.Data.Sqlite is synchronous
+    /// underneath — its <c>…Async</c> methods complete on the calling thread — so a million-row import, a
+    /// <c>CREATE INDEX</c> over the whole history or a full-file <c>quick_check</c> holds whatever thread it started on
+    /// for minutes. On a thread-pool thread that is one worker gone for the duration, next to the upload workers'
+    /// own blocking work; Kestrel logged thread-pool starvation for the whole of the 2026-09-13 run. A long-running
+    /// task gets its own thread from the start, and since nothing inside truly yields, it stays there to the end.
+    /// </summary>
+    private static Task OffThePoolAsync(Func<Task> work, CancellationToken ct) =>
+        Task.Factory.StartNew(work, ct, TaskCreationOptions.LongRunning | TaskCreationOptions.DenyChildAttach, TaskScheduler.Default).Unwrap();
 
     /// <summary>
     /// The version size, as a fraction of the history already in the catalog, from which one version's import is
@@ -218,7 +229,9 @@ public sealed partial class VersionCatalog : IAsyncDisposable
     /// otherwise well-formed file that only this full scan would find. Public, not run automatically by
     /// <see cref="OpenAsync"/>, so the caller controls when the scan happens.
     /// </summary>
-    public async Task QuickCheckAsync(CancellationToken ct)
+    public Task QuickCheckAsync(CancellationToken ct) => OffThePoolAsync(() => QuickCheckCoreAsync(ct), ct);
+
+    private async Task QuickCheckCoreAsync(CancellationToken ct)
     {
         ct.ThrowIfCancellationRequested();
         // Microsoft.Data.Sqlite only looks at the token before it starts a statement, and its Cancel() is a no-op — so
@@ -287,7 +300,12 @@ public sealed partial class VersionCatalog : IAsyncDisposable
 
     /// <param name="onEntries">Called with the running row count every <see cref="EntryProgressEvery"/> rows, on the
     /// importing thread; null when nobody is watching.</param>
-    private async Task ImportCoreAsync(int version, long identity, int expected, IAsyncEnumerable<IndexEntry> entries,
+    private Task ImportCoreAsync(int version, long identity, int expected, IAsyncEnumerable<IndexEntry> entries,
+        Func<(IReadOnlyList<string> EmptyDirs, IReadOnlyList<string> Unrecoverable)> tail, CancellationToken ct,
+        Action<long>? onEntries) =>
+        OffThePoolAsync(() => ImportOnThisThreadAsync(version, identity, expected, entries, tail, ct, onEntries), ct);
+
+    private async Task ImportOnThisThreadAsync(int version, long identity, int expected, IAsyncEnumerable<IndexEntry> entries,
         Func<(IReadOnlyList<string> EmptyDirs, IReadOnlyList<string> Unrecoverable)> tail, CancellationToken ct,
         Action<long>? onEntries)
     {
