@@ -27,7 +27,7 @@ import { isInScope, parseScope, scopeToText } from '../lib/scopeRules'
 import { windDownControls, type CatalogPass, type WindDownKind } from '../lib/windDownControls'
 import { runTotals } from '../lib/runSummary'
 import { pipelineHold, preparingRowLabelOf, stageLines, type PipelineHold } from '../lib/stageLines'
-import { windDownFromServer } from '../lib/windDownControls'
+import { runIsSettled, windDownFromServer } from '../lib/windDownControls'
 import { Modal } from '../components/Modal'
 import {
   activityBadgeLabels,
@@ -2289,6 +2289,9 @@ function RunStatus({
           {stagedBytes > 0 && ` · holding ${formatBytes(stagedBytes)} of staging`}
         </div>
       )}
+      {/* Once the pipeline reports its terminal stage the run is only recording its result, and nothing here
+          can reach it — the group goes rather than greying a fourth time. See runIsSettled. */}
+      {!runIsSettled(p.stage) && (
       <RunButtons
         onStop={onStop}
         onSuspend={onSuspend}
@@ -2309,6 +2312,7 @@ function RunStatus({
                 : undefined
         }
       />
+      )}
       {/* Details are folded into an expandable area: the path being processed can be very long and would
           distort the table if laid out in the row. One line of overall progress by default, expanded when
           wanted. */}

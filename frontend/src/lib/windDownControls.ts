@@ -1,3 +1,5 @@
+import { BackupStage } from '../api/backupConfigs'
+
 /**
  * Which run controls stay live once a wind-down has been asked for, and what Stop reads as.
  *
@@ -119,4 +121,24 @@ export function windDownControls(
     stopLabel: kind === 'now' ? 'Stopping…' : 'Stop',
     suspendLabel: kind === 'suspend' ? 'Suspending…' : 'Suspend',
   }
+}
+
+/**
+ * Whether a run still has controls worth offering.
+ *
+ * The stage reaches its terminal value while the run state is still `Running`: the backend reports
+ * `Completed` when the pipeline ends, and only then does the run record its result — the change-count
+ * queries over the draft, the operation-log line, the success webhook, the config's status write. On a
+ * container of a million entries and a webhook that has to answer, that is seconds, and for all of them
+ * the row said "Completed (0 changed)" above a Pause / Suspend / Stop group. Pause and Suspend were
+ * already greyed by the wrap-up rule, and Stop was live but meaningless — its one remaining meaning was
+ * "skip the cleanup", and the cleanup is what just finished.
+ *
+ * So the group goes rather than greys: four dead buttons under the word Completed are noise, and the
+ * row is about to drop them anyway when the status catches up. The backend refuses the same requests
+ * from the same point (`BackupRunState.PipelineFinished`), so this is the half that keeps the operator
+ * from meeting that refusal at all.
+ */
+export function runIsSettled(stage: number): boolean {
+  return stage >= BackupStage.Completed
 }

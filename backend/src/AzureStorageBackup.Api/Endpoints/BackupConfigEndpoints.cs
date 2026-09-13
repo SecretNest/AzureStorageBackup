@@ -1043,8 +1043,13 @@ public static class BackupConfigEndpoints
 
             // Apart from backup, stopping is still asynchronous: this only raises the cancellation signal, and the run itself does not actually wind down until the next cancellation checkpoint.
             // The UI uses that to switch the button to "Stopping…" instead of treating it as already stopped.
+            // A run whose pipeline has finished is told apart from an idle config, for the same reason the wrap-up
+            // refusal is: the row still says Running, so "nothing is running" would contradict the screen.
             return canceled.Count == 0
-                ? Results.Conflict(new { error = "Nothing is running for this backup." })
+                ? Results.Conflict(new
+                {
+                    error = backupRunner.IsFinishing(id) ? FinishedError : "Nothing is running for this backup.",
+                })
                 : Results.Ok(new { canceled, stopping });
         });
 
@@ -1307,6 +1312,11 @@ public static class BackupConfigEndpoints
     /// <summary>The refusal Pause and Suspend share once a run is past its uploads (<see cref="BackupRunState.WrappingUp"/>).</summary>
     private const string WrappingUpError =
         "Every upload is done and the backup is writing its index; it can no longer be paused or suspended and will finish on its own. Stop still skips the cleanup.";
+
+    /// <summary>The refusal a stop gets once the pipeline itself is over (<see cref="BackupRunState.PipelineFinished"/>).
+    /// Stop's meaning was "skip the cleanup", and the cleanup has already run.</summary>
+    private const string FinishedError =
+        "The backup has finished and is recording its result; there is nothing left to stop.";
 
     /// <summary>
     /// Raise the stop request and wait for it to finish flushing to disk, but **for at most <see cref="StopWaitCap"/> (20 seconds in production)**.

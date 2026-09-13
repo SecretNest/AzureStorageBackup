@@ -59,6 +59,19 @@ public sealed class BackupRunState
     /// </summary>
     public bool WrappingUp => Progress is { Stage: >= BackupStage.WritingIndex };
 
+    /// <summary>
+    /// The pipeline has reported its terminal stage. The run is still <see cref="RunStatus.Running"/> for a while
+    /// yet — what is left is the run's own bookkeeping: three SQL passes over the draft for the change counts, the
+    /// operation-log line, the success notification (a webhook, over the network, which is the long one), and the
+    /// config's status write. None of it can be paused, suspended or stopped, and none of it is the backup.
+    /// <para>
+    /// Without this the row said "Completed (0 changed)" over a live Stop button for as long as that webhook took.
+    /// Stop is refused here — <see cref="WrappingUp"/> leaves it alone because it still means "skip the cleanup",
+    /// and by this point the cleanup is done, so the word no longer refers to anything.
+    /// </para>
+    /// </summary>
+    public bool PipelineFinished => Progress is { Stage: BackupStage.Completed };
+
     /// <summary>Number of files this round could not read and therefore carried the old index entry forward for. A
     /// "successful" backup may have stored nothing at all; leave this number off the UI and the operator has only the
     /// notification to go on — and notifications drown in other messages.</summary>
@@ -393,6 +406,11 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
             state = _runs.GetValueOrDefault(configId);
         if (state is not { Status: RunStatus.Running })
             return null;
+        // The pipeline is over and only the bookkeeping is left (BackupRunState.PipelineFinished). A stop raised
+        // now reaches nothing — every stage has returned — but it would set the intent, and the row would read
+        // "Stopping…" over a run that reports Completed a moment later.
+        if (state.PipelineFinished)
+            return null;
         if (state.Control is { } control)
         {
             // control is already disposed before the status flips to terminal (`await using` takes effect ahead of
@@ -464,6 +482,15 @@ public sealed class BackupRunner(IServiceScopeFactory scopes, BackupBusyTracker 
     {
         lock (_lock)
             return _runs.GetValueOrDefault(configId) is { Status: RunStatus.Running, WrappingUp: true };
+    }
+
+    /// <summary>Whether the run on this config has finished its pipeline and is only recording the result
+    /// (<see cref="BackupRunState.PipelineFinished"/>), which is why a stop raised now is refused. False when there
+    /// is no run: like <see cref="IsWrappingUp"/>, the endpoints ask only to choose the wording of a refusal.</summary>
+    public bool IsFinishing(int configId)
+    {
+        lock (_lock)
+            return _runs.GetValueOrDefault(configId) is { Status: RunStatus.Running, PipelineFinished: true };
     }
 
     /// <summary>
