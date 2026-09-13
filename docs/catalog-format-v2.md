@@ -58,8 +58,9 @@ sentinel (`2147483647`) for "still current".
 that rewrites a version's storage reference is a change like any other (see Repair patches).
 
 The table is an ordinary rowid table. `(path, version_from)` is unique. Secondary indexes carry an
-8-byte rowid instead of a path copy. Hash columns (`head_hash`, `tail_hash`, `full_hash`) become
-16-byte BLOBs; `storage_ref` stays TEXT (it is a name, `xxh128:…` or a pack id). `seq` is gone: a
+8-byte rowid instead of a path copy. The hash columns stay TEXT: `EntryRowMapper` is shared with the
+run's work database, and a catalog-only BLOB encoding would be a second definition of the same row
+for a saving of about 100 bytes a row against the 1,150 the key change removes. `seq` is gone: a
 version's order is its `path_key` order (see Legacy order).
 
 `dirs` becomes interval rows on the same rule — a directory is current while any entry below it is —
