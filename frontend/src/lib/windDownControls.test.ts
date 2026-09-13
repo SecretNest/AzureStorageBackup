@@ -126,6 +126,14 @@ describe('loading the version history', () => {
     expect(c.canStop).toBe(true)
   })
 
+  test('the catalog upgrade greys Pause the same way, with a reason of its own', () => {
+    const c = windDownControls(undefined, false, 'UpgradingCatalog')
+    expect(c.canPause).toBe(false)
+    expect(c.canActOnGate).toBe(true)
+    expect(c.canStop).toBe(true)
+    expect(c.pauseHint).toContain('upgrading its catalog')
+  })
+
   test('outside the stage Pause follows the gate controls, with the gate reason', () => {
     expect(windDownControls(undefined).canPause).toBe(true)
     expect(windDownControls(undefined).pauseHint).toBeUndefined()

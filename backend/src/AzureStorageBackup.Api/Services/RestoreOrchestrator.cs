@@ -403,7 +403,7 @@ public sealed class RestoreOrchestrator(
                 : new StageTracker("Restoring", downloadSizes.Count, onProgress, speedWhileInFlight: true) { Clock = Clock };
 
             // The selection is sorted by storage key in memory (bounded by the selection); the whole-version cursor
-            // arrives already ordered by storage object, straight off the entries_storage index. Symlinks are dropped
+            // arrives already ordered by storage object, straight off the entries_ref index. Symlinks are dropped
             // from both: pass one has already restored them, and a tampered index that hands a symlink entry a storage
             // reference would otherwise get it restored twice — once as a link, then once more with the object's
             // content written over it.

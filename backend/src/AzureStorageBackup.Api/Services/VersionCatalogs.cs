@@ -47,6 +47,11 @@ public sealed class VersionCatalogs(
     public Task<bool> VerifyCatalogAsync(int accountId, string container, CancellationToken ct = default) =>
         catalogs.VerifyNowAsync(accountId, container, ct);
 
+    public bool NeedsUpgrade(int accountId, string container) => catalogs.NeedsUpgrade(accountId, container);
+
+    public Task UpgradeAsync(int accountId, string container, IProgress<CatalogUpgradeProgress>? progress, CancellationToken ct = default) =>
+        catalogs.UpgradeAsync(accountId, container, progress, ct);
+
     public async Task EnsureVersionAsync(
         Account account, string container, BackupVersion version, long identityTicks, string? password, CancellationToken ct = default)
     {

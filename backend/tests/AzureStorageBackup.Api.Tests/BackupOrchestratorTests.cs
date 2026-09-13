@@ -1498,6 +1498,71 @@ public sealed class BackupOrchestratorTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
+    /// <summary>A format-1 catalog is converted on the run's first touch of it, under its own stage — counted in
+    /// entries, one version at a time — before the check and the version load, which would otherwise convert it
+    /// silently inside their own write open.</summary>
+    [SkippableFact]
+    public async Task A_Format_1_Catalog_Is_Upgraded_On_Its_Own_Stage_Before_Anything_Else_Opens_It()
+    {
+        Skip.IfNot(AzuriteReachable(), "Azurite not running");
+        Skip.IfNot(SevenZip(), "7z not found");
+
+        var account = AzuriteAccount();
+        var name = RandomName("orchup-");
+        var root = Path.Combine(_temp, "catalogs");
+        var store = new VersionCatalogStore(root);
+        var (orchestrator, _, factory) = Build(catalogStore: store);
+        var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
+        await container.CreateIfNotExistsAsync();
+        try
+        {
+            WriteText("a.txt", "alpha");
+            var first = new List<BackupProgress>();
+            await orchestrator.RunAsync(Request(account, name), new SyncProgress(first));   // version 1, a format-2 catalog
+            Assert.DoesNotContain(first, p => p.Stage == BackupStage.UpgradingCatalog);
+
+            // Rewrite the catalog as a format-1 file holding the same version, the way 2026.9.13.1 left it.
+            var history = new List<VersionIndex>();
+            long identity;
+            await using (var catalog = await store.OpenAsync(account.Id, name, readOnly: true, CancellationToken.None))
+            {
+                using var ms = new MemoryStream();
+                await catalog.SerializeVersionAsync(1, ms, patches: null, CancellationToken.None);
+                ms.Position = 0;
+                using var reader = new IndexStreamReader(ms);
+                history.Add(new VersionIndex
+                {
+                    Version = 1,
+                    Entries = [.. reader.Entries()],
+                    EmptyDirs = [.. reader.ReadEmptyDirs()],
+                    UnrecoverablePaths = [.. reader.ReadUnrecoverable()],
+                });
+                identity = (await catalog.ListVersionsAsync(CancellationToken.None))[0].Identity;
+            }
+            await store.RemoveContainerAsync(account.Id, name, CancellationToken.None);
+            await LegacyCatalogFixture.WriteAsync(store.PathFor(account.Id, name), history, identity);
+
+            WriteText("b.txt", "beta");
+            var second = new List<BackupProgress>();
+            await orchestrator.RunAsync(Request(account, name), new SyncProgress(second));
+
+            var stages = second.Select(p => p.Stage).Distinct().ToList();
+            var upgrading = stages.IndexOf(BackupStage.UpgradingCatalog);
+            Assert.True(upgrading >= 0, "the conversion reports its own stage");
+            Assert.True(upgrading < stages.IndexOf(BackupStage.LoadingVersions));
+            var detail = second.Select(p => p.Detail).Last(d => d is { Stage: "UpgradingCatalog" })!;
+            Assert.Equal(1, detail.Total);
+            Assert.Equal(1, detail.Processed);
+            Assert.Equal(detail.WorkTotal, detail.WorkDone);
+            Assert.True(detail.WorkTotal > 0);
+
+            var third = new List<BackupProgress>();
+            await orchestrator.RunAsync(Request(account, name), new SyncProgress(third));
+            Assert.DoesNotContain(third, p => p.Stage == BackupStage.UpgradingCatalog);
+        }
+        finally { await container.DeleteIfExistsAsync(); }
+    }
+
     /// <summary>A catalog the last process left open — a kill, a crash, a docker stop mid-import — is not re-read at
     /// the next start: SQLite's write-ahead log covers that, the marker is logged, and no stage appears. Until
     /// 2026-09-13 this case paid the full check, 37 minutes on an 8 GB catalog after every interrupted import.</summary>

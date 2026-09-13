@@ -101,7 +101,28 @@ public interface IVersionCatalogs
     /// corrupt and has been replaced (<see cref="VersionCatalogStore.VerifyNowAsync"/>). Defaults to sound for test
     /// doubles that keep no file.</summary>
     Task<bool> VerifyCatalogAsync(int accountId, string container, CancellationToken ct = default) => Task.FromResult(true);
+
+    /// <summary>Whether the container's catalog is a format-1 file the next write open converts
+    /// (<see cref="VersionCatalogStore.NeedsUpgrade"/>). The backup asks before it opens anything, so the conversion
+    /// runs on its own stage line. Defaults to false for doubles that keep no file.</summary>
+    bool NeedsUpgrade(int accountId, string container) => false;
+
+    /// <summary>Converts the catalog now, reporting per version — see <see cref="VersionCatalogStore.UpgradeAsync"/>.</summary>
+    Task UpgradeAsync(int accountId, string container, IProgress<CatalogUpgradeProgress>? progress, CancellationToken ct = default) => Task.CompletedTask;
 }
+
+/// <summary>One reading from a catalog conversion: the version under conversion, rows landed so far over all
+/// versions, the rows the whole history declares, and whether this reading closes the version.
+/// <para>
+/// <paramref name="VersionsDone"/> and <paramref name="VersionsTotal"/> are the counts line's two numbers, and they
+/// are carried rather than derived because a resumed conversion only iterates the versions an earlier attempt did
+/// not finish: counting the readings would have a resume that started at 4 of 10 end at "6 of 10 versions" beside
+/// "entries (100%)". Done counts the rows of <c>upgrade_done</c> — every version already converted, this one
+/// included once its transaction commits — and Total the whole history's versions.
+/// </para>
+/// </summary>
+public readonly record struct CatalogUpgradeProgress(
+    int Version, long RowsDone, long RowsTotal, bool VersionDone, int VersionsDone, int VersionsTotal);
 
 /// <summary>What happened to one version during <see cref="IVersionCatalogs.EnsureVersionsAsync"/>.</summary>
 public enum VersionLoadEvent

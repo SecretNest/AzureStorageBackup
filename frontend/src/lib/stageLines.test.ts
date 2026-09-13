@@ -750,6 +750,18 @@ describe('the version-loading stage', () => {
   })
 })
 
+describe('the catalog upgrade stage', () => {
+  test('counts versions on the counts line and entries on the done line, like Loading versions', () => {
+    const lines = stageLines(
+      progress({ stage: 'UpgradingCatalog', processed: 3, total: 14, workTotal: 5_948_795, workDone: 1_250_000, workPercent: 21, currentItem: 'version 4' }),
+    )
+    expect(lines.label).toBe('Upgrading catalog')
+    expect(lines.counts).toBe('3 of 14 versions')
+    expect(lines.done).toBe('1,250,000 / 5,948,795 entries (21%)')
+    expect(lines.speed).toBe('')
+  })
+})
+
 describe('versionItemLabel', () => {
   test('spells the version out with its dates on the browser clock, like the check and restore lists', () => {
     const start = '2026-09-04T02:59:10.0000000Z'

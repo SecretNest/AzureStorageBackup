@@ -613,12 +613,18 @@ The button's tooltip says so. Suspend and Stop stay live: both end the run there
 path as during the scan, and every version already imported stays in the catalog — a resume picks up
 with only the version that was in flight left to import.
 
-**Checking catalog** (right after, when it runs at all: the full-file `quick_check`, owed only when the
-last process that wrote the catalog did not exit cleanly or a reader saw damage) is treated the same way, for a simpler reason: it is one SQL
+**Checking catalog** (right after, when it runs at all: the full-file `quick_check`, owed only once a
+reader has seen damage on the file) is treated the same way, for a simpler reason: it is one SQL
 statement, and there is nothing inside it to park at. Pause is greyed with its own tooltip; Suspend and
 Stop stay live and take effect at once — the statement is interrupted (`sqlite3_interrupt`, since
 Microsoft.Data.Sqlite only consults the token before a statement starts), the path is left unchecked,
 and the next write open pays for the check instead. Nothing is lost either way.
+
+**Upgrading catalog** (before both, and only for a container whose catalog is still in format 1 —
+the conversion described in [storage-format.md](storage-format.md)) is the third of the same family:
+one transaction per version, nothing to park in. Pause is greyed with its own tooltip; Suspend and
+Stop end the run between versions, and the conversion resumes from the last finished version at the
+next open, so a run ended here costs nothing but the version that was in flight.
 
 ## Not covered
 
