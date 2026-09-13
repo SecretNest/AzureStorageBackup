@@ -1453,26 +1453,25 @@ public sealed class BackupOrchestratorTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>The catalog's full-file quick_check is owed only after an unclean exit (the marker a write open leaves
-    /// and a clean shutdown removes — see VersionCatalogStore), and for a big history it is minutes with nothing to
-    /// report. When it runs it has its own stage between the version load and the diff, and that stage carries no
-    /// progress figures at all: no total, no in-flight item, no bytes — a "0%" over a read that cannot report progress
-    /// read as a hang. The next run on the same process does not mention it.</summary>
+    /// <summary>The catalog's full-file quick_check is owed only once a reader saw damage on it (see
+    /// VersionCatalogStore.ForgetChecked; an unclean exit used to count and no longer does), and for a big history it
+    /// is minutes with nothing to report. When it runs it has its own stage **ahead of** the version load — that load's
+    /// write open is where it used to run unannounced — and that stage carries no progress figures at all: no total,
+    /// no in-flight item, no bytes — a "0%" over a read that cannot report progress read as a hang. The next run on the
+    /// same process does not mention it.</summary>
     [SkippableFact]
-    public async Task The_Catalog_Check_Has_Its_Own_Figureless_Stage_After_An_Unclean_Exit()
+    public async Task The_Catalog_Check_Has_Its_Own_Figureless_Stage_When_Damage_Was_Seen()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
 
         var account = AzuriteAccount();
         var name = RandomName("orchqc-");
-        // The previous process: opened the catalog for writing and never exited cleanly (never disposed).
         var root = Path.Combine(_temp, "catalogs");
-        var crashed = new VersionCatalogStore(root);
-        using (var held = await crashed.LockForWriteAsync(account.Id, name, CancellationToken.None))
-        await using (var _ = await crashed.OpenForWriteAsync(held, account.Id, name, CancellationToken.None)) { }
+        var store = new VersionCatalogStore(root);
+        store.ForgetChecked(account.Id, name); // a reader hit SQLITE_CORRUPT on this container's catalog
 
-        var (orchestrator, _, factory) = Build(catalogStore: new VersionCatalogStore(root));
+        var (orchestrator, _, factory) = Build(catalogStore: store);
         var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
         await container.CreateIfNotExistsAsync();
         try
@@ -1483,7 +1482,8 @@ public sealed class BackupOrchestratorTests : IDisposable
 
             var stages = first.Select(p => p.Stage).Distinct().ToList();
             var checking = stages.IndexOf(BackupStage.CheckingCatalog);
-            Assert.True(checking > stages.IndexOf(BackupStage.LoadingVersions), "the check comes after the versions are loaded");
+            Assert.True(checking >= 0, "the owed check reports its own stage");
+            Assert.True(checking < stages.IndexOf(BackupStage.LoadingVersions), "the check comes before the version load, whose write open used to hide it");
             Assert.True(checking < stages.IndexOf(BackupStage.Diffing), "the check comes before the diff");
             var detail = first.Select(p => p.Detail).First(d => d is { Stage: "CheckingCatalog" })!;
             Assert.Equal(0, detail.Total);          // no fraction to compute a percentage from
@@ -1498,9 +1498,11 @@ public sealed class BackupOrchestratorTests : IDisposable
         finally { await container.DeleteIfExistsAsync(); }
     }
 
-    /// <summary>A catalog the last process closed cleanly is not re-read at the next start: no marker, no stage.</summary>
+    /// <summary>A catalog the last process left open — a kill, a crash, a docker stop mid-import — is not re-read at
+    /// the next start: SQLite's write-ahead log covers that, the marker is logged, and no stage appears. Until
+    /// 2026-09-13 this case paid the full check, 37 minutes on an 8 GB catalog after every interrupted import.</summary>
     [SkippableFact]
-    public async Task A_Cleanly_Closed_Catalog_Is_Not_Checked_Again()
+    public async Task A_Catalog_Left_Open_By_A_Killed_Process_Is_Not_Checked_Again()
     {
         Skip.IfNot(AzuriteReachable(), "Azurite not running");
         Skip.IfNot(SevenZip(), "7z not found");
@@ -1508,10 +1510,10 @@ public sealed class BackupOrchestratorTests : IDisposable
         var account = AzuriteAccount();
         var name = RandomName("orchqc-");
         var root = Path.Combine(_temp, "catalogs");
-        var previous = new VersionCatalogStore(root);
-        using (var held = await previous.LockForWriteAsync(account.Id, name, CancellationToken.None))
-        await using (var _ = await previous.OpenForWriteAsync(held, account.Id, name, CancellationToken.None)) { }
-        previous.Dispose(); // the clean shutdown
+        var crashed = new VersionCatalogStore(root);
+        using (var held = await crashed.LockForWriteAsync(account.Id, name, CancellationToken.None))
+        await using (var _ = await crashed.OpenForWriteAsync(held, account.Id, name, CancellationToken.None)) { }
+        // never disposed: the marker stays on disk
 
         var (orchestrator, _, factory) = Build(catalogStore: new VersionCatalogStore(root));
         var container = factory.CreateServiceClient(account).GetBlobContainerClient(name);
