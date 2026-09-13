@@ -7,7 +7,7 @@ namespace AzureStorageBackup.Api.Tests;
 /// The differ itself no longer hands back such a list — the whole point of the merge is that nothing proportional to
 /// the file count is ever resident — but a test over a tree of a dozen files is precisely the caller for which
 /// collecting them is free, and asserting against a list is far clearer than asserting inside a callback.</summary>
-internal sealed record DiffOutcome(IReadOnlyList<FileChange> Changes, int ChangedFiles, long ChangedBytes)
+internal sealed record DiffOutcome(IReadOnlyList<FileChange> Changes, int ChangedFiles, long ChangedBytes, DiffTotals Totals)
 {
     /// <summary>The single change for one path. A path the diff said nothing about fails here rather than further
     /// down on a null.</summary>
@@ -86,6 +86,6 @@ internal static class DiffTestHarness
             },
             fullHashDeferred is null ? null : entry => fullHashDeferred(entry.Path));
 
-        return new DiffOutcome(changes, totals.ChangedFiles, totals.ChangedBytes);
+        return new DiffOutcome(changes, totals.ChangedFiles, totals.ChangedBytes, totals);
     }
 }

@@ -27,7 +27,10 @@ this belong?" A number that cannot answer it will actively manufacture misreadin
 (2026-09-12/13) "is it stuck?" could only be answered from the screen or a polling script, and the
 stage durations had to be reconstructed from file dates. The runner's progress sink now logs
 `Backup 'name' (config N): Stage` once per change, at information level — `docker logs` has the
-timeline. Same-stage snapshots, a thousand a minute during upload, log nothing.
+timeline. Same-stage snapshots, a thousand a minute during upload, log nothing. The diff adds one
+line of its own when it ends, with where its time went: entries emitted, previous-version rows read,
+entries settled by metadata alone, head/tail-hashed, read in full and how many bytes that was
+(`DiffTotals`). A 61-minute diff over 1.1 M files could not be explained afterwards from a file count.
 
 **Scheduled runs take the same path as the UI button.** Ownership of the busy lock is expressed **by
 method choice, not by a boolean**:
