@@ -311,4 +311,38 @@ public sealed class CatalogV2Tests : IDisposable
         Assert.Equal(1, (await catalog.GetEntryAsync(1, "a", CancellationToken.None))!.Length);
         Assert.Equal([("a", "duplicate")], await catalog.ImportIssuesAsync(1, CancellationToken.None));
     }
+
+    [Fact]
+    public async Task A_patch_on_a_spanning_row_changes_only_its_version()
+    {
+        await using var catalog = await OpenAsync();
+        var a = Entry("a", 1, "h1", new StorageRef { Kind = "blob", Ref = "data/old" });
+        var v1 = Version(1, a); var v2 = Version(2, a); var v3 = Version(3, a);
+        foreach (var index in new[] { v1, v2, v3 })
+            await ImportAsync(catalog, index);
+        Assert.Equal(1, await CountAsync(catalog, "SELECT COUNT(*) FROM entries"));    // one row spans [1,∞)
+
+        await catalog.ApplyPatchesAsync(
+            [new CatalogPatch(2, "a", UnreadableAt: null, Unrecoverable: true, Storage: new StorageRef { Kind = "blob", Ref = "data/new" })],
+            CancellationToken.None);
+
+        Assert.Equal(3, await CountAsync(catalog, "SELECT COUNT(*) FROM entries"));    // [1,2) [2,3) [3,∞)
+        Assert.Equal("data/old", (await catalog.GetEntryAsync(1, "a", CancellationToken.None))!.Storage!.Ref);
+        Assert.Equal("data/new", (await catalog.GetEntryAsync(2, "a", CancellationToken.None))!.Storage!.Ref);
+        Assert.Equal("data/old", (await catalog.GetEntryAsync(3, "a", CancellationToken.None))!.Storage!.Ref);
+        Assert.True(await catalog.IsUnrecoverableAsync(2, "a", CancellationToken.None));
+        Assert.False(await catalog.IsUnrecoverableAsync(3, "a", CancellationToken.None));
+        Assert.Equal(["a"], await catalog.UnrecoverableAsync(2, CancellationToken.None));
+        Assert.Equal(Bytes(v1), await SerializeAsync(catalog, 1));
+        Assert.Equal(Bytes(v3), await SerializeAsync(catalog, 3));
+
+        // Damage marks flow to dedup exactly as before: the ref is damaged if any version says so.
+        Assert.True(await catalog.IsDamagedRefAsync("data/new", CancellationToken.None));
+        Assert.False(await catalog.IsDamagedRefAsync("data/old", CancellationToken.None));
+
+        // Clearing the mark on the same version isolates nothing further (the row is already [2,3)).
+        await catalog.ApplyPatchesAsync([new CatalogPatch(2, "a", null, Unrecoverable: false, null)], CancellationToken.None);
+        Assert.Equal(3, await CountAsync(catalog, "SELECT COUNT(*) FROM entries"));
+        Assert.Empty(await catalog.UnrecoverableAsync(2, CancellationToken.None));
+    }
 }
