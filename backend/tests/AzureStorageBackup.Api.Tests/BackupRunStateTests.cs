@@ -36,6 +36,20 @@ public class BackupRunStateTests
         Assert.All(lines, l => Assert.Contains("photos", l.Text));
     }
 
+    /// <summary>The check's run state carries an id and its response exposes it, like the backup's. CheckRunner.Start
+    /// hands an already-running check back to a second caller by design, so a caller that needs a check that started
+    /// after some event has to be able to tell a fresh run from the one it was handed: the chaos storm's vandal read
+    /// a pre-damage check's clean verdict as "damage not detected" twice in CI before it could.</summary>
+    [Fact]
+    public void Check_run_state_and_response_carry_a_distinct_run_id()
+    {
+        var one = new CheckRunState();
+        var two = new CheckRunState();
+        Assert.NotEqual(one.RunId, two.RunId);
+        Assert.Equal(12, one.RunId.Length);
+        Assert.Equal(one.RunId, CheckRunResponse.From(one).RunId);
+    }
+
     [Fact]
     public void A_missing_logger_is_tolerated()
     {

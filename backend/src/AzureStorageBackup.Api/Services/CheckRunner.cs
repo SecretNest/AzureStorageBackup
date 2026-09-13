@@ -8,6 +8,11 @@ namespace AzureStorageBackup.Api.Services;
 /// <summary>In-memory state of one check run.</summary>
 public sealed class CheckRunState
 {
+    /// <summary>Which run this is. <see cref="CheckRunner.Start"/> hands an already-running check back to a second
+    /// caller by design, so a caller that needs "a check that started after X" has to be able to tell a fresh run
+    /// from the one it was handed — the backup's run state has carried this for the same reason.</summary>
+    public string RunId { get; init; } = Guid.NewGuid().ToString("N")[..12];
+
     public RunStatus Status { get; set; } = RunStatus.Running;
 
     /// <summary>The report of the most recent completed run. **Kept around after the run finishes**: the user must
@@ -41,10 +46,10 @@ public sealed class CheckRunState
 }
 
 public sealed record CheckRunResponse(string Status, CheckReport? Report, string? Error, StageProgress? Detail,
-    DateTimeOffset? FinishedAt = null, string? Resolution = null, int UnrepairedCount = 0)
+    DateTimeOffset? FinishedAt = null, string? Resolution = null, int UnrepairedCount = 0, string RunId = "")
 {
     public static CheckRunResponse From(CheckRunState s) => new(
-        s.Status.ToString(), s.Report, s.Error, s.Detail, s.FinishedAt, s.Resolution?.ToString(), s.UnrepairedCount);
+        s.Status.ToString(), s.Report, s.Error, s.Detail, s.FinishedAt, s.Resolution?.ToString(), s.UnrepairedCount, s.RunId);
 }
 
 /// <summary>
