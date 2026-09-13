@@ -406,7 +406,9 @@ instead ([volume-identity.md](volume-identity.md), "Writing the label").
 
 Measured with one backup run per row over a synthetic tree of unique-content files, sampling
 `Process.WorkingSet64` and the managed heap every two seconds (`MemoryBenchmarkTests`, which the
-suite runs only under `ASB_BENCH=1`). Two runs at each size, shown as *first / second*:
+suite runs only under `ASB_BENCH=1`). These columns cover **the backend process only** — the
+compressor is a child process and is sized separately below. Two runs at each size, shown as
+*first / second*:
 
 | Files in the run | Peak working set | Peak managed heap | Live heap (forced collection) | Working set after the run |
 |---|---|---|---|---|
@@ -444,6 +446,46 @@ whatever holds the per-file share at peak is transient. The working set after a 
 that because of native residue — the SQLite page caches and the allocator's own leftovers from a few
 hundred thousand inserts — and it is the figure worth watching: ~380 MB after 200,000 files, against
 a **400 MB budget for this benchmark**, is a margin of 11–21 MB.
+
+### The compressor is a second process, and it is the larger one
+
+Every figure above is the backend process. Compression runs in a separate **`7zz` process**, so none
+of it appears in those columns — and it shares the container's cgroup, so it counts in full against
+`mem_limit` and against whatever the OOM killer reads. Size the container as **the working set above
+plus the figure below**, never as the working set alone.
+
+7-Zip reduces its dictionary to the size of the input it is handed, so a pack costs in proportion to
+what is in it, up to `-mx9`'s 64 MB dictionary. Measured with `/usr/bin/time -v` against 7zz 26.02
+(x64, 8 threads), invoked as `SevenZipCompressor.CompressAsync` invokes it — one pack, members passed
+as relative paths in argv:
+
+| Members | Pack bytes | `7zz` peak RSS |
+|---|---|---|
+| 500 | 2 MB | 43 MB |
+| 2,000 | 9 MB | 133 MB |
+| 6,000 | 29 MB | 346 MB |
+| 14,000 | 68 MB | 771 MB |
+
+Past 64 MB of input the dictionary stops growing and the peak settles with it, so the default
+`GroupCapBytes` of 100 MB ([packing.md](packing.md)) puts **every full pack at roughly 800 MB**.
+Per-member metadata is the small term: at ~1.3 KB each it is 18 MB at the 14,000 members above, and
+`MaxPackMembers` caps it near 26 MB.
+
+The single-file route arrives at the same ceiling by a different road — `CompressStreamAsync` sizes
+`-md` from the length it stat'ed and caps that at 64 MB — so the **peak** is no different for a large
+file. What differs is how often it is paid. A large file holds one such allocation for the length of
+its compression; a run over many small files takes a fresh one **per pack**, back to back, for as
+long as the run lasts. On a host already near its memory ceiling that is the difference between one
+reclaim and a few thousand, and it is the first thing to weigh when a small-file backup makes the
+whole machine slow while a large-file one does not.
+
+> **Rationale — why this is written down rather than capped.** The dictionary is what makes packing
+> worth doing: a 64 MB window is how one solid block finds matches *across* its members, which is the
+> entire reason small files are merged. Lowering it trades compression ratio for resident bytes, and
+> which side of that trade is right depends on the host, not on us. `Backup__SevenZipMethodArgs` is
+> the lever — an explicit `-md=` is honoured by both compression paths, the streaming one deliberately
+> standing aside for it — so the default is left where 7-Zip puts it. This is a number to know before
+> setting `mem_limit`, not a default to change.
 
 > **Rationale — why the process runs workstation GC and forces one collection per run.** A backup's
 > peak is not its steady state: the scan, the diff and the index write each touch a great deal of
@@ -552,6 +594,7 @@ The three form one chain, and changing any one means revisiting the other two. T
 ## See also
 
 - [run-lifecycle.md](run-lifecycle.md) — graceful shutdown and automatic resume
+- [packing.md](packing.md) — `GroupCapBytes`, which sets the compressor's peak memory
 - [check-restore-repair.md](check-restore-repair.md) — restore's own path-traversal defence
 - [configuration.md](configuration.md) — what is configured per backup rather than per deployment
 - [web-ui.md](web-ui.md) — the login page and the recovery banner
