@@ -69,7 +69,7 @@ public sealed class CatalogV2Tests : IDisposable
         return ms.ToArray();
     }
 
-    private static async Task<long> CountAsync(VersionCatalog catalog, string sql)
+    internal static async Task<long> CountAsync(VersionCatalog catalog, string sql)
     {
         // The row shape is the thing under test here, so this one helper reads the table directly.
         await using var connection = new Microsoft.Data.Sqlite.SqliteConnection(CatalogSql.ConnectionString(catalog.Path, readOnly: true));

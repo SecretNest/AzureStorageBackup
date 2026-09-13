@@ -214,7 +214,7 @@ public sealed partial class VersionCatalog : IAsyncDisposable
     /// own blocking work; Kestrel logged thread-pool starvation for the whole of the 2026-09-13 run. A long-running
     /// task gets its own thread from the start, and since nothing inside truly yields, it stays there to the end.
     /// </summary>
-    private static Task OffThePoolAsync(Func<Task> work, CancellationToken ct) =>
+    internal static Task OffThePoolAsync(Func<Task> work, CancellationToken ct) =>
         Task.Factory.StartNew(work, ct, TaskCreationOptions.LongRunning | TaskCreationOptions.DenyChildAttach, TaskScheduler.Default).Unwrap();
 
     /// <summary>
@@ -303,7 +303,7 @@ public sealed partial class VersionCatalog : IAsyncDisposable
 
     public async Task<CatalogVersionInfo?> GetVersionAsync(int version, CancellationToken ct)
     {
-        using var command = Command(SelectVersionSql);
+        using var command = CreateCommand(SelectVersionSql);
         Set(command, "@v", version);
         await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
         return await reader.ReadAsync(ct) ? ReadVersion(reader) : null;
@@ -311,7 +311,7 @@ public sealed partial class VersionCatalog : IAsyncDisposable
 
     public async Task<IReadOnlyList<CatalogVersionInfo>> ListVersionsAsync(CancellationToken ct)
     {
-        using var command = Command(SelectVersionsSql);
+        using var command = CreateCommand(SelectVersionsSql);
         await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
         var versions = new List<CatalogVersionInfo>();
         while (await reader.ReadAsync(ct))
@@ -372,11 +372,11 @@ public sealed partial class VersionCatalog : IAsyncDisposable
         _transaction = transaction;
         try
         {
-            using var unreadable = Command(PatchUnreadableSql);
-            using var storage = Command(PatchStorageSql);
-            using var flag = Command(PatchUnrecoverableFlagSql);
-            using var append = Command(AppendUnrecoverableListSql);
-            using var remove = Command(RemoveUnrecoverableListSql);
+            using var unreadable = CreateCommand(PatchUnreadableSql);
+            using var storage = CreateCommand(PatchStorageSql);
+            using var flag = CreateCommand(PatchUnrecoverableFlagSql);
+            using var append = CreateCommand(AppendUnrecoverableListSql);
+            using var remove = CreateCommand(RemoveUnrecoverableListSql);
             foreach (var patch in patches)
             {
                 ct.ThrowIfCancellationRequested();
@@ -429,13 +429,42 @@ public sealed partial class VersionCatalog : IAsyncDisposable
 
     // ---- plumbing -------------------------------------------------------------------------------------------
 
-    private SqliteCommand Command(string sql)
+    /// <summary>A command on this catalog's connection, already naming whatever transaction is pending. Internal
+    /// rather than private for <see cref="CatalogUpgrade"/>, which reads the old tables and writes the per-version
+    /// bookkeeping inside the transaction <see cref="RunInTransactionAsync"/> opened for it.</summary>
+    internal SqliteCommand CreateCommand(string sql)
     {
         var command = _connection.CreateCommand();
         command.CommandText = sql;
         command.Transaction = _transaction;
         return command;
     }
+
+    /// <summary>The connection itself, for <see cref="CatalogUpgrade"/>'s DDL — the statements that rename the old
+    /// tables aside and drop them again, which run in transactions of their own rather than an import's.</summary>
+    internal SqliteConnection Connection => _connection;
+
+    /// <summary>The upgrade's transaction door: the merge runs inside a transaction the caller opens, one per version,
+    /// so the conversion can put the version's own bookkeeping (its legacy order, its issues, its "done" row) in the
+    /// same transaction as the rows and be resumable at a version boundary.</summary>
+    internal async Task RunInTransactionAsync(Func<Task> work, CancellationToken ct)
+    {
+        await using var transaction = (SqliteTransaction)await _connection.BeginTransactionAsync(ct);
+        _transaction = transaction;
+        try
+        {
+            await work();
+            await transaction.CommitAsync(ct);
+        }
+        finally
+        {
+            _transaction = null;
+        }
+    }
+
+    /// <summary>Set by <see cref="CatalogUpgrade"/> when the post-conversion <c>VACUUM</c> could not run; the store
+    /// logs it, since it is the one that knows the path.</summary>
+    internal string? VacuumSkipped { get; set; }
 
     /// <summary>The catalog's own parameters (version, path, seq, …) go through the mapper's setter too, so every
     /// command in the class reuses its parameters across rows the same way.</summary>
@@ -465,7 +494,7 @@ public sealed partial class VersionCatalog : IAsyncDisposable
     private async Task<long?> IsolateAsync(int version, string path, CancellationToken ct)
     {
         long id; int from, to;
-        using (var find = Command(SelectCoveringRowSql))
+        using (var find = CreateCommand(SelectCoveringRowSql))
         {
             Set(find, "@path", path);
             Set(find, "@v", version);
@@ -481,7 +510,7 @@ public sealed partial class VersionCatalog : IAsyncDisposable
         if (from == version && to == end)
             return id;
 
-        using (var shrink = Command(ShrinkRowToVersionSql))
+        using (var shrink = CreateCommand(ShrinkRowToVersionSql))
         {
             Set(shrink, "@id", id);
             Set(shrink, "@from", version);
@@ -489,7 +518,7 @@ public sealed partial class VersionCatalog : IAsyncDisposable
             await shrink.ExecuteNonQueryAsync(ct);
         }
 
-        using var copy = Command(CopyRowSql);
+        using var copy = CreateCommand(CopyRowSql);
         Set(copy, "@id", id);
         if (from < version)
         {
@@ -511,7 +540,7 @@ public sealed partial class VersionCatalog : IAsyncDisposable
     /// started at <paramref name="version"/> ends when the version stops describing the path.</summary>
     internal async Task<int?> NextPresentAsync(int version, CancellationToken ct)
     {
-        using var command = Command(SelectNextPresentSql);
+        using var command = CreateCommand(SelectNextPresentSql);
         Set(command, "@v", version);
         return await command.ExecuteScalarAsync(ct) is long next ? (int)next : null;
     }
@@ -520,13 +549,13 @@ public sealed partial class VersionCatalog : IAsyncDisposable
     /// <see cref="DeleteUnreachableEntriesSql"/> judges reachability against.</summary>
     private async Task<int> MaxPresentAsync(CancellationToken ct)
     {
-        using var command = Command(SelectMaxPresentSql);
+        using var command = CreateCommand(SelectMaxPresentSql);
         return await command.ExecuteScalarAsync(ct) is long max ? (int)max : -1;
     }
 
     private async Task UpsertVersionAsync(int version, long identity, int entryCount, CancellationToken ct)
     {
-        using var command = Command(UpsertVersionSql);
+        using var command = CreateCommand(UpsertVersionSql);
         Set(command, "@v", version);
         Set(command, "@identity", identity);
         // The stored count is what was actually inserted, not what the source announced: it becomes the header of the
@@ -538,7 +567,7 @@ public sealed partial class VersionCatalog : IAsyncDisposable
 
     private async Task RecordIssueAsync(int version, string path, string issue, CancellationToken ct)
     {
-        using var command = Command(InsertIssueSql);
+        using var command = CreateCommand(InsertIssueSql);
         Set(command, "@v", version);
         Set(command, "@path", path);
         Set(command, "@issue", issue);
@@ -553,14 +582,14 @@ public sealed partial class VersionCatalog : IAsyncDisposable
 
     private async Task<int?> EntryCountAsync(int version, CancellationToken ct)
     {
-        using var command = Command(SelectEntryCountSql);
+        using var command = CreateCommand(SelectEntryCountSql);
         Set(command, "@v", version);
         return await command.ExecuteScalarAsync(ct) is long count ? (int)count : null;
     }
 
     private async Task<IReadOnlyList<string>> StringsAsync(string sql, int version, CancellationToken ct)
     {
-        using var command = Command(sql);
+        using var command = CreateCommand(sql);
         Set(command, "@v", version);
         await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
         var values = new List<string>();
@@ -573,7 +602,7 @@ public sealed partial class VersionCatalog : IAsyncDisposable
     private async IAsyncEnumerable<IndexEntry> QueryEntriesAsync(
         string sql, int version, [EnumeratorCancellation] CancellationToken ct)
     {
-        using var command = Command(sql);
+        using var command = CreateCommand(sql);
         Set(command, "@v", version);
         await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
@@ -588,3 +617,8 @@ public sealed class CatalogFormatException(string path)
 {
     public string Path { get; } = path;
 }
+
+/// <summary>A format-1 conversion failed for a reason other than cancellation. The store answers it the way it answers
+/// a corrupt file: the catalog is a cache, so it is deleted and rebuilt from the cloud on demand.</summary>
+public sealed class CatalogUpgradeException(string path, Exception cause)
+    : IOException($"Converting catalog '{path}' to the current format failed: {cause.Message}", cause);

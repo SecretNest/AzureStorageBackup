@@ -103,71 +103,74 @@ public sealed partial class VersionCatalog
     /// <param name="ordered">Whether <paramref name="entries"/> come in ascending <see cref="CatalogSql.PathKey"/>
     /// order. If not, they are staged into a temp table, merged from it in path order, and their given order is
     /// recorded in <c>entry_order</c> so <see cref="SerializeVersionAsync"/> reproduces it.</param>
-    private async Task ImportCoreAsync(int version, long identity, int expected, IAsyncEnumerable<IndexEntry> entries,
+    private Task ImportCoreAsync(int version, long identity, int expected, IAsyncEnumerable<IndexEntry> entries,
+        IReadOnlyList<string> emptyDirs, IReadOnlyList<string> unrecoverable, bool ordered, Action<long>? onEntries, CancellationToken ct) =>
+        RunInTransactionAsync(
+            () => MergeVersionAsync(version, identity, expected, entries, emptyDirs, unrecoverable, ordered, onEntries, ct), ct);
+
+    /// <summary>The merge without a transaction of its own, for a caller that already holds one: the conversion of a
+    /// format-1 file, which puts a version's rows and its bookkeeping in one transaction so it can resume at a version
+    /// boundary. Its entries come off the old table in path order, so no staging pass is needed.</summary>
+    internal Task ImportOrderedInTransactionAsync(int version, long identity, int entryCount, IAsyncEnumerable<IndexEntry> entries,
+        IReadOnlyList<string> emptyDirs, IReadOnlyList<string> unrecoverable, Action<long>? onEntries, CancellationToken ct) =>
+        MergeVersionAsync(version, identity, entryCount, entries, emptyDirs, unrecoverable, ordered: true, onEntries, ct);
+
+    /// <summary>The import's body, inside whichever transaction the caller opened.</summary>
+    private async Task MergeVersionAsync(int version, long identity, int expected, IAsyncEnumerable<IndexEntry> entries,
         IReadOnlyList<string> emptyDirs, IReadOnlyList<string> unrecoverable, bool ordered, Action<long>? onEntries, CancellationToken ct)
     {
-        await using var transaction = (SqliteTransaction)await _connection.BeginTransactionAsync(ct);
-        _transaction = transaction;
-        try
+        // Re-importing a version replaces it wholesale: a repair rewrites an index in place. Its rows go the way
+        // retention takes them, and what other versions reach stays.
+        if (await GetVersionAsync(version, ct) is not null)
+            await RemoveVersionCoreAsync(version, ct);
+
+        var source = entries;
+        if (!ordered)
         {
-            // Re-importing a version replaces it wholesale: a repair rewrites an index in place. Its rows go the way
-            // retention takes them, and what other versions reach stays.
-            if (await GetVersionAsync(version, ct) is not null)
-                await RemoveVersionCoreAsync(version, ct);
-
-            var source = entries;
-            if (!ordered)
+            var (seen, ascending) = await StageAsync(entries, ct);
+            if (seen != expected)
+                throw new InvalidOperationException($"Version {version} announced {expected} entries but produced {seen}.");
+            // Only a version whose entries really did arrive out of path order needs its order written down;
+            // for every other one the path order is the order, and the table would be a row per entry per
+            // version — the shape this format exists to stop storing.
+            if (!ascending)
             {
-                var (seen, ascending) = await StageAsync(entries, ct);
-                if (seen != expected)
-                    throw new InvalidOperationException($"Version {version} announced {expected} entries but produced {seen}.");
-                // Only a version whose entries really did arrive out of path order needs its order written down;
-                // for every other one the path order is the order, and the table would be a row per entry per
-                // version — the shape this format exists to stop storing.
-                if (!ascending)
-                {
-                    using var order = Command(RecordStageOrderSql);
-                    Set(order, "@v", version);
-                    await order.ExecuteNonQueryAsync(ct);
-                }
-                source = QueryStageAsync(ct);
+                using var order = CreateCommand(RecordStageOrderSql);
+                Set(order, "@v", version);
+                await order.ExecuteNonQueryAsync(ct);
             }
-
-            var kept = await MergeEntriesAsync(version, expected, source, unrecoverable, ordered, onEntries, ct);
-            AddEmptyDirs(emptyDirs);
-            await MergeDirsAsync(version, ct);
-
-            using var emptyDir = Command(InsertEmptyDirSql);
-            for (var i = 0; i < emptyDirs.Count; i++)
-            {
-                Set(emptyDir, "@v", version);
-                Set(emptyDir, "@path", emptyDirs[i]);
-                Set(emptyDir, "@seq", i);
-                await emptyDir.ExecuteNonQueryAsync(ct);
-            }
-
-            using var list = Command(InsertUnrecoverableListSql);
-            for (var i = 0; i < unrecoverable.Count; i++)
-            {
-                Set(list, "@v", version);
-                Set(list, "@path", unrecoverable[i]);
-                Set(list, "@seq", i);
-                await list.ExecuteNonQueryAsync(ct);
-            }
-
-            if (!ordered)
-            {
-                using var clear = Command(ClearStageSql);
-                await clear.ExecuteNonQueryAsync(ct);
-            }
-
-            await UpsertVersionAsync(version, identity, kept, ct);
-            await transaction.CommitAsync(ct);
+            source = QueryStageAsync(ct);
         }
-        finally
+
+        var kept = await MergeEntriesAsync(version, expected, source, unrecoverable, ordered, onEntries, ct);
+        AddEmptyDirs(emptyDirs);
+        await MergeDirsAsync(version, ct);
+
+        using var emptyDir = CreateCommand(InsertEmptyDirSql);
+        for (var i = 0; i < emptyDirs.Count; i++)
         {
-            _transaction = null;
+            Set(emptyDir, "@v", version);
+            Set(emptyDir, "@path", emptyDirs[i]);
+            Set(emptyDir, "@seq", i);
+            await emptyDir.ExecuteNonQueryAsync(ct);
         }
+
+        using var list = CreateCommand(InsertUnrecoverableListSql);
+        for (var i = 0; i < unrecoverable.Count; i++)
+        {
+            Set(list, "@v", version);
+            Set(list, "@path", unrecoverable[i]);
+            Set(list, "@seq", i);
+            await list.ExecuteNonQueryAsync(ct);
+        }
+
+        if (!ordered)
+        {
+            using var clear = CreateCommand(ClearStageSql);
+            await clear.ExecuteNonQueryAsync(ct);
+        }
+
+        await UpsertVersionAsync(version, identity, kept, ct);
     }
 
     /// <summary>The directories of the version being merged, gathered as its entries go by (every prefix of every
@@ -183,20 +186,20 @@ public sealed partial class VersionCatalog
         _mergeDirs.Clear();
 
         long maxId;
-        using (var max = Command(MaxEntryIdSql))
+        using (var max = CreateCommand(MaxEntryIdSql))
             maxId = Convert.ToInt64(await max.ExecuteScalarAsync(ct));
 
-        using var covering = Command(SelectCoveringSql);
+        using var covering = CreateCommand(SelectCoveringSql);
         Set(covering, "@v", version);
         Set(covering, "@maxId", maxId);
         await using var rows = (SqliteDataReader)await covering.ExecuteReaderAsync(ct);
         var haveRow = await rows.ReadAsync(ct);
 
-        using var insert = Command(InsertEntrySql);
-        using var close = Command(CloseEntrySql);
-        using var start = Command(StartEntryAtSql);
-        using var delete = Command(DeleteEntrySql);
-        using var copy = Command(CopyRowSql);
+        using var insert = CreateCommand(InsertEntrySql);
+        using var close = CreateCommand(CloseEntrySql);
+        using var start = CreateCommand(StartEntryAtSql);
+        using var delete = CreateCommand(DeleteEntrySql);
+        using var copy = CreateCommand(CopyRowSql);
 
         var seen = 0;
         var kept = 0;
@@ -339,20 +342,20 @@ public sealed partial class VersionCatalog
     {
         var next = await NextPresentAsync(version, ct) ?? CatalogSql.OpenEnd;
         long maxId;
-        using (var max = Command(MaxDirIdSql))
+        using (var max = CreateCommand(MaxDirIdSql))
             maxId = Convert.ToInt64(await max.ExecuteScalarAsync(ct));
 
-        using var covering = Command(SelectCoveringDirsSql);
+        using var covering = CreateCommand(SelectCoveringDirsSql);
         Set(covering, "@v", version);
         Set(covering, "@maxId", maxId);
         await using var rows = (SqliteDataReader)await covering.ExecuteReaderAsync(ct);
         var haveRow = await rows.ReadAsync(ct);
 
-        using var insert = Command(InsertDirSql);
-        using var close = Command(CloseDirSql);
-        using var start = Command(StartDirAtSql);
-        using var delete = Command(DeleteDirSql);
-        using var copy = Command(CopyDirSql);
+        using var insert = CreateCommand(InsertDirSql);
+        using var close = CreateCommand(CloseDirSql);
+        using var start = CreateCommand(StartDirAtSql);
+        using var delete = CreateCommand(DeleteDirSql);
+        using var copy = CreateCommand(CopyDirSql);
 
         foreach (var dir in _mergeDirs)
         {
@@ -386,7 +389,7 @@ public sealed partial class VersionCatalog
     }
 
     /// <summary>Empty directories are browsable nodes too: their prefixes and themselves join the directory set
-    /// before the directory merge. Called by <see cref="ImportCoreAsync"/> before <see cref="MergeDirsAsync"/>.</summary>
+    /// before the directory merge. Called by <see cref="MergeVersionAsync"/> before <see cref="MergeDirsAsync"/>.</summary>
     private void AddEmptyDirs(IReadOnlyList<string> emptyDirs)
     {
         foreach (var dir in emptyDirs)
@@ -401,9 +404,9 @@ public sealed partial class VersionCatalog
     /// each row is stored under, and decides whether the version needs an <c>entry_order</c> table at all.</summary>
     private async Task<(int Seen, bool Ascending)> StageAsync(IAsyncEnumerable<IndexEntry> entries, CancellationToken ct)
     {
-        using (var create = Command(CreateStageSql))
+        using (var create = CreateCommand(CreateStageSql))
             await create.ExecuteNonQueryAsync(ct);
-        using var insert = Command(InsertStageSql);
+        using var insert = CreateCommand(InsertStageSql);
         var seq = 0;
         var ascending = true;
         byte[]? lastKey = null;
@@ -424,7 +427,7 @@ public sealed partial class VersionCatalog
 
     private async IAsyncEnumerable<IndexEntry> QueryStageAsync([EnumeratorCancellation] CancellationToken ct)
     {
-        using var command = Command(SelectStageSql);
+        using var command = CreateCommand(SelectStageSql);
         await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
             yield return EntryRowMapper.Read(reader);
@@ -449,13 +452,13 @@ public sealed partial class VersionCatalog
     /// remains; then every entry and directory row nothing remaining reaches; then the per-version tables.</summary>
     private async Task RemoveVersionCoreAsync(int version, CancellationToken ct)
     {
-        using (var drop = Command(DeleteVersionSql))
+        using (var drop = CreateCommand(DeleteVersionSql))
         {
             Set(drop, "@v", version);
             await drop.ExecuteNonQueryAsync(ct);
         }
         var max = await MaxPresentAsync(ct);
-        using (var unreachable = Command(DeleteUnreachableEntriesSql))
+        using (var unreachable = CreateCommand(DeleteUnreachableEntriesSql))
         {
             Set(unreachable, "@max", max);
             await unreachable.ExecuteNonQueryAsync(ct);
@@ -464,11 +467,11 @@ public sealed partial class VersionCatalog
         // any, and this pair has no index to work with.
         if (version > max)
         {
-            using var above = Command(DeleteRowsAboveMaxSql);
+            using var above = CreateCommand(DeleteRowsAboveMaxSql);
             Set(above, "@max", max);
             await above.ExecuteNonQueryAsync(ct);
         }
-        using var rest = Command(DeletePerVersionRowsSql);
+        using var rest = CreateCommand(DeletePerVersionRowsSql);
         Set(rest, "@v", version);
         await rest.ExecuteNonQueryAsync(ct);
     }

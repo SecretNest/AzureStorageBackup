@@ -93,7 +93,19 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
         var path = PathFor(accountId, container);
         if (!File.Exists(path))
             throw new FileNotFoundException($"No catalog for container '{container}' under account {accountId}.", path);
-        return await VersionCatalog.OpenAsync(path, readOnly: true, ct);
+        try
+        {
+            return await VersionCatalog.OpenAsync(path, readOnly: true, ct);
+        }
+        catch (CatalogFormatException)
+        {
+            // A reader met a format-1 file. It cannot convert on its own handle; the write path can, and this is
+            // the one place a read-only open takes the write lock — never while a caller already holds it (the
+            // lock is not reentrant): every read-only opener in the product opens outside its write scopes.
+            using var held = await LockForWriteAsync(accountId, container, ct);
+            await using (var _ = await OpenForWriteAsync(held, accountId, container, ct)) { }
+            return await VersionCatalog.OpenAsync(path, readOnly: true, ct);
+        }
     }
 
     /// <summary>
@@ -115,8 +127,11 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
     /// the same moment, which is all the locking was ever there for.
     /// </para>
     /// </summary>
+    /// <param name="upgradeProgress">Where a format-1 conversion reports, when this open is the one that finds the
+    /// file (<see cref="UpgradeAsync"/> passes the stage's); null everywhere else, and the conversion runs silently.</param>
     public async Task<VersionCatalog> OpenForWriteAsync(
-        CatalogWriteLock held, int accountId, string container, CancellationToken ct)
+        CatalogWriteLock held, int accountId, string container, CancellationToken ct,
+        IProgress<CatalogUpgradeProgress>? upgradeProgress = null)
     {
         ArgumentNullException.ThrowIfNull(held);
         if (held.IsReleased)
@@ -131,9 +146,13 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
 
         try
         {
-            return await OpenCheckedAsync(path, ct);
+            return await OpenCheckedAsync(path, ct, upgradeProgress);
         }
         catch (SqliteException ex) when (ex.SqliteErrorCode is 11 /* SQLITE_CORRUPT */ or 26 /* SQLITE_NOTADB */)
+        {
+            return await RecoverAsync(path, ex, ct);
+        }
+        catch (CatalogUpgradeException ex)
         {
             return await RecoverAsync(path, ex, ct);
         }
@@ -142,7 +161,8 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
     /// <summary>Opens a write catalog and, only the first time this process opens this exact path, runs
     /// <see cref="VersionCatalog.QuickCheckAsync"/>. A failed check disposes the connection (so the file has no open
     /// handle by the time a caller deletes it) and forgets the path was ever checked, before rethrowing.</summary>
-    private async Task<VersionCatalog> OpenCheckedAsync(string path, CancellationToken ct)
+    private async Task<VersionCatalog> OpenCheckedAsync(
+        string path, CancellationToken ct, IProgress<CatalogUpgradeProgress>? upgradeProgress = null)
     {
         // Said once per path per process, on the first write open that finds another process's marker still there.
         if (!_openedHere.ContainsKey(path) && File.Exists(OpenMarkerFor(path)))
@@ -150,6 +170,30 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
                 "Catalog {Path} was not closed cleanly by the last process that wrote it; SQLite's write-ahead log has "
                 + "been recovered on open and the file is not re-read. The check operation verifies it in full.", path);
         var catalog = await VersionCatalog.OpenAsync(path, readOnly: false, ct);
+        if (catalog.NeedsUpgrade)
+        {
+            logger?.LogInformation("Catalog {Path} is in format 1; converting it in place to format {Format}.", path, CatalogSql.Format);
+            try
+            {
+                await CatalogUpgrade.RunAsync(catalog, upgradeProgress, ct);
+            }
+            catch (OperationCanceledException)
+            {
+                // The versions already converted are committed and the file is not stamped, so the next open
+                // resumes; the handle goes, because the next open needs the file to itself.
+                await catalog.DisposeAsync();
+                throw;
+            }
+            catch (Exception ex)
+            {
+                await catalog.DisposeAsync();
+                throw new CatalogUpgradeException(path, ex);
+            }
+            if (catalog.VacuumSkipped is { } why)
+                logger?.LogWarning("Catalog {Path} was converted but not compacted ({Why}); it is correct and larger than it needs to be.", path, why);
+            await catalog.DisposeAsync();
+            catalog = await VersionCatalog.OpenAsync(path, readOnly: false, ct);   // a fresh handle on the stamped file
+        }
         if (NeedsCheck(path))
         {
             try
@@ -206,7 +250,7 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
     /// place. No lock is taken here — the only caller is <see cref="OpenForWriteAsync"/>, which has already proved
     /// the container's write lock is held, and that lock is what keeps a second writer from doing the same thing to
     /// the same file at the same moment.</summary>
-    private async Task<VersionCatalog> RecoverAsync(string path, SqliteException cause, CancellationToken ct)
+    private async Task<VersionCatalog> RecoverAsync(string path, Exception cause, CancellationToken ct)
     {
         logger?.LogWarning(cause,
             "Catalog {Path} is unreadable; deleting it. It is a cache and will be rebuilt from the cloud on demand.", path);
@@ -282,6 +326,34 @@ public sealed class VersionCatalogStore(string rootDir, ILogger<VersionCatalogSt
         var path = PathFor(accountId, container);
         _checkedPaths.TryRemove(path, out _);
         _damageSeen.TryAdd(path, 0);
+    }
+
+    /// <summary>Whether the container's catalog is a format-1 file (or a conversion of one was interrupted) that the
+    /// next write open will convert. The backup asks before it opens anything, so the conversion runs on a stage line
+    /// of its own; every other opener converts silently.</summary>
+    public bool NeedsUpgrade(int accountId, string container)
+    {
+        var path = PathFor(accountId, container);
+        if (!File.Exists(path))
+            return false;
+        try
+        {
+            using var connection = new SqliteConnection(CatalogSql.ConnectionString(path, readOnly: true));
+            connection.Open();
+            return CatalogSql.FormatOf(connection) < CatalogSql.Format
+                && (CatalogSql.HasTable(connection, "v1_entries") || CatalogSql.HasTable(connection, "entries"));
+        }
+        catch (SqliteException)
+        {
+            return false;   // unreadable: the write open's recovery path is the one that deals with it
+        }
+    }
+
+    /// <summary>Converts the catalog now, under the write lock, reporting per version. A no-op on a current file.</summary>
+    public async Task UpgradeAsync(int accountId, string container, IProgress<CatalogUpgradeProgress>? progress, CancellationToken ct)
+    {
+        using var held = await LockForWriteAsync(accountId, container, ct);
+        await using var _ = await OpenForWriteAsync(held, accountId, container, ct, progress);
     }
 
     /// <summary>

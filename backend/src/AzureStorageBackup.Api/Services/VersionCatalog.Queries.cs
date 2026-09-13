@@ -165,7 +165,7 @@ public sealed partial class VersionCatalog
 
     public async Task<IndexEntry?> GetEntryAsync(int version, string path, CancellationToken ct)
     {
-        using var command = Command(SelectEntrySql);
+        using var command = CreateCommand(SelectEntrySql);
         Set(command, "@v", version);
         Set(command, "@path", path);
         await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
@@ -178,7 +178,7 @@ public sealed partial class VersionCatalog
     {
         var children = new List<CatalogChild>();
 
-        using (var dirs = Command(SelectChildDirsSql))
+        using (var dirs = CreateCommand(SelectChildDirsSql))
         {
             Set(dirs, "@v", version);
             Set(dirs, "@parent", parent);
@@ -187,7 +187,7 @@ public sealed partial class VersionCatalog
                 children.Add(new CatalogChild(NameOf(reader.GetString(0)), IsDir: true, reader.GetBoolean(1), Entry: null));
         }
 
-        using (var files = Command(SelectChildEntriesSql))
+        using (var files = CreateCommand(SelectChildEntriesSql))
         {
             Set(files, "@v", version);
             Set(files, "@parent", parent);
@@ -224,7 +224,7 @@ public sealed partial class VersionCatalog
         {
             ct.ThrowIfCancellationRequested();
             var placeholders = string.Join(", ", Enumerable.Range(0, chunk.Length).Select(i => $"@p{i}"));
-            using var command = Command($"SELECT {EntryRowMapper.Columns} FROM entries WHERE {Current} AND path IN ({placeholders})");
+            using var command = CreateCommand($"SELECT {EntryRowMapper.Columns} FROM entries WHERE {Current} AND path IN ({placeholders})");
             Set(command, "@v", version);
             for (var i = 0; i < chunk.Length; i++)
                 Set(command, $"@p{i}", chunk[i]);
@@ -239,7 +239,7 @@ public sealed partial class VersionCatalog
     /// <summary>Paths whose content is carried over from an earlier version because this run could not read the file, and since when.</summary>
     public async Task<IReadOnlyList<(string Path, DateTimeOffset UnreadableAt)>> UnreadableAsync(int version, CancellationToken ct)
     {
-        using var command = Command(SelectUnreadableSql);
+        using var command = CreateCommand(SelectUnreadableSql);
         Set(command, "@v", version);
         await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
         var rows = new List<(string, DateTimeOffset)>();
@@ -250,7 +250,7 @@ public sealed partial class VersionCatalog
 
     public async Task<(long Files, long Bytes)> StatsAsync(int version, CancellationToken ct)
     {
-        using var command = Command(SelectStatsSql);
+        using var command = CreateCommand(SelectStatsSql);
         Set(command, "@v", version);
         await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
         return await reader.ReadAsync(ct) ? (reader.GetInt64(0), reader.GetInt64(1)) : (0, 0);
@@ -286,7 +286,7 @@ public sealed partial class VersionCatalog
         var pool = 0;
         for (var bucket = 0; bucket < counts.Length; bucket++)
         {
-            using var count = Command(
+            using var count = CreateCommand(
                 $"SELECT COUNT(*) FROM entries WHERE {Current} AND unreadable_ticks IS NULL AND {SamplePlan.Predicate(bucket)}");
             Set(count, "@v", version);
             counts[bucket] = Convert.ToInt32(await count.ExecuteScalarAsync(ct));
@@ -313,7 +313,7 @@ public sealed partial class VersionCatalog
 
             // One prepared statement per bucket, re-bound per offset: the picked positions are spread across the
             // bucket, so they cannot be collapsed into a single range.
-            using var pick = Command(
+            using var pick = CreateCommand(
                 $"SELECT {EntryRowMapper.Columns} FROM entries WHERE {Current} AND unreadable_ticks IS NULL " +
                 $"AND {SamplePlan.Predicate(bucket)} ORDER BY path_key LIMIT 1 OFFSET @n");
             Set(pick, "@v", version);
@@ -332,7 +332,7 @@ public sealed partial class VersionCatalog
 
     public async Task<IReadOnlyList<(string Path, int Version)>> CaseCollisionsAsync(int version, CancellationToken ct)
     {
-        using var command = Command(SelectCaseCollisionsSql);
+        using var command = CreateCommand(SelectCaseCollisionsSql);
         Set(command, "@v", version);
         await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
         var rows = new List<(string, int)>();
@@ -347,7 +347,7 @@ public sealed partial class VersionCatalog
     /// survivor as if it were authoritative.</summary>
     public async Task<IReadOnlyList<(string Path, string Issue)>> ImportIssuesAsync(int version, CancellationToken ct)
     {
-        using var command = Command(SelectImportIssuesSql);
+        using var command = CreateCommand(SelectImportIssuesSql);
         Set(command, "@v", version);
         await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
         var rows = new List<(string, string)>();
@@ -363,7 +363,7 @@ public sealed partial class VersionCatalog
     public async IAsyncEnumerable<(StorageRef Storage, long Bytes)> StorageGroupSizesAsync(
         int version, [EnumeratorCancellation] CancellationToken ct)
     {
-        using var command = Command(SelectStorageGroupSizesSql);
+        using var command = CreateCommand(SelectStorageGroupSizesSql);
         Set(command, "@v", version);
         await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
@@ -376,7 +376,7 @@ public sealed partial class VersionCatalog
     /// head or tail is "different content", never a wildcard, because the answer decides what an entry points at.</summary>
     public async Task<CatalogBlobHit?> FindBlobByContentAsync(string fullHash, long length, string? head, string? tail, CancellationToken ct)
     {
-        using var command = Command(FindBlobByContentSql);
+        using var command = CreateCommand(FindBlobByContentSql);
         Set(command, "@f", fullHash);
         Set(command, "@l", length);
         Set(command, "@h", head);
@@ -395,7 +395,7 @@ public sealed partial class VersionCatalog
     /// <summary>Which content holds a blob ref — collision avoidance asks this before claiming an address.</summary>
     public async Task<CatalogRefOwner?> FindRefOwnerAsync(string storageRef, CancellationToken ct)
     {
-        using var command = Command(FindRefOwnerSql);
+        using var command = CreateCommand(FindRefOwnerSql);
         Set(command, "@r", storageRef);
         await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
         if (!await reader.ReadAsync(ct))
@@ -422,7 +422,7 @@ public sealed partial class VersionCatalog
     /// <summary>Content that already sits inside an existing pack, so a new entry can point at the member instead of packing another box.</summary>
     public async Task<CatalogPackMember?> FindPackMemberAsync(string fullHash, long length, string headHash, CancellationToken ct)
     {
-        using var command = Command(FindPackMemberSql);
+        using var command = CreateCommand(FindPackMemberSql);
         Set(command, "@f", fullHash);
         Set(command, "@l", length);
         Set(command, "@h", headHash);
@@ -443,7 +443,7 @@ public sealed partial class VersionCatalog
     public async IAsyncEnumerable<(string Kind, string Ref, int Volumes)> DistinctRefsAsync(
         [EnumeratorCancellation] CancellationToken ct)
     {
-        using var command = Command(SelectDistinctRefsSql);
+        using var command = CreateCommand(SelectDistinctRefsSql);
         await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
             yield return (reader.GetString(0), reader.GetString(1), reader.GetInt32(2));
@@ -459,7 +459,7 @@ public sealed partial class VersionCatalog
         // Interpolated rather than parameterised because the list appears twice and its length varies; the values are
         // ints straight off the info file's version numbers, so there is nothing here a string could smuggle in.
         var list = string.Join(", ", versions.Select(v => v.ToString(CultureInfo.InvariantCulture)));
-        using var command = Command($"""
+        using var command = CreateCommand($"""
             SELECT e.storage_ref FROM entries e
             WHERE e.storage_kind=@k AND e.storage_ref IS NOT NULL
             GROUP BY e.storage_ref
@@ -481,7 +481,7 @@ public sealed partial class VersionCatalog
     public async IAsyncEnumerable<(string PackId, string EntryName, long Length, string FullHash)> LivePackMembersAsync(
         [EnumeratorCancellation] CancellationToken ct)
     {
-        using var command = Command(SelectLivePackMembersSql);
+        using var command = CreateCommand(SelectLivePackMembersSql);
         await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
         string? lastPack = null;
         string? lastName = null;
@@ -520,7 +520,7 @@ public sealed partial class VersionCatalog
     /// <summary>Runs a <c>SELECT EXISTS(…)</c>. The token comes before the parameters because <c>params</c> has to be last.</summary>
     private async Task<bool> ExistsAsync(string sql, CancellationToken ct, params (string Name, object? Value)[] parameters)
     {
-        using var command = Command(sql);
+        using var command = CreateCommand(sql);
         foreach (var (name, value) in parameters)
             Set(command, name, value);
         return Convert.ToInt64(await command.ExecuteScalarAsync(ct)) != 0;
@@ -528,7 +528,7 @@ public sealed partial class VersionCatalog
 
     private async IAsyncEnumerable<string> QueryStringsAsync(string sql, [EnumeratorCancellation] CancellationToken ct)
     {
-        using var command = Command(sql);
+        using var command = CreateCommand(sql);
         await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
             yield return reader.GetString(0);
@@ -537,7 +537,7 @@ public sealed partial class VersionCatalog
     private async IAsyncEnumerable<(int Version, IndexEntry Entry)> QueryVersionedEntriesAsync(
         string sql, string storageRef, [EnumeratorCancellation] CancellationToken ct)
     {
-        using var command = Command(sql);
+        using var command = CreateCommand(sql);
         Set(command, "@r", storageRef);
         await using var reader = (SqliteDataReader)await command.ExecuteReaderAsync(ct);
         while (await reader.ReadAsync(ct))
