@@ -80,6 +80,27 @@ interruptibility under real data volumes. All of it is merged into `main`.
 | 09-13 | The diff logs where its time went when it ends: previous rows read, entries settled by metadata, head/tail-hashed, read in full and the bytes — a 61-minute diff over 1.1 M files had only a file count to explain it | [progress-display.md](progress-display.md) |
 | 09-13 | Catalog format 2: one `entries` row per path per change over a version interval, an integer key so the eight indexes carry a pointer instead of a path copy, imports as a path-ordered merge that writes only the changes, in-place conversion of format-1 files on their own stage | [storage-format.md](storage-format.md) |
 | 09-13 | A run whose pipeline has finished drops its Pause/Suspend/Stop group and refuses a stop: the stage reports `Completed` while the run is still recording its result, and the row offered a live Stop under the word Completed | [run-lifecycle.md](run-lifecycle.md) |
+| 09-17 | One anchor connection to `app.db` held for the process lifetime, so no DbContext close is ever the last close: with pooling off, the last connection's close checkpointed the WAL under an exclusive lock that stalls readers too, and on a ZFS disk the compressor kept saturated it ran past the command timeout — a backup died reading `GlobalSettings` with `database is locked` while nothing was writing | [operations.md](operations.md) |
+
+### The last connection's close (2026-09-17)
+
+A backup on the NAS died mid-run with `SQLite Error 5: 'database is locked'` on a plain read of
+`GlobalSettings` from `app.db`, after the full 30-second command timeout, with the two minutes of log
+before it empty: no scheduled task, no other job, no configuration save. Under WAL a writer cannot
+hold a reader for a second, let alone thirty; what can is an exclusive file lock, and SQLite takes
+one in exactly one ordinary place — when the last open connection closes, it checkpoints the WAL
+under that lock, fsyncs the database and deletes `-wal`, and every newcomer waits. Since pooling
+was switched off (2026.9.7.4) every DbContext scope closes a real connection, so "the last
+connection" is whichever of the run's per-file settings read, the UI poll and the scheduler's tick
+happened to be alone, a dozen times a minute. The fsync it needs is the same one the single-writer
+stall of 08-2026 waited on, on the same disk the compressor keeps saturated; on ZFS it waits for the
+transaction group. The mechanism was reproduced locally (a 240 MB WAL a reader had kept from being
+checkpointed held a fresh reader for the length of the close), and the thread-pool starvation warning
+five seconds before the failure is its consequence: the driver retries a busy prepare by sleeping on
+a pool thread. The process now keeps one anchor connection open for its lifetime
+([operations.md](operations.md) § *SQLite locks*), so no other close is ever the last; the passive
+auto-checkpoint on the committing connection bounds the WAL without locking anyone out, and the WAL
+is folded back once, at shutdown.
 
 ### The migration that read 30 GB to write 1 GB (2026.9.8.3)
 

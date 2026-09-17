@@ -582,6 +582,24 @@ was missing. It costs a `readlink` per lock call and is off by default.
 `app.db` (the application database, through EF Core) is not affected by any of this; it still uses
 the default VFS and its `-shm` file, and has never shown the failure.
 
+`app.db` has a lock story of its own. It is opened without connection pooling (a pooled handle
+reclaimed from a garbage-collected context was being handed to a second thread mid-finalisation,
+2026.9.7.4), so every DbContext scope closes a real connection — and SQLite treats the *last* open
+connection's close specially: it takes an exclusive lock on the file, checkpoints what is left of the
+WAL, fsyncs the database and deletes `-wal`. Under that lock every newcomer waits, readers included;
+WAL's "readers never block" holds only while the WAL is in use. With pooling off, some connection is
+the last one open a dozen times a minute (the run's per-file settings read, the UI poll, the
+scheduler's tick), and on a disk the compressor is saturating that close's fsync waits behind the
+compressor's dirty pages — on ZFS, for the whole transaction group. On 2026-09-17 one of them ran past
+the 30-second command timeout and a backup died reading `GlobalSettings` with `SQLite Error 5:
+'database is locked'` while nothing was writing at all. The process now holds one **anchor
+connection** to `app.db` open for its lifetime (`SqliteAnchorConnection`), so no other close is ever
+the last close and the exclusive-lock checkpoint never runs; the WAL is bounded by the passive
+auto-checkpoint on the committing connection, which locks nobody out. The visible consequence is
+that `app.db-wal` and `app.db-shm` exist for as long as the container runs, and the WAL is folded
+back into `app.db` once, at shutdown. Anyone copying the data directory while the container is up
+must take all three files.
+
 ## Shutdown timing
 
 ```

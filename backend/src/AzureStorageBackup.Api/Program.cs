@@ -39,6 +39,8 @@ if (string.IsNullOrWhiteSpace(sqliteConn))
 // at a rate where that shows. Pinned by SqliteConnectionPoolingTests on the hosted DbContext's live connection.
 sqliteConn = new Microsoft.Data.Sqlite.SqliteConnectionStringBuilder(sqliteConn) { Pooling = false }.ToString();
 builder.Services.AddDbContext<AppDbContext>(options => options.UseSqlite(sqliteConn));
+// Resolved once, right after the journal mode is set (below); a singleton so the host owns its lifetime.
+builder.Services.AddSingleton(_ => SqliteAnchorConnection.Open(sqliteConn));
 
 // --- Data Protection (reversible encryption of sensitive values), keyring persisted to a local volume ---
 var keysPath = builder.Configuration["DataProtection:KeysPath"];
@@ -412,6 +414,11 @@ var journalMode = SqliteJournalMode.Enable(sqliteConn);
 app.Logger.Log(
     journalMode == "wal" ? LogLevel.Information : LogLevel.Warning,
     "SQLite journal mode is {JournalMode}", journalMode);
+// Held open from here until the host disposes it: with pooling off, every DbContext close is a real close, and
+// the last connection to close checkpoints the WAL under an exclusive lock that stalls readers too — on a
+// saturated disk for longer than the command timeout (see SqliteAnchorConnection). With this one open, no other
+// close is ever the last.
+app.Services.GetRequiredService<SqliteAnchorConnection>();
 
 // Create/upgrade the database from the EF migrations at startup (migration history included). A database created by the old EnsureCreated has no migration history and must be deleted and rebuilt (there are no deployments yet).
 using (var scope = app.Services.CreateScope())
