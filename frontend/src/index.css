@@ -1335,6 +1335,11 @@ tbody tr.edit-row > td > .panel {
      of the form waiting for someone to scroll down to them. */
   .form-actions {
     position: sticky;
+    /* The buttons below each claim 120px and cannot shrink under it, and .row never wraps - so at three buttons
+       (Edit's step 1: Next, Cancel, Delete) the bar is wider than a phone and the last one pokes out past the panel;
+       step 2 has four. The rule was written when the bar held two. Wrapping lets the ones that do not fit drop to a
+       second line instead of leaving the screen. */
+    flex-wrap: wrap;
     /* Clear the bottom nav bar, or the two bars stack on each other. The 52px matches .nav-item's min-height. */
     bottom: calc(52px + env(safe-area-inset-bottom));
     z-index: 30; /* Below .sidebar's 40 */
