@@ -497,7 +497,17 @@ export function stageLines(detail: StageProgress, hold?: PipelineHold) {
                 detail.workPercent != null ? ` (${detail.workPercent}%)` : ''
               }`,
           ]
-        : [
+        : detail.stage === 'Diffing'
+          ? [
+              // The diff moves nothing over the wire. Its transferredBytes is the tracker's old accumulate
+              // branch (no per-item upload reading ever arrives on this stage) summing each hashed file's
+              // local read at EndItem — so the number is "bytes read from disk to compute content hashes",
+              // and the speed next to it is the disk's pace. Rendered through the upload wording below it
+              // said "6.232 GB uploaded · 6.6 MB/s" over a Diffing line, and the user asked what had been
+              // uploaded: nothing. The real upload figure is on the Uploading line beneath it.
+              detail.transferredBytes > 0 && `${formatBytes(detail.transferredBytes)} read for hashing`,
+            ]
+          : [
           // Completed and total **source** bytes, pre-compression. A fraction only means something when
           // both sides share a basis — using transferred bytes as the numerator does not work: the
           // denominator (the compressed total) does not exist until compression has run, and the ratio
