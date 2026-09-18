@@ -272,6 +272,7 @@ Every byte is in at most one segment. If they do not add up, this line is worse 
 |---|---|
 | `workDone / workTotal original` | completed and total **source** bytes, pre-compression |
 | `transferredBytes uploaded` | bytes this run actually pushed, post-compression and post-encryption |
+| `transferredBytes read for hashing` | **Diffing only**: the same field, but nothing crossed the wire — the tracker sums each hashed file's local read into it, so it is bytes read from disk to compute content hashes, and the speed beside it is the disk's pace. The upload figure for a pipelined run is on the Uploading line beneath |
 | `unfinishedItemBytes` | already in the cloud, but the item they belong to has not settled |
 | `checkingBytes` | compressed and on disk, but still in checking — not cleared to upload |
 | `waitingToUploadBytes` | on disk with **not one byte on the wire**, whoever happens to own it |

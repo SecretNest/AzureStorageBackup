@@ -841,3 +841,25 @@ describe('the catalog update stage', () => {
     expect(lines.done).toBe('')
   })
 })
+
+describe('diffing done line', () => {
+  /**
+   * The diff's transferredBytes is not a transfer at all: the tracker books each hashed file's local
+   * read into it at EndItem (the diff never supplies a per-item upload reading, so the old accumulate
+   * branch runs, and it accumulates flow.Sent — bytes read from disk). Rendered through the upload
+   * wording it read "6.232 GB uploaded · 6.6 MB/s" over a Diffing line, and the user asked what had
+   * been uploaded: nothing, that is the disk being read for hashes. The real upload figure lives on
+   * the Uploading line rendered beneath it.
+   */
+  test('the diff stage calls its bytes a hash read, not an upload', () => {
+    const { done } = stageLines(
+      progress({ stage: 'Diffing', processed: 1_054_886, total: 1_128_399, transferredBytes: 6_232_000_000 }),
+    )
+    expect(done).toBe('5.804 GB read for hashing')
+  })
+
+  test('the diff stage shows nothing on the done line before a single byte is read', () => {
+    const { done } = stageLines(progress({ stage: 'Diffing', processed: 10, total: 100 }))
+    expect(done).toBe('')
+  })
+})
