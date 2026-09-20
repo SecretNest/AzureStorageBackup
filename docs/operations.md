@@ -471,13 +471,31 @@ Past 64 MB of input the dictionary stops growing and the peak settles with it, s
 Per-member metadata is the small term: at ~1.3 KB each it is 18 MB at the 14,000 members above, and
 `MaxPackMembers` caps it near 26 MB.
 
-The single-file route arrives at the same ceiling by a different road — `CompressStreamAsync` sizes
-`-md` from the length it stat'ed and caps that at 64 MB — so the **peak** is no different for a large
-file. What differs is how often it is paid. A large file holds one such allocation for the length of
-its compression; a run over many small files takes a fresh one **per pack**, back to back, for as
-long as the run lasts. On a host already near its memory ceiling that is the difference between one
-reclaim and a few thousand, and it is the first thing to weigh when a small-file backup makes the
-whole machine slow while a large-file one does not.
+**The single-file route does not stop at that ceiling.** `CompressStreamAsync` sizes `-md` from the
+length it stat'ed and caps it at 64 MB, so the dictionary is the same — but LZMA2 also splits a
+stream into blocks (about 4× the dictionary, 256 MB at `-mx9`) and encodes several of them at once,
+one pair of threads and one dictionary-sized state per block. A 100 MB pack is a single block; a
+large file is as many as the thread count allows. Measured 2026-09-20 with `/usr/bin/time -v`
+against 7zz 26.02 (x64, 8 hardware threads), a 1.07 GB base64 stream fed on stdin exactly as
+`CompressStreamAsync` feeds it (`-mx9 -md=67108864b -v104857600b`):
+
+| `Backup__SevenZipMethodArgs` | `7zz` peak RSS | Wall time |
+|---|---|---|
+| default (`-mx9`, all 8 threads) | **4.23 GB** | 1:10 |
+| `-mx9 -mmt=4` | 2.32 GB | 2:10 |
+| `-mx9 -mmt=2` | 702 MB | 4:31 |
+| `-mx9 -mmemuse=1500m` | 702 MB | 4:32 |
+
+The peak is set by the thread count, not the file size: with 8 threads at most four blocks are in
+flight, so a 10 GB file costs the same 4.2 GB as a 1 GB one, and it holds that for the length of the
+compression. A many-small-files run instead pays ~800 MB per pack, back to back, thousands of times.
+Both shapes matter on a host near its memory ceiling, in different ways — one large reclaim held for
+minutes, or thousands of smaller ones. `-mmt=N` is the precise lever (peak ≈ N/2 dictionary-sized
+states); `-mmemuse=` is the blunt one (7-Zip drops to whatever thread count fits, here straight to
+the `-mmt=2` shape). Halving the threads roughly doubles the time; on a link-bound run
+(`-mmt=4` compresses at ~8 MB/s here, about the upload rate of a 100 Mbit link) the wall clock may
+not move at all, on a faster link it will. Store-only files (`-mx0`, the don't-compress list)
+cost nothing: 5 MB peak measured on a NAS in the middle of a video backup.
 
 > **Rationale — why this is written down rather than capped.** The dictionary is what makes packing
 > worth doing: a 64 MB window is how one solid block finds matches *across* its members, which is the
@@ -520,6 +538,53 @@ sixteen times too small), while the post-run working set tracked it upwards and 
 > only by the leader-map change measured within noise of each other when run in the same session. Any
 > duration question has to be answered by a same-session A/B; the memory readings, by contrast,
 > reproduce to within a few MB.
+
+### On ZFS, the filesystem cache is the largest occupant, and it does not give way
+
+Everything above is memory the container owns. On a ZFS host the run's reads land somewhere else
+first: the ARC, ZFS's own cache, which lives outside the Linux page cache and outside any cgroup.
+A backup that reads most of the data — the first backup, a content-level Check, a run after
+something rewrote modified times (see the README's *Why the first backup is slow*) — streams every
+byte through it, and the ARC keeps growing until it reaches its cap. Two properties of that cache
+turn a long sequential read into a host-wide problem:
+
+- **It fills to its cap on any sustained read and then stays there.** The default cap is half of
+  RAM. Sequentially-read backup data has no reuse value, but the ARC does not know that.
+- **It does not shrink when the host runs short.** The kernel can ask it to, but the ZFS shrinker
+  yields a few tens of MB per call, and direct reclaim takes the faster route: swapping anonymous
+  pages. The ARC keeps its half, and everything else on the host — VMs, other containers, this
+  process — is what gets paged out. Once paged out, a process gets its memory back only as it
+  touches it, so the damage outlives the run.
+
+Measured 2026-09-20 on a QNAP QuTS hero NAS (64 GB, ZFS, 8 hardware threads) 22 hours into a video
+backup that had read 3.8 TB: ARC 33.4 GB against a 33.7 GB cap (`c_max`), 12.5 GB floor, never
+throttled (`memory_throttle_count` 0); 15.3 GB swapped, of which a Windows VM's 8.1 GB of 8.2 GB, and
+1.2 GB of this container's 1.5 GB peak; anonymous pages resident on the whole host: 0.6 GB.
+Everything that was not the ARC had been paged out, and the container itself, at 47 MB resident,
+was logging Kestrel heartbeat warnings for 17 hours while faulting its working set back in.
+
+**The application cannot keep its reads out of the ARC.** `posix_fadvise(DONTNEED)` acts on the
+page cache, which ZFS does not use for file data; OpenZFS before 2.3 accepts `O_DIRECT` and buffers
+anyway; and dataset properties are set on the host as root, not from inside a container. The levers
+are the host's:
+
+- **Before an initialisation or first backup on ZFS, consider lowering the ARC cap for the duration.**
+  The data goes through once and is worth nothing cached; the memory it would take is what the
+  rest of the host runs in. Size it so that *cap + every other tenant's steady state + this
+  container's peak* (the working set above, plus the `7zz` table for the file mix) fits with room
+  for whatever else the host does. Restore it afterwards if the host benefits from a large ARC in
+  normal operation — routine incremental runs open almost nothing and do not refill it.
+- **Or set `primarycache=metadata` on the datasets being backed up.** Their contents then bypass the
+  ARC on every run, not just the first, at no cost to data that is read once (media, archives) and a
+  real cost to data that is read repeatedly. Per dataset, so it can be applied to exactly the trees
+  that are backed up.
+- **Cap the container** (`mem_limit`) only after the two above; it bounds this process and its
+  `7zz`, which are the small tenants in the picture above, and would not have changed this
+  outcome.
+
+Neither undoes a swap-out that has already happened. A VM that is already paged out recovers
+fastest by being restarted while the host has free memory; waiting for it to fault its pages back
+through a saturated array is what "unusable" looks like.
 
 ## 7-Zip binary
 

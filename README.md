@@ -102,6 +102,8 @@ Diffing compares each file against the previous backup's index:
 
 A first backup has no previous index to compare against, so every file takes the slow path. That is the one run where Diffing reads every byte you own.
 
+> **On a ZFS host, plan that run's memory, not just its time.** Every byte read goes through ZFS's ARC cache, which grows to its cap (half of RAM by default) and does not give it back when VMs or other containers need it — they get swapped out instead. Consider lowering the ARC cap for the first backup, or setting `primarycache=metadata` on the datasets you back up; see [operations.md § Memory](docs/operations.md#on-zfs-the-filesystem-cache-is-the-largest-occupant-and-it-does-not-give-way).
+
 > Two consequences worth planning around:
 >
 > - Anything that rewrites modified times without changing content — `touch`, some sync tools, restoring files from another backup, copying across filesystems — makes the next backup re-read and re-hash those files. It will not re-upload them, so no bandwidth is wasted, but the disk work comes back.
