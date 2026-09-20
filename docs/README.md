@@ -34,7 +34,7 @@ document is a bug.
 | | |
 |---|---|
 | [configuration.md](configuration.md) | What a backup is configured with: default inheritance, the container picker, scope rules, the sentinel path, and changing the local root. |
-| [operations.md](operations.md) | The password gate, the local path boundary, key ring loss and recovery, 7-Zip settings, what the process costs in memory, and environment variables. |
+| [operations.md](operations.md) | The password gate, the local path boundary, key ring loss and recovery, 7-Zip settings, what the process and its `7zz` cost in memory, why a ZFS host's ARC needs sizing before a first backup, and environment variables. |
 
 ## Interface
 
