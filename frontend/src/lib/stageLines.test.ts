@@ -83,20 +83,20 @@ describe('stageLines', () => {
     )
 
     expect(pipeline.split(' · ')).toEqual([
-      '+2.794 GB on the cloud',
+      '+3.000 GB on the cloud',
       // No '2 volumes uploading' here any more: the in-flight heading above the stream rows says exactly
       // that sentence, and the pipeline starts at the first thing the heading does not say.
       '2 objects waiting on the same content elsewhere',
       // The whole upload-side wait as one entry: the volumes on the disk, who owns them, and what they weigh —
       // one population stated three ways. No volume on the wire is in the volumes or the bytes, so neither
       // overlaps the "2 volumes uploading" above.
-      '33 volumes (7 objects, 3.073 GB) waiting for uploading',
+      '33 volumes (7 objects, 3.300 GB) waiting for uploading',
       // The same point of the pipeline, kept adjacent and ordered by what is left to do: off the disk, from the
       // source, and — for content already stored — nothing at all but the index entry and the journal record.
       '3 objects waiting to upload in place',
       '12,000 objects waiting to be recorded',
       '1 object checking files',
-      '95.4 MB being checked',
+      '100.0 MB being checked',
       '1 object preparing',
       // The two staging-area waits, split: the lock points at a producer (possibly another backup's), the pool's
       // byte ceiling points at the wire. Reported as one number, the second looked exactly like the first.
@@ -131,8 +131,8 @@ describe('stageLines', () => {
     )
 
     expect(pipeline).toBe(
-      '+63.7 MB on the cloud · nothing on the wire right now · ' +
-        '24 objects (63.7 MB) waiting for uploading · 1 object preparing',
+      '+66.8 MB on the cloud · nothing on the wire right now · ' +
+        '24 objects (66.8 MB) waiting for uploading · 1 object preparing',
     )
     expect(pipeline).not.toContain('starting upload')
   })
@@ -154,7 +154,7 @@ describe('stageLines', () => {
           waitingToUploadBytes: 10_400_000_000,
         }),
       ).pipeline,
-    ).toContain('80 volumes (14 objects, 9.686 GB) waiting for uploading')
+    ).toContain('80 volumes (14 objects, 10.400 GB) waiting for uploading')
 
     expect(
       stageLines(
@@ -164,7 +164,7 @@ describe('stageLines', () => {
           waitingToUploadBytes: 10_400_000_000,
         }),
       ).pipeline,
-    ).toContain('14 objects (9.686 GB) waiting for uploading')
+    ).toContain('14 objects (10.400 GB) waiting for uploading')
 
     expect(stageLines(progress({})).pipeline).not.toContain('waiting for uploading')
   })
@@ -190,7 +190,7 @@ describe('stageLines', () => {
       }),
     ).pipeline
 
-    expect(split).toContain('3 volumes on the staging disk (5 objects, 6.467 GB) waiting for uploading')
+    expect(split).toContain('3 volumes on the staging disk (5 objects, 6.944 GB) waiting for uploading')
   })
 
   /**
@@ -214,7 +214,7 @@ describe('stageLines', () => {
       }),
     )
 
-    expect(pipeline).toContain('269 volumes (1 object, 26.260 GB) waiting for uploading')
+    expect(pipeline).toContain('269 volumes (1 object, 28.196 GB) waiting for uploading')
     expect(pipeline).not.toContain('on the staging disk')
     // The number in front can no longer collapse while the disk is full — that was the whole defect.
     expect(pipeline).not.toContain('0 objects')
@@ -237,7 +237,7 @@ describe('stageLines', () => {
     )
 
     expect(pipeline).toBe(
-      '1 object waiting on the same content elsewhere · 9 volumes (858.3 MB) waiting for uploading',
+      '1 object waiting on the same content elsewhere · 9 volumes (900.0 MB) waiting for uploading',
     )
   })
 
@@ -276,7 +276,7 @@ describe('stageLines', () => {
     )
 
     expect(pipeline).toBe(
-      '269 volumes (1 object, 26.260 GB) waiting for uploading · ' +
+      '269 volumes (1 object, 28.196 GB) waiting for uploading · ' +
         '3 objects waiting to upload in place · ' +
         '12,000 objects waiting to be recorded',
     )
@@ -314,7 +314,7 @@ describe('stageLines', () => {
     )
 
     expect(pipeline).toBe(
-      '9 volumes (3 objects, 858.3 MB) waiting for uploading',
+      '9 volumes (3 objects, 900.0 MB) waiting for uploading',
     )
     expect(pipeline).not.toContain("uploaders' hands")
   })
@@ -344,7 +344,7 @@ describe('stageLines', () => {
    * For the stretch that is compressed but not yet checked, the count and the bytes are separate
    * entries that **do not overlap** with the waiting one: the backend subtracts checking's bytes *and* its
    * volumes from it, so the frontend only has to stop adding them together. Together they read as "one object
-   * is being checked and those 95.4 MB are its; another 2.608 GB across 28 volumes is waiting to go".
+   * is being checked and those 100.0 MB are its; another 2.800 GB across 28 volumes is waiting to go".
    */
   test('keeps what is being checked out of the waiting entry beside it', () => {
     const { pipeline } = stageLines(
@@ -357,8 +357,8 @@ describe('stageLines', () => {
       }),
     )
     expect(pipeline).toBe(
-      '28 volumes (4 objects, 2.608 GB) waiting for uploading · ' +
-        '1 object checking files · 95.4 MB being checked',
+      '28 volumes (4 objects, 2.800 GB) waiting for uploading · ' +
+        '1 object checking files · 100.0 MB being checked',
     )
   })
 
@@ -384,7 +384,7 @@ describe('stageLines', () => {
         waitingToUploadBytes: 2_800_000_000,
       }),
     )
-    expect(done).toBe('1.728 TB / 2.728 TB original (62%) · 1.728 TB uploaded (100% of original)')
+    expect(done).toBe('1.900 TB / 3.000 TB original (62%) · 1.900 TB uploaded (100% of original)')
   })
 
   /**
@@ -403,8 +403,8 @@ describe('stageLines', () => {
         activeItems: [{ label: 'a', sent: 1, total: 2, percent: 50 }],
       }),
     )
-    expect(done).toBe('476.8 MB / 1.863 GB downloaded · 381.5 MB restored')
-    expect(pipeline).toBe('1.490 GB to go')
+    expect(done).toBe('500.0 MB / 2.000 GB downloaded · 400.0 MB restored')
+    expect(pipeline).toBe('1.600 GB to go')
   })
 })
 
@@ -446,7 +446,7 @@ describe('a held pipeline', () => {
    */
   test('a wind-down says the queue is not going to be started', () => {
     expect(stageLines(held(), 'winding-down').pipeline).toBe(
-      '33 volumes (7 objects, 3.073 GB) waiting for uploading · ' +
+      '33 volumes (7 objects, 3.300 GB) waiting for uploading · ' +
         '4,374 objects left for the next run',
     )
   })
@@ -454,7 +454,7 @@ describe('a held pipeline', () => {
   /** A pause holds the same population rather than abandoning it, and the wording has to say which. */
   test('a pause says the queue is held', () => {
     expect(stageLines(held(), 'paused').pipeline).toBe(
-      '33 volumes (7 objects, 3.073 GB) waiting for uploading · ' +
+      '33 volumes (7 objects, 3.300 GB) waiting for uploading · ' +
         '4,374 objects held by the pause',
     )
   })
@@ -476,7 +476,7 @@ describe('a held pipeline', () => {
       'winding-down',
     )
     expect(pipeline).toBe(
-      'nothing on the wire right now · 1 object checking files · 95.4 MB being checked · ' +
+      'nothing on the wire right now · 1 object checking files · 100.0 MB being checked · ' +
         '1 object preparing · 4 objects waiting for the archive slot · 1 object waiting for staging room',
     )
   })
@@ -491,7 +491,7 @@ describe('a held pipeline', () => {
   /** Nothing changes for a run that is neither winding down nor paused. */
   test('an unheld run reads exactly as before', () => {
     expect(stageLines(held()).pipeline).toBe(
-      '33 volumes (7 objects, 3.073 GB) waiting for uploading · ' +
+      '33 volumes (7 objects, 3.300 GB) waiting for uploading · ' +
         '9 objects waiting for the compressor · 4,365 objects queued',
     )
   })
@@ -855,7 +855,7 @@ describe('diffing done line', () => {
     const { done } = stageLines(
       progress({ stage: 'Diffing', processed: 1_054_886, total: 1_128_399, transferredBytes: 6_232_000_000 }),
     )
-    expect(done).toBe('5.804 GB read for hashing')
+    expect(done).toBe('6.232 GB read for hashing')
   })
 
   test('the diff stage shows nothing on the done line before a single byte is read', () => {
