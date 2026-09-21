@@ -63,22 +63,40 @@ describe('formatDuration', () => {
 })
 
 describe('formatBytes', () => {
+  // Decimal units, the same as the backend's ByteSize.Human: the push message for version 16 read
+  // "5.7 GB changed at source → 4.1 GB uploaded" while the screen said 5.332 GB → 3.863 GB for the
+  // same run, because this function divided by 1024 and still wrote "GB". Both sides now count in
+  // thousands, which is also how the Azure bill counts.
+  it('counts in thousands, so its GB is the push message GB', () => {
+    expect(formatBytes(5.332 * 1024 ** 3)).toBe('5.725 GB')
+    expect(formatBytes(3_000_000_000)).toBe('3.000 GB')
+    expect(formatBytes(1_000_000)).toBe('1.0 MB')
+    expect(formatBytes(1000)).toBe('1.0 KB')
+    expect(formatBytes(999)).toBe('999 B')
+  })
+
   it('gives GB and above three decimals, padded, so a slow line is still visibly moving', () => {
     // One decimal at this scale steps in ~100 MB: a progress line can hold "191.0 GB" through several
     // minutes of real upload. The zeros are kept rather than trimmed, so the digit count never shifts
     // under a number that is being watched.
-    expect(formatBytes(3 * 1024 ** 3)).toBe('3.000 GB')
-    expect(formatBytes(2_800_000_000)).toBe('2.608 GB')
-    expect(formatBytes(3 * 1024 ** 4)).toBe('3.000 TB')
+    expect(formatBytes(2_800_000_000)).toBe('2.800 GB')
+    expect(formatBytes(2_804_600_000)).toBe('2.805 GB')
+    expect(formatBytes(3_000_000_000_000)).toBe('3.000 TB')
   })
 
   it('keeps one decimal below GB, where three would be noise', () => {
-    expect(formatBytes(1024)).toBe('1.0 KB')
-    expect(formatBytes(100_000_000)).toBe('95.4 MB')
+    expect(formatBytes(100_000_000)).toBe('100.0 MB')
+    expect(formatBytes(95_400_000)).toBe('95.4 MB')
   })
 
   it('counts plain bytes whole', () => {
     expect(formatBytes(0)).toBe('0 B')
     expect(formatBytes(512)).toBe('512 B')
+  })
+
+  it('carries a value that only reaches 1000 after rounding, as ByteSize.Human does', () => {
+    // 999,960 B is 999.96 KB, which one decimal would print as "1000.0 KB" — a number nobody writes.
+    expect(formatBytes(999_960)).toBe('1.0 MB')
+    expect(formatBytes(999_999_600)).toBe('1.000 GB')
   })
 })

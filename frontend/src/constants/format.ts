@@ -74,18 +74,30 @@ export function formatDuration(seconds: number): string {
 /**
  * Human-readable byte counts. Used all over the backup UI (sizes, speeds); centralised so the copies cannot drift.
  *
+ * **Decimal units** (KB/MB/GB, base 1000), the same as the backend's `ByteSize.Human`, which writes the
+ * push message and the log lines. This function once divided by 1024 while still writing "GB", and the
+ * two disagreed by 7% for the same run: version 16 read "5.332 GB → 3.863 GB" on screen and
+ * "5.7 GB → 4.1 GB" in the push. Decimal is also how the Azure bill counts.
+ *
  * GB and above carry three decimals, KB and MB one. A single decimal at the GB level moves in ~100 MB
  * steps, so a progress line can sit on "191.0 GB" while a good few hundred megabytes go past — the
  * digits are there to show that the number is still moving. At the MB level one decimal already
  * resolves to ~100 KB, and three would be noise rather than news.
  */
 export function formatBytes(n: number): string {
-  if (n < 1024) return `${n} B`
+  if (n < 1000) return `${n} B`
   const units = ['KB', 'MB', 'GB', 'TB']
-  let v = n / 1024
+  let v = n / 1000
   let i = 0
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024
+  while (v >= 1000 && i < units.length - 1) {
+    v /= 1000
+    i++
+  }
+  // Rounding alone can push a value to 1000 (999,960 B is 999.96 KB, which one decimal prints as
+  // "1000.0 KB"). The carry has to be checked again on the *rounded* value, as ByteSize.Human does.
+  const decimals = i >= 2 ? 3 : 1
+  if (Number(v.toFixed(decimals)) >= 1000 && i < units.length - 1) {
+    v /= 1000
     i++
   }
   return `${v.toFixed(i >= 2 ? 3 : 1)} ${units[i]}`
