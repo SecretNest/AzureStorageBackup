@@ -74,10 +74,12 @@ export function formatDuration(seconds: number): string {
 /**
  * Human-readable byte counts. Used all over the backup UI (sizes, speeds); centralised so the copies cannot drift.
  *
- * **Decimal units** (KB/MB/GB, base 1000), the same as the backend's `ByteSize.Human`, which writes the
- * push message and the log lines. This function once divided by 1024 while still writing "GB", and the
- * two disagreed by 7% for the same run: version 16 read "5.332 GB → 3.863 GB" on screen and
- * "5.7 GB → 4.1 GB" in the push. Decimal is also how the Azure bill counts.
+ * **Binary units** (base 1024), written KB/MB/GB as Windows Explorer and `ls -h` write them, and the same
+ * as the backend's `ByteSize.Human`, which writes the push message and the log lines. The two must count
+ * the same way: this function and the backend once disagreed by 7% for the same run, and version 16 read
+ * "5.332 GB → 3.863 GB" on screen against "5.7 GB → 4.1 GB" in the push. Binary is what the settings
+ * inputs labelled "(MB)" store and what 7z splits by: the default volume limit is 100 MiB, so every volume
+ * on the pipeline line is 100 MiB, and in decimal every one of them read as an odd "104.9 MB".
  *
  * GB and above carry three decimals, KB and MB one. A single decimal at the GB level moves in ~100 MB
  * steps, so a progress line can sit on "191.0 GB" while a good few hundred megabytes go past — the
@@ -85,19 +87,19 @@ export function formatDuration(seconds: number): string {
  * resolves to ~100 KB, and three would be noise rather than news.
  */
 export function formatBytes(n: number): string {
-  if (n < 1000) return `${n} B`
+  if (n < 1024) return `${n} B`
   const units = ['KB', 'MB', 'GB', 'TB']
-  let v = n / 1000
+  let v = n / 1024
   let i = 0
-  while (v >= 1000 && i < units.length - 1) {
-    v /= 1000
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024
     i++
   }
-  // Rounding alone can push a value to 1000 (999,960 B is 999.96 KB, which one decimal prints as
-  // "1000.0 KB"). The carry has to be checked again on the *rounded* value, as ByteSize.Human does.
+  // Rounding alone can push a value to 1024 (1,048,536 B is 1023.96 KB, which one decimal prints as
+  // "1024.0 KB"). The carry has to be checked again on the *rounded* value, as ByteSize.Human does.
   const decimals = i >= 2 ? 3 : 1
-  if (Number(v.toFixed(decimals)) >= 1000 && i < units.length - 1) {
-    v /= 1000
+  if (Number(v.toFixed(decimals)) >= 1024 && i < units.length - 1) {
+    v /= 1024
     i++
   }
   return `${v.toFixed(i >= 2 ? 3 : 1)} ${units[i]}`
