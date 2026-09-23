@@ -4,7 +4,7 @@ import { etaLabel } from './etaLabel'
 
 describe('etaLabel', () => {
   test('states the outstanding size alongside the time', () => {
-    expect(etaLabel(45_780, 214_748_364_800)).toBe('214.748 GB (~12h 43m) left')
+    expect(etaLabel(45_780, 214_748_364_800)).toBe('200.000 GB (~12h 43m) left')
   })
 
   test('falls back to the bare time rather than empty parentheses when nothing is outstanding', () => {

@@ -22,13 +22,13 @@ describe('uploadMemoryShare', () => {
 describe('uploadMemoryNotice', () => {
   test('a volume that fits its share is sent from memory in one read', () => {
     expect(uploadMemoryNotice(1024 * MB, 5, 100 * MB)).toBe(
-      'Each of a backup’s 6 upload streams may hold up to 179.0 MB. A 104.9 MB volume fits, so volumes are hashed and sent from memory in one disk read.',
+      'Each of a backup’s 6 upload streams may hold up to 170.7 MB. A 100.0 MB volume fits, so volumes are hashed and sent from memory in one disk read.',
     )
   })
 
   test('a volume past its share is hashed first and read a second time for the send', () => {
     expect(uploadMemoryNotice(600 * MB, 10, 100 * MB)).toBe(
-      'Each of a backup’s 11 upload streams may hold up to 57.2 MB. A 104.9 MB volume does not fit, so every volume is hashed from disk first and read a second time for the send — still labelled, just one extra read.',
+      'Each of a backup’s 11 upload streams may hold up to 54.5 MB. A 100.0 MB volume does not fit, so every volume is hashed from disk first and read a second time for the send — still labelled, just one extra read.',
     )
   })
 
@@ -40,7 +40,7 @@ describe('uploadMemoryNotice', () => {
 
   test('with splitting off an archive is one volume of any size', () => {
     expect(uploadMemoryNotice(600 * MB, 5, null)).toBe(
-      'Each of a backup’s 6 upload streams may hold up to 104.9 MB. Volume splitting is off, so an archive is one volume of any size: archives up to 104.9 MB are sent from memory in one disk read, larger ones are hashed first and read a second time for the send.',
+      'Each of a backup’s 6 upload streams may hold up to 100.0 MB. Volume splitting is off, so an archive is one volume of any size: archives up to 100.0 MB are sent from memory in one disk read, larger ones are hashed first and read a second time for the send.',
     )
   })
 })

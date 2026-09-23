@@ -11,10 +11,12 @@ namespace AzureStorageBackup.Api.Tests;
 /// </summary>
 public class BackupSummaryTests
 {
+    private const long GB = 1L << 30;
+
     private static BackupRunResult Result(
-        int version = 12, int changed = 340, long changedBytes = 4_700_000_000,
+        int version = 12, int changed = 340, long changedBytes = (long)(4.7 * GB),
         int unreadable = 0, int added = 128, int modified = 212, int deleted = 35,
-        long deletedBytes = 2_100_000_000, long uploaded = 1_200_000_000, CleanupReport? cleanup = null) =>
+        long deletedBytes = (long)(2.1 * GB), long uploaded = (long)(1.2 * GB), CleanupReport? cleanup = null) =>
         new(version, changed, changedBytes, unreadable)
         {
             NewFiles = added,
@@ -49,7 +51,7 @@ public class BackupSummaryTests
     [Fact]
     public void Reports_How_Much_The_Deleted_Files_Weighed()
     {
-        var text = BackupSummary.Format(Result(deleted: 35, deletedBytes: 2_100_000_000));
+        var text = BackupSummary.Format(Result(deleted: 35, deletedBytes: (long)(2.1 * GB)));
 
         Assert.Contains("35 deleted (2.1 GB)", text);
     }
@@ -75,7 +77,7 @@ public class BackupSummaryTests
     [Fact]
     public void Reports_Retention_Counts_Separately_For_Packs_And_Blobs()
     {
-        var text = BackupSummary.Format(Result(cleanup: new CleanupReport(2, 37, 412, 5_200_000_000)));
+        var text = BackupSummary.Format(Result(cleanup: new CleanupReport(2, 37, 412, (long)(5.2 * GB))));
 
         Assert.Contains("Retention", text);
         Assert.Contains("2 version(s)", text);

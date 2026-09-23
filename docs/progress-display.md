@@ -567,13 +567,17 @@ Hard constraints on wording:
   ~100 MB steps, so on a slow link the figure sits still while real progress happens; the digits are
   what show the number is alive. The zeros are padded rather than trimmed, so a number being watched
   never changes width under the eye. Below a GB one decimal already resolves to ~100 KB.
-- **Units are decimal (base 1000) on both sides.** `formatBytes` once divided by 1024 while still
-  writing "GB", so the screen and the push message disagreed by 7% for the same run: version 16 read
-  "5.332 GB → 3.863 GB" on the page and "5.7 GB → 4.1 GB" in the notification, from the same two
-  byte counts. Both now count in thousands, which is also how the Azure bill counts. The settings
-  inputs labelled "(MB)" still store mebibytes, because the backend's defaults are `100 * 1024 * 1024`
-  and the stored configurations are in those bytes; the upload-memory notice beside them therefore
-  reads "104.9 MB" for a 100 MiB volume, exactly as `ByteSize.Human` would print it.
+- **Units are binary (base 1024) on both sides, written KB/MB/GB.** `formatBytes` and the backend's
+  `ByteSize.Human` must count the same way: they once differed, and the screen and the push message
+  disagreed by 7% for the same run (version 16 read "5.332 GB → 3.863 GB" on the page and
+  "5.7 GB → 4.1 GB" in the notification, from the same two byte counts). Release 2026.9.21.1 aligned
+  them on decimal, and that made the archive volumes read wrong. 7z splits in 1024s: the settings
+  inputs labelled "(MB)" store mebibytes (the backend's default volume limit is `100 * 1024 * 1024`,
+  passed to 7zz as a byte count), so every volume the program produces is 100 MiB, and in decimal
+  every one of them showed as an odd "104.9 MB" — on the pipeline line, in the upload-memory notice,
+  wherever a volume size appears. Both now count in 1024s, as Windows Explorer and `ls -h` do, and a
+  volume reads "100.0 MB". The labels stay KB/MB/GB rather than KiB/MiB/GiB because that is how the
+  operator's own file manager writes the same sizes.
 
 The string assembly lives in one module. **The entire difficulty of these two lines is order and
 wording**, and once a string is inside JSX there is nowhere left to assert it — a wrong order raises
