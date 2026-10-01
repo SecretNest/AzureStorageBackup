@@ -8,20 +8,20 @@ public class GroupService(AppDbContext db) : IGroupService
 {
     public async Task<IReadOnlyList<Group>> ListAsync(CancellationToken ct = default) =>
         await db.Groups
-            .Include(g => g.Members.OrderBy(m => m.AccountId).ThenBy(m => m.ContainerName))
+            .Include(g => g.Members.OrderBy(m => m.Position))
             .AsNoTracking()
             // NOCASE: SQLite compares by code point by default, which sorts every uppercase letter before every lowercase one (see BackupConfigService.ListAsync).
             .OrderBy(g => EF.Functions.Collate(g.Name, "NOCASE")).ToListAsync(ct);
 
     public async Task<Group?> GetAsync(int id, CancellationToken ct = default) =>
         await db.Groups
-            .Include(g => g.Members.OrderBy(m => m.AccountId).ThenBy(m => m.ContainerName))
+            .Include(g => g.Members.OrderBy(m => m.Position))
             .AsNoTracking()
             .FirstOrDefaultAsync(g => g.Id == id, ct);
 
     public async Task<Group> CreateAsync(string name, IEnumerable<GroupMember> members, CancellationToken ct = default)
     {
-        var list = SortMembers(members);
+        var list = Sequence(members);
         if (list.Count == 0)
             throw new ArgumentException("A group must contain at least one backup.", nameof(members));
 
@@ -38,7 +38,7 @@ public class GroupService(AppDbContext db) : IGroupService
 
     public async Task<Group?> UpdateAsync(int id, string name, IEnumerable<GroupMember> members, CancellationToken ct = default)
     {
-        var list = SortMembers(members);
+        var list = Sequence(members);
         if (list.Count == 0)
             throw new ArgumentException("A group must contain at least one backup.", nameof(members));
 
@@ -54,9 +54,24 @@ public class GroupService(AppDbContext db) : IGroupService
         return group;
     }
 
-    /// <summary>A stable order for group members: by (AccountId, ContainerName), so insertion order does not make the UI jump (§5.6).</summary>
-    private static List<GroupMember> SortMembers(IEnumerable<GroupMember> members) =>
-        members.OrderBy(m => m.AccountId).ThenBy(m => m.ContainerName, StringComparer.Ordinal).ToList();
+    /// <summary>
+    /// Members in the order they were given, numbered from 0, with a backup named twice kept at its first place.
+    /// The order a group is saved in is its run order (see <see cref="GroupMember.Position"/>), so nothing here
+    /// may sort: the request's order is the one the operator arranged.
+    /// </summary>
+    private static List<GroupMember> Sequence(IEnumerable<GroupMember> members)
+    {
+        var seen = new HashSet<(int, string)>();
+        var list = new List<GroupMember>();
+        foreach (var m in members)
+        {
+            if (!seen.Add((m.AccountId, m.ContainerName)))
+                continue;
+            m.Position = list.Count;
+            list.Add(m);
+        }
+        return list;
+    }
 
     public async Task<bool> DeleteAsync(int id, CancellationToken ct = default)
     {
