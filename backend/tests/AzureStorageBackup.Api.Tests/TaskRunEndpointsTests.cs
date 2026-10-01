@@ -1,3 +1,4 @@
+using System.Net;
 using System.Net.Http.Json;
 using System.Net.Sockets;
 using AzureStorageBackup.Api.Models;
@@ -45,10 +46,11 @@ public sealed class TaskRunEndpointsTests(TestWebAppFactory factory)
             false, ProxyMode.Independent, null, null, null, null)))
             .Content.ReadFromJsonAsync<AccountResponse>();
 
-        await _client.PostAsJsonAsync("/api/backup-configs", new BackupConfigRequest(
+        var config = await (await _client.PostAsJsonAsync("/api/backup-configs", new BackupConfigRequest(
             account!.Id, containerName, "photos", null, _root, null,
             StorageTier.Hot, StorageTier.Hot, null, null, null, false,
-            100, 180, RetentionMode.EitherTriggers, 5_000_000, 100_000_000));
+            100, 180, RetentionMode.EitherTriggers, 5_000_000, 100_000_000)))
+            .Content.ReadFromJsonAsync<ConfigResponse>();
 
         // Scheduled task: backup target (account, container)
         var task = await (await _client.PostAsJsonAsync("/api/tasks", new TaskRequest(
@@ -62,14 +64,21 @@ public sealed class TaskRunEndpointsTests(TestWebAppFactory factory)
 
         try
         {
-            var res = await _client.PostAsync($"/api/tasks/{task!.id}/run", null);
-            res.EnsureSuccessStatusCode();
-
-            // The dispatcher has awaited the whole backup to completion
-            Assert.True(await container.GetBlobClient(BackupDiscovery.IndexBlobName).ExistsAsync());
-
+            // The request is answered as soon as the dispatch is under way — 202, not 200 — and the work goes
+            // on without it. It used to await the whole backup inside the request, which the web client's
+            // one-minute deadline then aborted, cancelling the backup with it (see the endpoint's header).
+            using var abandoned = new CancellationTokenSource();
+            var res = await _client.PostAsync($"/api/tasks/{task!.id}/run", null, abandoned.Token);
+            Assert.Equal(HttpStatusCode.Accepted, res.StatusCode);
             var after = await res.Content.ReadFromJsonAsync<TaskResponse>();
             Assert.NotNull(after!.lastRunAt);
+            // The caller walking away must not reach the backup: it finishes, and leaves an index behind.
+            abandoned.Cancel();
+
+            var state = await WaitForRunAsync(config!.id);
+            await state.Completion.Task.WaitAsync(TimeSpan.FromSeconds(60));
+            Assert.Equal(RunStatus.Completed, state.Status);
+            Assert.True(await container.GetBlobClient(BackupDiscovery.IndexBlobName).ExistsAsync());
         }
         finally
         {
@@ -113,12 +122,20 @@ public sealed class TaskRunEndpointsTests(TestWebAppFactory factory)
             var res = await _client.PostAsync($"/api/tasks/{task!.id}/run", null);
             res.EnsureSuccessStatusCode();
 
+            // The dispatch runs on after the response, so the Warning it writes is awaited, not assumed.
+            var deadline = DateTime.UtcNow.AddSeconds(10);
+            List<LogRow>? logs = null;
+            while (DateTime.UtcNow < deadline)
+            {
+                logs = await _client.GetFromJsonAsync<List<LogRow>>("/api/logs?minLevel=1&limit=20");
+                if (logs!.Any(l => l.message.Contains("busy", StringComparison.OrdinalIgnoreCase)))
+                    break;
+                await Task.Delay(100);
+            }
+            Assert.Contains(logs!, l => l.message.Contains("busy", StringComparison.OrdinalIgnoreCase));
+
             // Busy → skipped: no backup should be produced (the info file does not exist).
             Assert.False(await container.GetBlobClient(BackupDiscovery.IndexBlobName).ExistsAsync());
-
-            // A Warning was logged.
-            var logs = await _client.GetFromJsonAsync<List<LogRow>>("/api/logs?minLevel=1&limit=20");
-            Assert.Contains(logs!, l => l.message.Contains("busy", StringComparison.OrdinalIgnoreCase));
         }
         finally
         {
@@ -127,7 +144,22 @@ public sealed class TaskRunEndpointsTests(TestWebAppFactory factory)
         }
     }
 
+    /// <summary>The run state the detached dispatch registers for the UI to poll; it appears a moment after the response.</summary>
+    private async Task<BackupRunState> WaitForRunAsync(int configId)
+    {
+        var runner = factory.Services.GetRequiredService<BackupRunner>();
+        var deadline = DateTime.UtcNow.AddSeconds(10);
+        while (DateTime.UtcNow < deadline)
+        {
+            if (runner.Get(configId) is { } state)
+                return state;
+            await Task.Delay(50);
+        }
+        throw new TimeoutException($"No run was registered for config {configId}.");
+    }
+
     // Subset of the backend's camelCase JSON
     private sealed record TaskResponse(int id, DateTimeOffset? lastRunAt);
+    private sealed record ConfigResponse(int id);
     private sealed record LogRow(int level, string message);
 }

@@ -115,11 +115,17 @@ export function TasksPage() {
   }
 
   const [running, setRunning] = useState<number | null>(null)
+  // What the last Run now set going. The request comes back as soon as the work is under way (it used to
+  // wait for the whole run, which the one-minute request deadline then cut off — see the endpoint), so the
+  // only visible change on this page is Last run ticking over; this line says where the work itself is.
+  const [started, setStarted] = useState<string | null>(null)
   const runNow = async (t: ScheduledTask) => {
     setError(null)
+    setStarted(null)
     setRunning(t.id)
     try {
       await tasksApi.run(t.id)
+      setStarted(`${taskTypeLabels[t.taskType]} started for ${describeTarget(t)}. Progress shows on the Backups page.`)
       loadTasks()
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e))
@@ -167,6 +173,7 @@ export function TasksPage() {
       </div>
 
       {error && <p className="text-danger">{error}</p>}
+      {started && <p className="text-muted">{started}</p>}
 
       <table className="cards">
         <thead>
