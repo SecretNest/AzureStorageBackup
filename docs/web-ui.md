@@ -305,6 +305,13 @@ into or out of the group — and below it a numbered *Run order* list with up/do
 backup appends it. Existing groups keep the sequence they had: the migration numbers their members
 in (account id, container name) order, which is the order they ran in until then.
 
+**Backups are called by their configuration name** in the picker, the run-order list, the Schedules
+page's Backup select and its Target column, with the account / container they stand for after the
+name (`backupNames.ts`, fed by `GET /api/backup-configs`, which is local rows and so loads with the
+page). The cloud inventory behind "Load backups" knows a backup only as account / container; a
+container with no configuration keeps that form, since it could not run from a schedule anyway.
+A group target is its group's name.
+
 > **Rationale.** Members used to be sorted by (account id, container name) on save and on read, so
 > that insertion order would not make the list jump. The picker shows backups by name, so the order
 > a group actually ran in could not be read off any screen, and could not be changed at all.
