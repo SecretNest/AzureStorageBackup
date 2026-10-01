@@ -14,12 +14,29 @@ public sealed class SchedulerService(
     private readonly TimeZoneInfo _tz = ResolveTimeZone(config["Scheduler:TimeZone"]);
 
     /// <summary>Resolves an IANA/system time zone id; empty or invalid falls back to UTC.</summary>
-    public static TimeZoneInfo ResolveTimeZone(string? id)
+    public static TimeZoneInfo ResolveTimeZone(string? id) => TryResolveTimeZone(id, out var tz) ? tz : TimeZoneInfo.Utc;
+
+    /// <summary>
+    /// Resolves an IANA/system time zone id, and says whether it was understood. Blank is "not configured": UTC, and
+    /// <c>true</c>, because the default is not a mistake. Only an id the system does not know returns <c>false</c>
+    /// (<paramref name="tz"/> is UTC either way), so the Schedules page can tell "UTC because nothing was set" from
+    /// "UTC because what was set was not recognised" — the second is a misconfiguration the operator meant otherwise,
+    /// and a cron hour read in the wrong zone fires at the wrong time every night without any other sign.
+    /// </summary>
+    public static bool TryResolveTimeZone(string? id, out TimeZoneInfo tz)
     {
+        tz = TimeZoneInfo.Utc;
         if (string.IsNullOrWhiteSpace(id))
-            return TimeZoneInfo.Utc;
-        try { return TimeZoneInfo.FindSystemTimeZoneById(id); }
-        catch { return TimeZoneInfo.Utc; }
+            return true;
+        try
+        {
+            tz = TimeZoneInfo.FindSystemTimeZoneById(id);
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)
