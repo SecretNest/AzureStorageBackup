@@ -3,6 +3,7 @@ import { groupsApi, type Group, type GroupMember } from '../api/groups'
 import { backupsApi, backupKey, type DiscoveredBackup } from '../api/backups'
 import { EmptyRow } from '../components/EmptyRow'
 import { Field } from '../components/Field'
+import { moveMember, toggleMember } from '../lib/groupOrder'
 
 export function GroupsSection({ onChanged }: { onChanged?: () => void } = {}) {
   const [groups, setGroups] = useState<Group[]>([])
@@ -14,7 +15,8 @@ export function GroupsSection({ onChanged }: { onChanged?: () => void } = {}) {
   const [editing, setEditing] = useState<Group | null>(null)
   const [showForm, setShowForm] = useState(false)
   const [name, setName] = useState('')
-  const [selected, setSelected] = useState<Set<string>>(new Set())
+  // The members in run order (see groupOrder.ts): a list, not a set, because the order is saved and run.
+  const [selected, setSelected] = useState<string[]>([])
   const [error, setError] = useState<string | null>(null)
   // In-flight guard for Create/Save: there is no uniqueness constraint on a group name, so a double-click
   // (or a second click during a slow response) would silently create two identical groups.
@@ -44,7 +46,7 @@ export function GroupsSection({ onChanged }: { onChanged?: () => void } = {}) {
   const startNew = () => {
     setEditing(null)
     setName('')
-    setSelected(new Set())
+    setSelected([])
     setError(null)
     setShowForm(true)
     if (!poolLoaded) loadPool()
@@ -53,19 +55,14 @@ export function GroupsSection({ onChanged }: { onChanged?: () => void } = {}) {
   const startEdit = (g: Group) => {
     setEditing(g)
     setName(g.name)
-    setSelected(new Set(g.members.map(backupKey)))
+    setSelected(g.members.map(backupKey))
     setError(null)
     setShowForm(true)
     if (!poolLoaded) loadPool()
   }
 
-  const toggle = (key: string) =>
-    setSelected((s) => {
-      const n = new Set(s)
-      if (n.has(key)) n.delete(key)
-      else n.add(key)
-      return n
-    })
+  const toggle = (key: string) => setSelected((s) => toggleMember(s, key))
+  const move = (key: string, delta: -1 | 1) => setSelected((s) => moveMember(s, key, delta))
 
   const memberFromKey = (key: string): GroupMember => {
     const slash = key.indexOf('/')
@@ -73,7 +70,7 @@ export function GroupsSection({ onChanged }: { onChanged?: () => void } = {}) {
   }
 
   const save = async () => {
-    const members = [...selected].map(memberFromKey)
+    const members = selected.map(memberFromKey)
     if (members.length === 0) {
       setError('Select at least one backup.')
       return
@@ -105,7 +102,12 @@ export function GroupsSection({ onChanged }: { onChanged?: () => void } = {}) {
   }
 
   const poolKeys = new Set(pool.map(backupKey))
-  const extraKeys = [...selected].filter((k) => !poolKeys.has(k))
+  const extraKeys = selected.filter((k) => !poolKeys.has(k))
+  const poolByKey = new Map(pool.map((b) => [backupKey(b), b]))
+  const describe = (key: string) => {
+    const b = poolByKey.get(key)
+    return b ? `${b.accountName} / ${b.containerName}` : key
+  }
 
   // Groups are only used by scheduled tasks, so this is a section on the Tasks page rather than a top-level tab of its own.
   return (
@@ -178,7 +180,7 @@ export function GroupsSection({ onChanged }: { onChanged?: () => void } = {}) {
                 const key = backupKey(b)
                 return (
                   <label key={key} style={{ display: 'block' }}>
-                    <input type="checkbox" checked={selected.has(key)} onChange={() => toggle(key)} />{' '}
+                    <input type="checkbox" checked={selected.includes(key)} onChange={() => toggle(key)} />{' '}
                     {b.accountName} / {b.containerName}
                   </label>
                 )
@@ -188,6 +190,30 @@ export function GroupsSection({ onChanged }: { onChanged?: () => void } = {}) {
                   <input type="checkbox" checked onChange={() => toggle(key)} /> {key} (not in current list)
                 </label>
               ))}
+            </div>
+          )}
+
+          {/* The order the group runs in, which is the order it is saved in. The picker above lists backups by
+              name for finding them; this list is the sequence, and the arrows are the only way to change it. */}
+          {selected.length > 0 && (
+            <div style={{ margin: '0.75rem 0 0' }}>
+              <strong>Run order</strong>
+              <ol style={{ margin: '0.25rem 0 0', paddingLeft: '1.5rem' }}>
+                {selected.map((key, i) => (
+                  <li key={key} className={poolByKey.has(key) || !poolLoaded ? undefined : 'text-warn'}>
+                    {describe(key)}{' '}
+                    <button type="button" className="btn-ghost" onClick={() => move(key, -1)} disabled={i === 0} aria-label="Move up">
+                      ↑
+                    </button>
+                    <button type="button" className="btn-ghost" onClick={() => move(key, 1)} disabled={i === selected.length - 1} aria-label="Move down">
+                      ↓
+                    </button>
+                  </li>
+                ))}
+              </ol>
+              <p className="text-faint" style={{ margin: '0.25rem 0 0' }}>
+                A scheduled task runs the members in this order, one after another.
+              </p>
             </div>
           )}
 

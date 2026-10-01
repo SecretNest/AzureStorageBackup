@@ -88,18 +88,44 @@ public class GroupServiceTests : IDisposable
     }
 
     [Fact]
-    public async Task Group_Members_Are_Returned_In_Stable_Order()
+    public async Task Group_Members_Keep_The_Order_They_Were_Given()
     {
-        var outOfOrder = new List<GroupMember>
+        // Not (AccountId, ContainerName) order: the saved order is the run order, and it is the operator's.
+        var arranged = new List<GroupMember>
         {
-            new() { AccountId = 1, ContainerName = "c" },
+            new() { AccountId = 2, ContainerName = "c" },
             new() { AccountId = 1, ContainerName = "a" },
             new() { AccountId = 1, ContainerName = "b" },
         };
-        var created = await _sut.CreateAsync("stable-order", outOfOrder);
+        var created = await _sut.CreateAsync("arranged", arranged);
 
         var g = await _sut.GetAsync(created.Id);
+        Assert.Equal(new[] { "c", "a", "b" }, g!.Members.Select(m => m.ContainerName).ToArray());
+        Assert.Equal(new[] { 0, 1, 2 }, g.Members.Select(m => m.Position).ToArray());
 
-        Assert.Equal(new[] { "a", "b", "c" }, g!.Members.Select(m => m.ContainerName).ToArray());
+        // Rearranged on update: the new order replaces the old one wholesale.
+        await _sut.UpdateAsync(created.Id, "arranged", new List<GroupMember>
+        {
+            new() { AccountId = 1, ContainerName = "b" },
+            new() { AccountId = 2, ContainerName = "c" },
+            new() { AccountId = 1, ContainerName = "a" },
+        });
+        var after = await _sut.GetAsync(created.Id);
+        Assert.Equal(new[] { "b", "c", "a" }, after!.Members.Select(m => m.ContainerName).ToArray());
+        Assert.Equal(new[] { 0, 1, 2 }, after.Members.Select(m => m.Position).ToArray());
+    }
+
+    [Fact]
+    public async Task A_Backup_Named_Twice_Keeps_Its_First_Place()
+    {
+        var created = await _sut.CreateAsync("twice", new List<GroupMember>
+        {
+            new() { AccountId = 1, ContainerName = "a" },
+            new() { AccountId = 1, ContainerName = "b" },
+            new() { AccountId = 1, ContainerName = "a" },
+        });
+
+        var g = await _sut.GetAsync(created.Id);
+        Assert.Equal(new[] { "a", "b" }, g!.Members.Select(m => m.ContainerName).ToArray());
     }
 }

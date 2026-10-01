@@ -295,6 +295,20 @@ the word in the future tense.
 **Backend naming is untouched** — `ScheduledTask`, `tasksApi` and `/api/tasks` all stay. Renaming
 them would spread across the backend and buys the user nothing visible.
 
+## Groups
+
+**A group's order is its run order.** `GroupMember.Position` is the place a backup holds in the
+group, assigned from the order the group was saved in; `GroupService` sorts nothing on the way in,
+collapses a backup named twice to its first place, and returns members by `Position`, which is the
+order `TaskDispatcher` runs them in. The editor keeps the picker — backups listed by name, ticked
+into or out of the group — and below it a numbered *Run order* list with up/down arrows; ticking a
+backup appends it. Existing groups keep the sequence they had: the migration numbers their members
+in (account id, container name) order, which is the order they ran in until then.
+
+> **Rationale.** Members used to be sorted by (account id, container name) on save and on read, so
+> that insertion order would not make the list jump. The picker shows backups by name, so the order
+> a group actually ran in could not be read off any screen, and could not be changed at all.
+
 ## Schedules
 
 **The page says which clock its hours are read in.** `GET /api/system/scheduler` reports the zone

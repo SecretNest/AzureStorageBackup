@@ -52,7 +52,7 @@ Settings must be persisted.
 ## 2. Scheduled tasks
 
 - **2.1 Backup list** — list every discovered backup across accounts. Refreshed **manually**, never automatically (faster loading, fewer reads).
-- **2.2 Groups** — groups can be created, each holding at least one backup. A group has a name and supports full CRUD. Scheduling a task on a group runs it against every backup in the group **in sequence**: the next one starts after the previous finishes, successfully or not.
+- **2.2 Groups** — groups can be created, each holding at least one backup. A group has a name and supports full CRUD. Scheduling a task on a group runs it against every backup in the group **in sequence, in the order the group lists them** (editable in the group): the next one starts after the previous finishes, successfully or not.
 - **2.3 Task settings** — backup and check tasks can be configured per backup or per group. Execution times use cron syntax, but a graphical editor must be provided for non-technical users.
 
 ---
