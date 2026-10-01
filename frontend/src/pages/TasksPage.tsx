@@ -16,6 +16,8 @@ import { groupsApi, type Group } from '../api/groups'
 import { backupsApi, backupKey, type DiscoveredBackup } from '../api/backups'
 import { CronEditor } from '../components/CronEditor'
 import { EmptyRow } from '../components/EmptyRow'
+import { systemApi, type SchedulerInfo } from '../api/system'
+import { scheduleClockLines } from '../lib/scheduleClock'
 import { GroupsSection } from './GroupsPage'
 import { Field } from '../components/Field'
 
@@ -44,6 +46,10 @@ export function TasksPage() {
   const [showForm, setShowForm] = useState(false)
   const [form, setForm] = useState<TaskInput>(emptyForm)
   const [error, setError] = useState<string | null>(null)
+  // The clock the cron hours on this page are read in. Null until the server has said; the page says
+  // nothing about zones rather than guess, because a wrong guess here is worse than none.
+  const [clock, setClock] = useState<SchedulerInfo | null>(null)
+  const clockLines = clock ? scheduleClockLines(clock) : []
 
   const loadTasks = () =>
     tasksApi
@@ -56,6 +62,7 @@ export function TasksPage() {
   useEffect(() => {
     loadTasks()
     groupsApi.list().then(setGroups).catch(() => {})
+    systemApi.scheduler().then(setClock).catch(() => {})
   }, [])
 
   const loadPool = () =>
@@ -172,6 +179,11 @@ export function TasksPage() {
         </button>
       </div>
 
+      {clockLines.map((l) => (
+        <p key={l.text} className={l.warning ? 'text-warn' : 'text-muted'}>
+          {l.text}
+        </p>
+      ))}
       {error && <p className="text-danger">{error}</p>}
       {started && <p className="text-muted">{started}</p>}
 
@@ -299,6 +311,13 @@ export function TasksPage() {
           <div style={{ margin: '0.5rem 0' }}>
             <div>Schedule</div>
             <CronEditor value={form.cronExpression} onChange={(c) => set('cronExpression', c)} />
+            {/* The zone again, right under the hour box: the line at the top of the page has scrolled away by
+                the time the form is open, and this is the moment the hour is being typed. */}
+            {clockLines.length > 0 && (
+              <p className={clockLines[0].warning ? 'text-warn' : 'text-faint'} style={{ margin: '0.25rem 0 0' }}>
+                {clockLines[0].text}
+              </p>
+            )}
           </div>
 
           <Field label="Enabled">

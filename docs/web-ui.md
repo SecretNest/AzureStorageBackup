@@ -297,6 +297,17 @@ them would spread across the backend and buys the user nothing visible.
 
 ## Schedules
 
+**The page says which clock its hours are read in.** `GET /api/system/scheduler` reports the zone
+in effect (`Scheduler__TimeZone`, UTC when unset), its current UTC offset, what was configured and
+whether the server recognised it, and `Scheduler__Enabled`. `scheduleClockLines` turns that into the
+line under the page title and under the Schedule field: "Times are in UTC. Set Scheduler__TimeZone
+on the server to use another zone.", or "Times are in Asia/Shanghai (UTC+08:00), the server's
+Scheduler__TimeZone." A configured zone the server does not recognise is called out in amber rather
+than reported as plain UTC — the fallback is silent on the server side, and a typo there fires every
+schedule at the wrong hour, every night, with no other sign. A switched-off scheduler gets a second
+amber line, because this page is where someone asking "why did it not run" looks. Until the server
+has answered, the page says nothing about zones rather than guess.
+
 **`Run now` starts the schedule and returns.** `POST /api/tasks/{id}/run` records `LastRunAt`, fires
 `TaskDispatcher.DispatchAsync` detached from the request, and answers `202 Accepted`; the page then
 says what was started and that progress shows on the Backups page. The work runs on no request

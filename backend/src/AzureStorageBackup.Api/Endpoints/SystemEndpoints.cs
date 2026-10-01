@@ -52,6 +52,26 @@ public static class SystemEndpoints
         })
         .WithTags("System");
 
+        // The clock cron expressions are read in, for the Schedules page to say next to the hour box. A cron hour
+        // means nothing until the reader knows the zone, and only the server knows it: Scheduler:TimeZone, UTC when
+        // unset — and UTC, silently, when set to something the system does not recognise, which is why the configured
+        // value and whether it was understood travel with the answer. Enabled rides along for the same page: on a
+        // server with the scheduler off, a schedule never fires however right its hour is.
+        app.MapGet("/api/system/scheduler", (IConfiguration config) =>
+        {
+            var configured = config["Scheduler:TimeZone"];
+            var recognised = SchedulerService.TryResolveTimeZone(configured, out var tz);
+            return Results.Ok(new
+            {
+                timeZone = tz.Id,
+                utcOffsetMinutes = (int)tz.GetUtcOffset(DateTimeOffset.UtcNow).TotalMinutes,
+                configuredTimeZone = string.IsNullOrWhiteSpace(configured) ? null : configured,
+                recognised,
+                enabled = config.GetValue("Scheduler:Enabled", true),
+            });
+        })
+        .WithTags("System");
+
         // Keyring status and the pending-reset counts (design §3.3), used by the top banner and the recovery checklist.
         app.MapGet("/api/system/keyring", async (
             IKeyringHealth keyring, AppDbContext db, IEncryptionService encryption, CancellationToken ct) =>

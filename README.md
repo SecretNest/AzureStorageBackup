@@ -472,7 +472,7 @@ ASP.NET Core maps nested config keys with a double underscore (`Section__Key`). 
 | `Backup__DiffQueueMaxItems` | How many pending work items the diff→upload queue keeps in memory before buffering to disk — see below. | `2000` |
 | `Backup__DiffQueueMemoryBytes` | Memory budget, in bytes, for that queue. Whichever of the two limits is reached first wins. | `67108864` |
 | `Scheduler__Enabled` | Enable the cron scheduler for scheduled backup/check/cleanup tasks. | `true` |
-| `Scheduler__TimeZone` | IANA time-zone id used to evaluate cron expressions. | `UTC` |
+| `Scheduler__TimeZone` | IANA time-zone id used to evaluate cron expressions. The Schedules page shows which zone is in effect, and warns when this is set to a value the server does not recognise (which falls back to UTC). | `UTC` |
 | `Auth__Password` | Password required to open the UI. Unset or empty = no authentication (the app logs a warning at startup). There is no username. | *(unset)* |
 | `Cors__AllowedOrigins__0` | Allowed browser origin. Not needed for the single-image deployment (frontend is same-origin); relevant only when hosting the SPA separately, in which case every origin must be listed explicitly. `*` is ignored (it cannot be combined with cookie credentials) and logs a warning at startup. | *(none — no cross-origin request is allowed)* |
 | `Logging__LogLevel__Microsoft.EntityFrameworkCore.Database.Command` | Set to `Information` to log every SQL statement the app runs. Off by default — it is very noisy and drowns out everything else in `docker logs`. | `Warning` |

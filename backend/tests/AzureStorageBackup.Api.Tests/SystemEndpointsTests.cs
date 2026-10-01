@@ -21,6 +21,26 @@ public class SystemEndpointsTests(TestWebAppFactory factory) : IClassFixture<Tes
     }
 
     [Fact]
+    public async Task Scheduler_Reports_The_Clock_Cron_Is_Read_In()
+    {
+        var res = await _client.GetAsync("/api/system/scheduler");
+
+        Assert.Equal(HttpStatusCode.OK, res.StatusCode);
+        var body = await res.Content.ReadFromJsonAsync<SchedulerInfo>();
+        Assert.NotNull(body);
+        // The test host sets no Scheduler:TimeZone, so the default applies and is reported as such — not as a fallback.
+        Assert.Equal("UTC", body!.TimeZone);
+        Assert.Equal(0, body.UtcOffsetMinutes);
+        Assert.Null(body.ConfiguredTimeZone);
+        Assert.True(body.Recognised);
+        // TestWebAppFactory switches the scheduler off; the page has to be able to say so.
+        Assert.False(body.Enabled);
+    }
+
+    private sealed record SchedulerInfo(
+        string TimeZone, int UtcOffsetMinutes, string? ConfiguredTimeZone, bool Recognised, bool Enabled);
+
+    [Fact]
     public async Task Version_Returns_NonEmpty()
     {
         var res = await _client.GetAsync("/api/system/version");
