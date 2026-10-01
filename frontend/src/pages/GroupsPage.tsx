@@ -4,6 +4,8 @@ import { backupsApi, backupKey, type DiscoveredBackup } from '../api/backups'
 import { EmptyRow } from '../components/EmptyRow'
 import { Field } from '../components/Field'
 import { moveMember, toggleMember } from '../lib/groupOrder'
+import { backupConfigsApi } from '../api/backupConfigs'
+import { backupNamesOf, nameBackup, type BackupNames } from '../lib/backupNames'
 
 export function GroupsSection({ onChanged }: { onChanged?: () => void } = {}) {
   const [groups, setGroups] = useState<Group[]>([])
@@ -12,6 +14,9 @@ export function GroupsSection({ onChanged }: { onChanged?: () => void } = {}) {
   const [groupsLoaded, setGroupsLoaded] = useState(false)
   const [pool, setPool] = useState<DiscoveredBackup[]>([])
   const [poolLoaded, setPoolLoaded] = useState(false)
+  // Configuration names, so a member is called what the Backups page calls it (see backupNames.ts). Loaded
+  // with the section — it is local rows, unlike the cloud inventory behind "Load backups".
+  const [names, setNames] = useState<BackupNames>(new Map())
   const [editing, setEditing] = useState<Group | null>(null)
   const [showForm, setShowForm] = useState(false)
   const [name, setName] = useState('')
@@ -32,6 +37,7 @@ export function GroupsSection({ onChanged }: { onChanged?: () => void } = {}) {
       .finally(() => setGroupsLoaded(true))
   useEffect(() => {
     loadGroups()
+    backupConfigsApi.list().then((c) => setNames(backupNamesOf(c))).catch(() => {})
   }, [])
 
   const loadPool = () =>
@@ -104,10 +110,18 @@ export function GroupsSection({ onChanged }: { onChanged?: () => void } = {}) {
   const poolKeys = new Set(pool.map(backupKey))
   const extraKeys = selected.filter((k) => !poolKeys.has(k))
   const poolByKey = new Map(pool.map((b) => [backupKey(b), b]))
-  const describe = (key: string) => {
+  // Name first; the account / container it stands for stays visible after it, because two configurations
+  // may well share a name and the key is what the group actually stores.
+  const where = (key: string) => {
     const b = poolByKey.get(key)
     return b ? `${b.accountName} / ${b.containerName}` : key
   }
+  const describe = (key: string) => (
+    <>
+      {nameBackup(names, memberFromKey(key), where(key))}{' '}
+      <span className="text-faint">{where(key)}</span>
+    </>
+  )
 
   // Groups are only used by scheduled tasks, so this is a section on the Tasks page rather than a top-level tab of its own.
   return (
@@ -181,7 +195,7 @@ export function GroupsSection({ onChanged }: { onChanged?: () => void } = {}) {
                 return (
                   <label key={key} style={{ display: 'block' }}>
                     <input type="checkbox" checked={selected.includes(key)} onChange={() => toggle(key)} />{' '}
-                    {b.accountName} / {b.containerName}
+                    {describe(key)}
                   </label>
                 )
               })}

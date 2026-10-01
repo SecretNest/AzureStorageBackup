@@ -18,6 +18,8 @@ import { CronEditor } from '../components/CronEditor'
 import { EmptyRow } from '../components/EmptyRow'
 import { systemApi, type SchedulerInfo } from '../api/system'
 import { scheduleClockLines } from '../lib/scheduleClock'
+import { backupConfigsApi } from '../api/backupConfigs'
+import { backupNamesOf, nameBackup, type BackupNames } from '../lib/backupNames'
 import { GroupsSection } from './GroupsPage'
 import { Field } from '../components/Field'
 
@@ -40,6 +42,8 @@ export function TasksPage() {
   // otherwise say "none" from "none yet". Same flag `poolLoaded` below already is. See EmptyRow.
   const [loaded, setLoaded] = useState(false)
   const [groups, setGroups] = useState<Group[]>([])
+  // Configuration names, so a target is called what the Backups page calls it (see backupNames.ts).
+  const [names, setNames] = useState<BackupNames>(new Map())
   const [pool, setPool] = useState<DiscoveredBackup[]>([])
   const [poolLoaded, setPoolLoaded] = useState(false)
   const [editing, setEditing] = useState<ScheduledTask | null>(null)
@@ -62,6 +66,7 @@ export function TasksPage() {
   useEffect(() => {
     loadTasks()
     groupsApi.list().then(setGroups).catch(() => {})
+    backupConfigsApi.list().then((c) => setNames(backupNamesOf(c))).catch(() => {})
     systemApi.scheduler().then(setClock).catch(() => {})
   }, [])
 
@@ -151,10 +156,16 @@ export function TasksPage() {
     }
   }
 
+  // The group's name and the backup's configuration name; the ids only when neither has arrived (or the
+  // target has since been deleted, which is worth seeing as-is rather than dressed up).
   const describeTarget = (t: ScheduledTask) =>
     t.targetKind === TaskTargetKind.Group
-      ? `Group #${t.groupId}`
-      : `${t.accountId} / ${t.containerName}`
+      ? groups.find((g) => g.id === t.groupId)?.name ?? `Group #${t.groupId}`
+      : nameBackup(
+          names,
+          { accountId: t.accountId ?? 0, containerName: t.containerName ?? '' },
+          `${t.accountId} / ${t.containerName}`,
+        )
 
   const pickBackup = (key: string) => {
     if (!key) {
@@ -257,7 +268,8 @@ export function TasksPage() {
                 <option value="">— select —</option>
                 {pool.map((b) => (
                   <option key={backupKey(b)} value={backupKey(b)}>
-                    {b.accountName} / {b.containerName}
+                    {nameBackup(names, b, `${b.accountName} / ${b.containerName}`)}
+                    {names.has(backupKey(b)) && ` (${b.accountName} / ${b.containerName})`}
                   </option>
                 ))}
               </select>{' '}
