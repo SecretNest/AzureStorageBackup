@@ -431,7 +431,7 @@ public sealed class ChaosMatrixTests(TestWebAppFactory factory, ITestOutputHelpe
         {
             try
             {
-                // The dispatcher awaits the whole cleanup; busy targets are skipped with a warning, and the
+                // The endpoint starts the cleanup and returns; busy targets are skipped with a warning, and the
                 // cleaner itself stands down for readers — every outcome is legal, the check is the judge.
                 var res = await _client.PostAsync($"/api/tasks/{taskId}/run", null, CancellationToken.None);
                 Log("cleanup", $"dispatched: {(int)res.StatusCode}");

@@ -55,8 +55,8 @@ public class ScheduledBackupProgressTests(TestWebAppFactory factory) : IClassFix
         taskRes.EnsureSuccessStatusCode();
         var task = await taskRes.Content.ReadFromJsonAsync<TaskResponse>();
 
-        // Run the scheduled task right now, going through the scheduler's dispatch path. The endpoint awaits the whole DispatchAsync
-        // before it returns, but we still poll as instructed, in case the endpoint is ever changed to fire asynchronously.
+        // Run the scheduled task right now, going through the scheduler's dispatch path. The endpoint starts the dispatch
+        // and returns, so the state is polled for.
         (await _client.PostAsync($"/api/tasks/{task!.Id}/run", null)).EnsureSuccessStatusCode();
 
         // The backup will most likely fail (the local root does not exist), but it **must leave behind a state the UI can poll**.

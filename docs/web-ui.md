@@ -295,6 +295,23 @@ the word in the future tense.
 **Backend naming is untouched** — `ScheduledTask`, `tasksApi` and `/api/tasks` all stay. Renaming
 them would spread across the backend and buys the user nothing visible.
 
+## Schedules
+
+**`Run now` starts the schedule and returns.** `POST /api/tasks/{id}/run` records `LastRunAt`, fires
+`TaskDispatcher.DispatchAsync` detached from the request, and answers `202 Accepted`; the page then
+says what was started and that progress shows on the Backups page. The work runs on no request
+token, so closing the tab or the client's deadline cannot reach it, and on a planned restart it is
+suspended by `GracefulSuspendService` like a run started from the Backups page.
+
+> **Rationale.** The endpoint used to await the whole dispatch on the request's own cancellation
+> token, which for a group meant every member backup ran, one after another, inside one HTTP
+> request. Once every request had a one-minute deadline (see *Error messages*), the browser dropped
+> that connection after a minute, Kestrel cancelled the token, the backup under way settled as
+> Canceled with its journal on disk — the Backups page read "Interrupted run — 0 block(s) already
+> uploaded" — and the rest of the group never started. `ApplicationStopping` was not used as the
+> replacement token because it fires before any hosted service's `StopAsync`, so a planned restart
+> would have cancelled the run before the suspend service reached it.
+
 ## Error messages
 
 The API client parses the project's error shape `{ error, code? }`, using `error` as the message and
