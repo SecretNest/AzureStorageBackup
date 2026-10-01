@@ -99,13 +99,15 @@ export function CronEditor({ value, onChange }: { value: string; onChange: (cron
             value={hour}
             onChange={(e) => apply({ hour: Number(e.target.value) })}
             className="w-sm"
-          />
+          />{' '}
           h
         </label>
       )}
 
+      {/* Both units trail their box so the row reads as a time: "at [2] h [30] min". When the hour box is hidden
+          (hourly) the minute box takes over the "at", giving "Hourly at [30] min" rather than a bare "min [30]". */}
       <label>
-        min{' '}
+        {freq === 'hourly' && 'at '}
         <input
           type="number"
           min={0}
@@ -113,7 +115,8 @@ export function CronEditor({ value, onChange }: { value: string; onChange: (cron
           value={minute}
           onChange={(e) => apply({ minute: Number(e.target.value) })}
           className="w-sm"
-        />
+        />{' '}
+        min
       </label>
 
       <code>{value || buildCron(freq, minute, hour, dow, dom)}</code>
