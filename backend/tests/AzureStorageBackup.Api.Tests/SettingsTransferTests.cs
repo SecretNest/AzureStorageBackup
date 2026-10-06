@@ -102,4 +102,95 @@ public class SettingsTransferTests : IDisposable
         Assert.True(doc.Notifications!.Enabled);
         Assert.Equal("https://n.example", doc.Notifications.Url);
     }
+
+    private static SettingsDocument Doc(params SettingsAccountEntry[] accounts) => new()
+    {
+        Format = SettingsDocument.FormatName,
+        Version = SettingsDocument.CurrentVersion,
+        Accounts = [.. accounts],
+    };
+
+    private static SettingsAccountEntry Entry(string name, string endpoint, string? key = null, string? proxyPassword = null,
+        bool useProxy = false, string? proxyUsername = null) =>
+        new(name, null, endpoint, AzureRegion.Global, key, useProxy, ProxyMode.Independent,
+            useProxy ? "proxy.local" : null, useProxy ? 3128 : null, proxyUsername, proxyPassword);
+
+    [Fact]
+    public async Task Plan_Rejects_Wrong_Format_And_Future_Version()
+    {
+        var wrongFormat = Doc() with { Format = "something-else" };
+        var ex1 = await Assert.ThrowsAsync<SettingsImportException>(() => _sut.PlanAsync(wrongFormat, CancellationToken.None));
+        Assert.Contains("azure-storage-backup-settings", ex1.Message);
+
+        var future = Doc() with { Version = SettingsDocument.CurrentVersion + 1 };
+        var ex2 = await Assert.ThrowsAsync<SettingsImportException>(() => _sut.PlanAsync(future, CancellationToken.None));
+        Assert.Contains("version", ex2.Message, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task Plan_Rejects_Blank_Name_Blank_Endpoint_And_Duplicate_Endpoint()
+    {
+        await Assert.ThrowsAsync<SettingsImportException>(() =>
+            _sut.PlanAsync(Doc(Entry("", "https://a.blob.core.windows.net")), CancellationToken.None));
+        await Assert.ThrowsAsync<SettingsImportException>(() =>
+            _sut.PlanAsync(Doc(Entry("a", " ")), CancellationToken.None));
+        var dup = await Assert.ThrowsAsync<SettingsImportException>(() =>
+            _sut.PlanAsync(Doc(Entry("a", "https://a.blob.core.windows.net"), Entry("b", "https://A.blob.core.windows.net/")), CancellationToken.None));
+        Assert.Contains("twice", dup.Message);
+    }
+
+    [Fact]
+    public async Task Plan_Classifies_Create_Update_And_Missing_Keys()
+    {
+        await SeedAccountAsync("prod", "https://prod.blob.core.windows.net");
+
+        var plan = await _sut.PlanAsync(Doc(
+            Entry("prod-renamed", "https://prod.blob.core.windows.net"),
+            Entry("new-with-key", "https://new1.blob.core.windows.net", key: "k1"),
+            Entry("new-without-key", "https://new2.blob.core.windows.net")), CancellationToken.None);
+
+        Assert.Collection(plan.Accounts,
+            a => { Assert.Equal("update", a.Action); Assert.False(a.NeedsAccountKey); Assert.Equal("prod-renamed", a.Name); },
+            a => { Assert.Equal("create", a.Action); Assert.False(a.NeedsAccountKey); },
+            a => { Assert.Equal("create", a.Action); Assert.True(a.NeedsAccountKey); });
+        Assert.False(plan.BackupDefaults);
+        Assert.False(plan.Performance);
+        Assert.False(plan.Notifications);
+    }
+
+    [Fact]
+    public async Task Plan_Reports_Which_Sections_The_File_Carries()
+    {
+        var doc = Doc() with { Performance = PerformanceSettings.From(new GlobalSettings()) };
+
+        var plan = await _sut.PlanAsync(doc, CancellationToken.None);
+
+        Assert.False(plan.BackupDefaults);
+        Assert.True(plan.Performance);
+        Assert.False(plan.Notifications);
+    }
+
+    [Fact]
+    public async Task Plan_Matches_Endpoint_Ignoring_Case_And_Trailing_Slash()
+    {
+        await SeedAccountAsync("prod", "https://prod.blob.core.windows.net");
+
+        var plan = await _sut.PlanAsync(Doc(Entry("prod", "https://PROD.blob.core.windows.net/")), CancellationToken.None);
+
+        Assert.Equal("update", Assert.Single(plan.Accounts).Action);
+    }
+
+    [Fact]
+    public async Task Plan_Writes_Nothing()
+    {
+        await SeedAccountAsync("prod", "https://prod.blob.core.windows.net");
+
+        await _sut.PlanAsync(Doc(
+            Entry("prod-renamed", "https://prod.blob.core.windows.net"),
+            Entry("new", "https://new.blob.core.windows.net", key: "k")), CancellationToken.None);
+
+        _db.ChangeTracker.Clear();
+        var rows = await _db.Accounts.AsNoTracking().ToListAsync();
+        Assert.Equal("prod", Assert.Single(rows).Name);
+    }
 }
