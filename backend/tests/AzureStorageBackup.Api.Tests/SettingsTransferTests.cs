@@ -193,4 +193,136 @@ public class SettingsTransferTests : IDisposable
         var rows = await _db.Accounts.AsNoTracking().ToListAsync();
         Assert.Equal("prod", Assert.Single(rows).Name);
     }
+
+    [Fact]
+    public async Task Import_Creates_Updates_And_Leaves_Accounts_Keeping_Ids()
+    {
+        var prod = await SeedAccountAsync("prod", "https://prod.blob.core.windows.net");
+        var untouched = await SeedAccountAsync("other", "https://other.blob.core.windows.net", key: "ok");
+
+        var plan = await _sut.ImportAsync(Doc(
+            Entry("prod-renamed", "https://prod.blob.core.windows.net"),
+            Entry("fresh", "https://fresh.blob.core.windows.net", key: "fresh-key")), CancellationToken.None);
+
+        Assert.Equal(new[] { "update", "create" }, plan.Accounts.Select(a => a.Action).ToArray());
+        _db.ChangeTracker.Clear();
+        var rows = await _db.Accounts.AsNoTracking().OrderBy(a => a.Id).ToListAsync();
+        Assert.Equal(3, rows.Count);
+        Assert.Equal(prod.Id, rows[0].Id);
+        Assert.Equal("prod-renamed", rows[0].Name);
+        Assert.Equal(untouched.Id, rows[1].Id);
+        Assert.Equal("other", rows[1].Name);
+        Assert.Equal("fresh", rows[2].Name);
+        Assert.Equal("fresh-key", TestSecrets.Reader.RevealAccountKey(rows[2]));
+        Assert.NotEqual(default, rows[2].CreatedAt);
+    }
+
+    [Fact]
+    public async Task Import_Keeps_Stored_Secrets_When_The_Entry_Has_None_And_Replaces_Them_When_It_Does()
+    {
+        var a = await SeedAccountAsync("prod", "https://prod.blob.core.windows.net", key: "old", proxyPassword: "old-pp");
+
+        await _sut.ImportAsync(Doc(Entry("prod", "https://prod.blob.core.windows.net", useProxy: true, proxyUsername: "pu")), CancellationToken.None);
+        _db.ChangeTracker.Clear();
+        var kept = await _db.Accounts.AsNoTracking().SingleAsync(x => x.Id == a.Id);
+        Assert.Equal("old", TestSecrets.Reader.RevealAccountKey(kept));
+        Assert.Equal("old-pp", TestSecrets.Reader.RevealProxyPassword(kept));
+
+        await _sut.ImportAsync(Doc(Entry("prod", "https://prod.blob.core.windows.net", key: "new", proxyPassword: "new-pp", useProxy: true, proxyUsername: "pu")), CancellationToken.None);
+        _db.ChangeTracker.Clear();
+        var replaced = await _db.Accounts.AsNoTracking().SingleAsync(x => x.Id == a.Id);
+        Assert.Equal("new", TestSecrets.Reader.RevealAccountKey(replaced));
+        Assert.Equal("new-pp", TestSecrets.Reader.RevealProxyPassword(replaced));
+    }
+
+    [Fact]
+    public async Task Import_Rejects_A_New_Account_Without_A_Key_And_Writes_Nothing()
+    {
+        await SeedAccountAsync("prod", "https://prod.blob.core.windows.net");
+
+        var ex = await Assert.ThrowsAsync<SettingsImportException>(() => _sut.ImportAsync(Doc(
+            Entry("prod-renamed", "https://prod.blob.core.windows.net"),
+            Entry("fresh", "https://fresh.blob.core.windows.net")), CancellationToken.None));
+
+        Assert.Contains("fresh", ex.Message);
+        _db.ChangeTracker.Clear();
+        var rows = await _db.Accounts.AsNoTracking().ToListAsync();
+        Assert.Equal("prod", Assert.Single(rows).Name);
+    }
+
+    [Fact]
+    public async Task Import_Applies_Only_The_Sections_Present()
+    {
+        var gs = new GlobalSettingsService(_db);
+        await gs.UpsertDefaultsAsync(BackupDefaultsSettings.From(new GlobalSettings()) with { DefaultMaxVersions = 7 });
+        await gs.UpsertPerformanceAsync(PerformanceSettings.From(new GlobalSettings()) with { UploadConcurrency = 9 });
+        await new NotificationConfigService(_db).UpsertAsync(new NotificationConfig { Enabled = true, Url = "https://old.example" });
+        _db.ChangeTracker.Clear();
+
+        var doc = Doc() with
+        {
+            Performance = PerformanceSettings.From(new GlobalSettings()) with { UploadConcurrency = 3 },
+            Notifications = new NotificationRequest(false, "https://new.example", NotificationMethod.Post, null, null, NotificationEvents.BackupFailure, null),
+        };
+        var plan = await _sut.ImportAsync(doc, CancellationToken.None);
+
+        Assert.False(plan.BackupDefaults);
+        Assert.True(plan.Performance);
+        Assert.True(plan.Notifications);
+        _db.ChangeTracker.Clear();
+        var row = await gs.GetAsync();
+        Assert.Equal(7, row.DefaultMaxVersions);   // defaults section absent → untouched
+        Assert.Equal(3, row.UploadConcurrency);    // performance section present → overwritten
+        var n = await new NotificationConfigService(_db).GetAsync();
+        Assert.False(n.Enabled);
+        Assert.Equal("https://new.example", n.Url);
+        Assert.Equal(NotificationEvents.BackupFailure, n.Events);
+    }
+
+    [Fact]
+    public async Task Import_Of_Empty_Document_Changes_Nothing()
+    {
+        await SeedAccountAsync("prod", "https://prod.blob.core.windows.net");
+
+        var plan = await _sut.ImportAsync(Doc(), CancellationToken.None);
+
+        Assert.Empty(plan.Accounts);
+        _db.ChangeTracker.Clear();
+        Assert.Equal(1, await _db.Accounts.CountAsync());
+    }
+
+    [Fact]
+    public async Task Import_Leaves_Unreadable_Ciphertext_Alone_When_Entry_Has_No_Key()
+    {
+        var a = await SeedAccountAsync("prod", "https://prod.blob.core.windows.net");
+        var stale = TestSecrets.Stale("old-key");
+        (await _db.Accounts.SingleAsync(x => x.Id == a.Id)).AccountKeyProtected = stale;
+        await _db.SaveChangesAsync();
+        _db.ChangeTracker.Clear();
+
+        await _sut.ImportAsync(Doc(Entry("prod-renamed", "https://prod.blob.core.windows.net")), CancellationToken.None);
+
+        _db.ChangeTracker.Clear();
+        var row = await _db.Accounts.AsNoTracking().SingleAsync(x => x.Id == a.Id);
+        Assert.Equal("prod-renamed", row.Name);
+        Assert.Equal(stale, row.AccountKeyProtected);
+    }
+
+    [Fact]
+    public async Task Import_Rolls_Back_Everything_When_A_Later_Account_Is_Invalid()
+    {
+        await SeedAccountAsync("prod", "https://prod.blob.core.windows.net");
+        var doc = Doc(
+            Entry("prod-renamed", "https://prod.blob.core.windows.net"),
+            Entry("dup", "https://PROD.blob.core.windows.net/", key: "k")) with
+        {
+            Performance = PerformanceSettings.From(new GlobalSettings()) with { UploadConcurrency = 3 },
+        };
+
+        await Assert.ThrowsAsync<SettingsImportException>(() => _sut.ImportAsync(doc, CancellationToken.None));
+
+        _db.ChangeTracker.Clear();
+        Assert.Equal("prod", (await _db.Accounts.AsNoTracking().SingleAsync()).Name);
+        Assert.Equal(5, (await new GlobalSettingsService(_db).GetAsync()).UploadConcurrency);
+    }
 }

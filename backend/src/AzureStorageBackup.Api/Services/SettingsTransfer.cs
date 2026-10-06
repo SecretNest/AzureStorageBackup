@@ -104,4 +104,84 @@ public sealed class SettingsTransfer(
             Performance: doc.Performance is not null,
             Notifications: doc.Notifications is not null);
     }
+
+    /// <summary>
+    /// Applies the file. One transaction: a failure anywhere leaves the database as it was. Held under the account
+    /// topology gate so a concurrent delete cannot slip between the plan and the writes. The settings and
+    /// notification services share this scope's DbContext, so their writes ride the same transaction.
+    /// </summary>
+    public async Task<ImportPlan> ImportAsync(SettingsDocument doc, CancellationToken ct)
+    {
+        Validate(doc);
+
+        await AccountTopologyGate.Gate.WaitAsync(ct);
+        try
+        {
+            await using var tx = await db.Database.BeginTransactionAsync(ct);
+
+            var existing = await db.Accounts.ToListAsync(ct);
+            var plan = BuildPlan(doc, existing);
+
+            var missing = plan.Accounts.Where(p => p.NeedsAccountKey).Select(p => $"\"{p.Name}\"").ToList();
+            if (missing.Count > 0)
+                throw new SettingsImportException(
+                    $"These accounts are new here and the file carries no key for them: {string.Join(", ", missing)}. Enter their keys and import again.");
+
+            var byEndpoint = ByEndpoint(existing);
+            foreach (var entry in doc.Accounts ?? [])
+            {
+                if (byEndpoint.TryGetValue(BlobEndpointKey.Normalize(entry.BlobEndpoint!), out var row))
+                {
+                    Apply(entry, row, isNew: false);
+                }
+                else
+                {
+                    row = new Account { CreatedAt = DateTimeOffset.UtcNow };
+                    Apply(entry, row, isNew: true);
+                    db.Accounts.Add(row);
+                }
+            }
+            await db.SaveChangesAsync(ct);
+
+            if (doc.BackupDefaults is not null)
+                await settings.UpsertDefaultsAsync(doc.BackupDefaults, ct);
+            if (doc.Performance is not null)
+                await settings.UpsertPerformanceAsync(doc.Performance, ct);
+            if (doc.Notifications is not null)
+                await notifications.UpsertAsync(doc.Notifications.ToConfig(), ct);
+
+            await tx.CommitAsync(ct);
+            return plan;
+        }
+        finally
+        {
+            AccountTopologyGate.Gate.Release();
+        }
+    }
+
+    /// <summary>Every non-secret field is taken from the file. A secret is replaced only when the file carries one;
+    /// an empty secret on a matched account means "keep what is stored" (the file was exported without secrets, or
+    /// the user chose not to re-enter it). A new account always has a key here — the check above guarantees it.</summary>
+    private void Apply(SettingsAccountEntry entry, Account row, bool isNew)
+    {
+        row.Name = entry.Name!;
+        row.Description = entry.Description;
+        row.BlobEndpoint = entry.BlobEndpoint!;
+        row.Region = entry.Region;
+        row.UseProxy = entry.UseProxy;
+        row.ProxyMode = entry.ProxyMode;
+        row.ProxyHost = entry.ProxyHost;
+        row.ProxyPort = entry.ProxyPort;
+        row.ProxyUsername = entry.ProxyUsername;
+
+        if (!string.IsNullOrEmpty(entry.AccountKey))
+            row.AccountKeyProtected = encryption.Encrypt(entry.AccountKey);
+        else if (isNew)
+            row.AccountKeyProtected = string.Empty;
+
+        if (!string.IsNullOrEmpty(entry.ProxyPassword))
+            row.ProxyPasswordProtected = encryption.Encrypt(entry.ProxyPassword);
+        else if (isNew)
+            row.ProxyPasswordProtected = null;
+    }
 }
