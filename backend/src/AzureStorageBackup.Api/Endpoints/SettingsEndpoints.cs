@@ -48,10 +48,18 @@ public static class SettingsEndpoints
             catch (SettingsImportException ex) { return Results.BadRequest(new { error = ex.Message }); }
         });
 
-        group.MapPost("/import", async (SettingsDocument doc, SettingsTransfer transfer, CancellationToken ct) =>
+        group.MapPost("/import", async (SettingsDocument doc, SettingsTransfer transfer, IKeyringHealth keyring,
+            KeyringRecovery recovery, CancellationToken ct) =>
         {
-            try { return Results.Ok(await transfer.ImportAsync(doc, ct)); }
+            ImportPlan plan;
+            try { plan = await transfer.ImportAsync(doc, ct); }
             catch (SettingsImportException ex) { return Results.BadRequest(new { error = ex.Message }); }
+
+            // A file exported with secrets is the natural way back from a lost keyring: every key it carries has just
+            // been re-encrypted under the current one. Same call as reset-secrets and account delete make.
+            if (keyring.Status == KeyringStatus.Lost)
+                await recovery.TryCompleteAsync(ct);
+            return Results.Ok(plan);
         });
 
         return app;

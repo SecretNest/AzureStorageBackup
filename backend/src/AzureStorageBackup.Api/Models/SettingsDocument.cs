@@ -1,3 +1,5 @@
+using System.Text.Json.Nodes;
+
 namespace AzureStorageBackup.Api.Models;
 
 /// <summary>
@@ -5,6 +7,13 @@ namespace AzureStorageBackup.Api.Models;
 /// JSON document. Carries no ids — accounts are matched on import by endpoint, so backups, groups and schedules
 /// that reference an account by id keep working after an import onto a database that already has it.
 /// Every section is optional on the way in: a missing one leaves that part of the database untouched.
+/// <para>
+/// The sections are JSON objects, not typed records, on purpose: a field missing from a section keeps its
+/// current value on import. Typed binding would turn an absent number into 0 and an absent string into null —
+/// a hand-trimmed file, or one from a build that did not yet have the field, would silently zero settings it never
+/// mentioned. The merge is <see cref="Services.SettingsTransfer"/>'s job; the shapes are still those of
+/// <see cref="BackupDefaultsSettings"/>, <see cref="PerformanceSettings"/> and <see cref="NotificationRequest"/>.
+/// </para>
 /// </summary>
 public sealed record SettingsDocument
 {
@@ -17,9 +26,9 @@ public sealed record SettingsDocument
     /// <summary>True when the export was asked to include account keys and proxy passwords (plaintext).</summary>
     public bool IncludesSecrets { get; init; }
     public List<SettingsAccountEntry>? Accounts { get; init; }
-    public BackupDefaultsSettings? BackupDefaults { get; init; }
-    public PerformanceSettings? Performance { get; init; }
-    public NotificationRequest? Notifications { get; init; }
+    public JsonObject? BackupDefaults { get; init; }
+    public JsonObject? Performance { get; init; }
+    public JsonObject? Notifications { get; init; }
 }
 
 /// <summary>One account in the file. The same fields as <see cref="AccountRequest"/>; secrets are plaintext or null.</summary>

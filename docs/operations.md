@@ -618,7 +618,13 @@ id and have their own pages.
 The file (`format: "azure-storage-backup-settings"`, `version: 1`) carries no ids and no `createdAt`. Each
 section is the same shape as its GET endpoint (`/api/settings/defaults`, `/api/settings/performance`,
 `/api/notifications`); accounts are the `AccountRequest` shape with `accountKey` / `proxyPassword` plaintext or
-null. Every section is optional on import — a hand-trimmed file carrying only `performance` changes only that.
+null. Every section is optional on import — a hand-trimmed file carrying only `performance` changes only that —
+and so is every field inside a section: the file's section is laid over the current values, so a field the file
+does not name keeps what is stored. That is why the sections bind as JSON objects rather than typed records: typed
+binding would turn an absent number into 0, and a file from a build that did not yet have the field would silently
+zero it. Keys match case-insensitively; unknown keys are ignored; a value of the wrong type is a 400 naming the
+section; a value the schema refuses (an explicit null in a required field) is a 400 with the database's own
+message, and the transaction is rolled back.
 
 **Accounts are matched by endpoint**, not by name and not by id: the endpoint with its trailing `/` dropped and
 lower-cased, the same key `AccountService` uses to refuse a second account on one endpoint
@@ -637,6 +643,10 @@ stored (including an unreadable ciphertext while the keyring is lost); an empty 
 one case the server refuses, because a keyless account is not flagged anywhere — it looks normal and fails on
 first use. The UI runs `POST /api/settings/import/preview` first and asks for each such key in the dialog, so a
 normal import never hits that refusal.
+
+A file exported **with** secrets is also the natural way back from a lost keyring: importing it re-encrypts every
+key it carries under the current keyring, and the import endpoint then runs the same recovery completion as
+`reset-secrets` and account delete, so `Lost` ends as soon as every stored secret is readable again.
 
 The endpoints: `GET /api/settings/export?includeSecrets=` (a named download), `POST /api/settings/import/preview`
 (the plan, no writes), `POST /api/settings/import` (same body, applies). Import is one SQLite transaction under

@@ -1,3 +1,5 @@
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using AzureStorageBackup.Api.Data;
 using AzureStorageBackup.Api.Models;
 using Microsoft.EntityFrameworkCore;
@@ -44,11 +46,42 @@ public sealed class SettingsTransfer(
                 a.ProxyPort,
                 a.ProxyUsername,
                 includeSecrets ? secrets.RevealProxyPassword(a) : null)).ToList(),
-            BackupDefaults = BackupDefaultsSettings.From(row),
-            Performance = PerformanceSettings.From(row),
-            Notifications = new NotificationRequest(
-                notif.Enabled, notif.Url, notif.Method, notif.BodyTemplate, notif.ContentType, notif.Events, notif.ProxyUrl),
+            BackupDefaults = ToSection(BackupDefaultsSettings.From(row)),
+            Performance = ToSection(PerformanceSettings.From(row)),
+            Notifications = ToSection(ToRequest(notif)),
         };
+    }
+
+    // The sections travel as JSON objects (see SettingsDocument). camelCase here so the in-memory document equals
+    // what the endpoint serialises — a JsonObject passes through the response serialiser untouched.
+    private static readonly JsonSerializerOptions Json = JsonSerializerOptions.Web;
+
+    private static JsonObject ToSection<T>(T value) => JsonSerializer.SerializeToNode(value, Json)!.AsObject();
+
+    private static NotificationRequest ToRequest(NotificationConfig c) =>
+        new(c.Enabled, c.Url, c.Method, c.BodyTemplate, c.ContentType, c.Events, c.ProxyUrl);
+
+    /// <summary>
+    /// The file's section laid over the current values: a field the file names is taken from the file, every
+    /// other field stays as it is. Keys match case-insensitively (a hand-written "UploadConcurrency" should land)
+    /// and unknown keys are ignored (a file from a newer build must not be refused for a field this build lacks).
+    /// </summary>
+    private static T MergeSection<T>(string name, T current, JsonObject patch)
+    {
+        var node = ToSection(current);
+        foreach (var (key, value) in patch)
+        {
+            var existing = node.FirstOrDefault(p => string.Equals(p.Key, key, StringComparison.OrdinalIgnoreCase)).Key;
+            node[existing ?? key] = value?.DeepClone();
+        }
+        try
+        {
+            return node.Deserialize<T>(Json)!;
+        }
+        catch (JsonException ex)
+        {
+            throw new SettingsImportException($"The \"{name}\" section has a value of the wrong type: {ex.Message}");
+        }
     }
 
     public async Task<ImportPlan> PlanAsync(SettingsDocument doc, CancellationToken ct)
@@ -144,14 +177,30 @@ public sealed class SettingsTransfer(
             await db.SaveChangesAsync(ct);
 
             if (doc.BackupDefaults is not null)
-                await settings.UpsertDefaultsAsync(doc.BackupDefaults, ct);
+            {
+                var row = await settings.GetAsync(ct);
+                await settings.UpsertDefaultsAsync(MergeSection("backupDefaults", BackupDefaultsSettings.From(row), doc.BackupDefaults), ct);
+            }
             if (doc.Performance is not null)
-                await settings.UpsertPerformanceAsync(doc.Performance, ct);
+            {
+                var row = await settings.GetAsync(ct);
+                await settings.UpsertPerformanceAsync(MergeSection("performance", PerformanceSettings.From(row), doc.Performance), ct);
+            }
             if (doc.Notifications is not null)
-                await notifications.UpsertAsync(doc.Notifications.ToConfig(), ct);
+            {
+                var current = ToRequest(await notifications.GetAsync(ct));
+                await notifications.UpsertAsync(MergeSection("notifications", current, doc.Notifications).ToConfig(), ct);
+            }
 
             await tx.CommitAsync(ct);
             return plan;
+        }
+        catch (DbUpdateException ex)
+        {
+            // A value the file carried that the schema refuses (an explicit null in a required field, say). The
+            // transaction is rolled back by its disposal; the user gets the database's own words, which name the column.
+            throw new SettingsImportException(
+                $"The file could not be stored: {ex.InnerException?.Message ?? ex.Message}");
         }
         finally
         {

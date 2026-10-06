@@ -72,7 +72,11 @@ export interface SettingsAccountEntry {
   proxyPassword: string | null
 }
 
-/** The settings file. Every section is optional on import; a missing one leaves that part of the server alone. */
+/**
+ * The settings file. Every section is optional on import; a missing one leaves that part of the server alone, and
+ * so does a missing field inside a section (the server lays the file over its current values). The sections are
+ * typed here for the export's benefit; on import the server reads them as plain JSON objects.
+ */
 export interface SettingsDocument {
   format: string
   version: number

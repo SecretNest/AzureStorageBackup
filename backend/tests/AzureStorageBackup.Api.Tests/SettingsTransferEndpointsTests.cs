@@ -1,9 +1,11 @@
 using System.Net;
 using System.Net.Http.Json;
 using System.Text;
+using AzureStorageBackup.Api.Data;
 using AzureStorageBackup.Api.Endpoints;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
+using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.DependencyInjection;
 
 namespace AzureStorageBackup.Api.Tests;
@@ -104,5 +106,35 @@ public class SettingsTransferEndpointsTests(TestWebAppFactory factory) : IClassF
             new StringContent("[]", Encoding.UTF8, "application/json"));
 
         Assert.Equal(HttpStatusCode.BadRequest, res.StatusCode);
+    }
+
+    [Fact]
+    public async Task Import_That_Restores_Every_Key_Ends_Keyring_Recovery()
+    {
+        var id = await TestAccounts.EnsureAsync(_client, Request("lost", "https://lost.blob.core.windows.net"));
+        using (var scope = factory.Services.CreateScope())
+        {
+            var db = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+            (await db.Accounts.FirstAsync(a => a.Id == id)).AccountKeyProtected = TestSecrets.Stale("old-key");
+            await db.SaveChangesAsync();
+        }
+        Keyring.Set(KeyringStatus.Lost);
+        try
+        {
+            var doc = await _client.GetFromJsonAsync<SettingsDocument>("/api/settings/export");
+            var restored = doc! with
+            {
+                Accounts = [.. doc.Accounts!.Select(a => a.Name == "lost" ? a with { AccountKey = "restored==" } : a)],
+            };
+
+            var res = await _client.PostAsJsonAsync("/api/settings/import", restored);
+
+            Assert.Equal(HttpStatusCode.OK, res.StatusCode);
+            Assert.Equal(KeyringStatus.Healthy, Keyring.Status);
+        }
+        finally
+        {
+            Keyring.Set(KeyringStatus.Healthy);
+        }
     }
 }

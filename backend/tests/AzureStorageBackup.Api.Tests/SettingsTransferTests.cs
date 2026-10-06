@@ -1,3 +1,5 @@
+using System.Text.Json;
+using System.Text.Json.Nodes;
 using AzureStorageBackup.Api.Data;
 using AzureStorageBackup.Api.Models;
 using AzureStorageBackup.Api.Services;
@@ -97,11 +99,18 @@ public class SettingsTransferTests : IDisposable
 
         var doc = await _sut.ExportAsync(includeSecrets: false, CancellationToken.None);
 
-        Assert.Equal(7, doc.BackupDefaults!.DefaultMaxVersions);
-        Assert.Equal("*.tmp", doc.BackupDefaults.DefaultIgnoreRules);
-        Assert.True(doc.Notifications!.Enabled);
-        Assert.Equal("https://n.example", doc.Notifications.Url);
+        var defaults = Read<BackupDefaultsSettings>(doc.BackupDefaults);
+        Assert.Equal(7, defaults.DefaultMaxVersions);
+        Assert.Equal("*.tmp", defaults.DefaultIgnoreRules);
+        var notif = Read<NotificationRequest>(doc.Notifications);
+        Assert.True(notif.Enabled);
+        Assert.Equal("https://n.example", notif.Url);
     }
+
+    /// <summary>A section as the file carries it: a JSON object, here built from the typed DTO.</summary>
+    private static JsonObject Section<T>(T value) => JsonSerializer.SerializeToNode(value, JsonSerializerOptions.Web)!.AsObject();
+
+    private static T Read<T>(JsonObject? section) => section!.Deserialize<T>(JsonSerializerOptions.Web)!;
 
     private static SettingsDocument Doc(params SettingsAccountEntry[] accounts) => new()
     {
@@ -161,7 +170,7 @@ public class SettingsTransferTests : IDisposable
     [Fact]
     public async Task Plan_Reports_Which_Sections_The_File_Carries()
     {
-        var doc = Doc() with { Performance = PerformanceSettings.From(new GlobalSettings()) };
+        var doc = Doc() with { Performance = Section(PerformanceSettings.From(new GlobalSettings())) };
 
         var plan = await _sut.PlanAsync(doc, CancellationToken.None);
 
@@ -261,8 +270,8 @@ public class SettingsTransferTests : IDisposable
 
         var doc = Doc() with
         {
-            Performance = PerformanceSettings.From(new GlobalSettings()) with { UploadConcurrency = 3 },
-            Notifications = new NotificationRequest(false, "https://new.example", NotificationMethod.Post, null, null, NotificationEvents.BackupFailure, null),
+            Performance = Section(PerformanceSettings.From(new GlobalSettings()) with { UploadConcurrency = 3 }),
+            Notifications = Section(new NotificationRequest(false, "https://new.example", NotificationMethod.Post, null, null, NotificationEvents.BackupFailure, null)),
         };
         var plan = await _sut.ImportAsync(doc, CancellationToken.None);
 
@@ -316,7 +325,7 @@ public class SettingsTransferTests : IDisposable
             Entry("prod-renamed", "https://prod.blob.core.windows.net"),
             Entry("dup", "https://PROD.blob.core.windows.net/", key: "k")) with
         {
-            Performance = PerformanceSettings.From(new GlobalSettings()) with { UploadConcurrency = 3 },
+            Performance = Section(PerformanceSettings.From(new GlobalSettings()) with { UploadConcurrency = 3 }),
         };
 
         await Assert.ThrowsAsync<SettingsImportException>(() => _sut.ImportAsync(doc, CancellationToken.None));
@@ -324,5 +333,60 @@ public class SettingsTransferTests : IDisposable
         _db.ChangeTracker.Clear();
         Assert.Equal("prod", (await _db.Accounts.AsNoTracking().SingleAsync()).Name);
         Assert.Equal(5, (await new GlobalSettingsService(_db).GetAsync()).UploadConcurrency);
+    }
+
+    [Fact]
+    public async Task Import_Keeps_Current_Values_For_Fields_A_Section_Leaves_Out()
+    {
+        var gs = new GlobalSettingsService(_db);
+        await gs.UpsertPerformanceAsync(PerformanceSettings.From(new GlobalSettings()) with { UploadConcurrency = 9, RetryBackoffSeconds = "1,2,3" });
+        _db.ChangeTracker.Clear();
+
+        // A hand-trimmed (or older-version) file: one field in the section, nothing else.
+        var doc = Doc() with { Performance = new JsonObject { ["uploadConcurrency"] = 8 } };
+        await _sut.ImportAsync(doc, CancellationToken.None);
+
+        _db.ChangeTracker.Clear();
+        var row = await gs.GetAsync();
+        Assert.Equal(8, row.UploadConcurrency);
+        Assert.Equal("1,2,3", row.RetryBackoffSeconds);                      // not nulled
+        Assert.Equal(new GlobalSettings().UploadMemoryLimitBytes, row.UploadMemoryLimitBytes); // not zeroed
+    }
+
+    [Fact]
+    public async Task Import_Matches_Section_Fields_Ignoring_Case_And_Ignores_Unknown_Ones()
+    {
+        var doc = Doc() with { Performance = new JsonObject { ["UploadConcurrency"] = 8, ["futureField"] = true } };
+        await _sut.ImportAsync(doc, CancellationToken.None);
+
+        _db.ChangeTracker.Clear();
+        Assert.Equal(8, (await new GlobalSettingsService(_db).GetAsync()).UploadConcurrency);
+    }
+
+    [Fact]
+    public async Task Import_Rejects_A_Section_Value_Of_The_Wrong_Type_Naming_The_Section()
+    {
+        var doc = Doc() with { Performance = new JsonObject { ["uploadConcurrency"] = "many" } };
+
+        var ex = await Assert.ThrowsAsync<SettingsImportException>(() => _sut.ImportAsync(doc, CancellationToken.None));
+
+        Assert.Contains("performance", ex.Message);
+    }
+
+    [Fact]
+    public async Task Import_Rolls_Back_The_Account_Writes_When_A_Settings_Write_Fails()
+    {
+        await SeedAccountAsync("prod", "https://prod.blob.core.windows.net");
+        // Explicit null into a NOT NULL column: the failure happens after the accounts were saved, inside the transaction.
+        var doc = Doc(Entry("prod-renamed", "https://prod.blob.core.windows.net")) with
+        {
+            Performance = new JsonObject { ["retryBackoffSeconds"] = null },
+        };
+
+        var ex = await Assert.ThrowsAsync<SettingsImportException>(() => _sut.ImportAsync(doc, CancellationToken.None));
+
+        Assert.Contains("RetryBackoffSeconds", ex.Message);
+        _db.ChangeTracker.Clear();
+        Assert.Equal("prod", (await _db.Accounts.AsNoTracking().SingleAsync()).Name);
     }
 }
