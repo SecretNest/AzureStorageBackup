@@ -288,6 +288,7 @@ builder.Services.AddScoped(sp => new BackupRepairer(
 // Operation log (M8) + global settings
 builder.Services.AddScoped<IOperationLog, OperationLogService>();
 builder.Services.AddScoped<IGlobalSettingsService, GlobalSettingsService>();
+builder.Services.AddScoped<SettingsTransfer>();
 
 // Notifications (M7)
 builder.Services.AddScoped<INotificationConfigService, NotificationConfigService>();
