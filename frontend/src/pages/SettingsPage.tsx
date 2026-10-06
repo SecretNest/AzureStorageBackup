@@ -37,8 +37,9 @@ export function SettingsPage({
   // Backup defaults and Performance are one row on the server but two resources on the API, each the shape of one
   // page: a page saves its own half and cannot carry the other page's fields along. The two states still live here,
   // above both pages, so edits made on one tab survive a switch to the other — they just no longer go up together.
-  const defaults = useSettingsHalf(settingsApi.getDefaults, settingsApi.updateDefaults)
-  const performance = useSettingsHalf(settingsApi.getPerformance, settingsApi.updatePerformance)
+  const [reload, setReload] = useState(0)
+  const defaults = useSettingsHalf(settingsApi.getDefaults, settingsApi.updateDefaults, reload)
+  const performance = useSettingsHalf(settingsApi.getPerformance, settingsApi.updatePerformance, reload)
 
   return (
     <section>
@@ -68,15 +69,18 @@ export function SettingsPage({
         <PerformanceOptions settings={performance} defaultVolumeBytes={defaults.s?.defaultVolumeBytes} />
       )}
       {tab === 'notifications' && <NotificationsSection />}
-      {tab === 'about' && <AboutSection authRequired={authRequired} onLogout={onLogout} />}
+      {tab === 'about' && (
+        <AboutSection authRequired={authRequired} onLogout={onLogout} onImported={() => setReload((n) => n + 1)} />
+      )}
     </section>
   )
 }
 
 type SettingsState<T> = ReturnType<typeof useSettingsHalf<T>>
 
-/// Load, edit and save one half of the settings — the resource behind one page.
-function useSettingsHalf<T>(get: () => Promise<T>, update: (s: T) => Promise<T>) {
+/// Load, edit and save one half of the settings — the resource behind one page. `reload` is a counter: bumping it
+/// refetches, which is how an import on the About page gets its new values onto these two pages.
+function useSettingsHalf<T>(get: () => Promise<T>, update: (s: T) => Promise<T>, reload: number) {
   const [s, setS] = useState<T | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [saved, setSaved] = useState(false)
@@ -89,7 +93,7 @@ function useSettingsHalf<T>(get: () => Promise<T>, update: (s: T) => Promise<T>)
     get()
       .then(setS)
       .catch((e) => setError(e instanceof Error ? e.message : String(e)))
-  }, [get])
+  }, [get, reload])
 
   const set = <K extends keyof T>(k: K, v: T[K]) => {
     // Any edit retracts "Saved." — otherwise it stays on screen next to fields that have since been changed and not

@@ -49,10 +49,9 @@ public class AccountService(AppDbContext db) : IAccountService
     /// old database are left alone — only new additions and edits are gated.</summary>
     private async Task RejectEndpointAliasAsync(string endpoint, int? exceptId, CancellationToken ct)
     {
-        static string Normalize(string e) => e.TrimEnd('/').ToLowerInvariant();
-        var normalized = Normalize(endpoint);
+        var normalized = BlobEndpointKey.Normalize(endpoint);
         var clash = (await db.Accounts.AsNoTracking().Select(a => new { a.Id, a.BlobEndpoint, a.Name }).ToListAsync(ct))
-            .FirstOrDefault(a => a.Id != exceptId && Normalize(a.BlobEndpoint) == normalized);
+            .FirstOrDefault(a => a.Id != exceptId && BlobEndpointKey.Normalize(a.BlobEndpoint) == normalized);
         if (clash is not null)
             throw new InvalidOperationException(
                 $"The endpoint {endpoint} is already registered by the account \"{clash.Name}\" — one storage account, one entry (a duplicate would let two operations run against the same container at once).");
