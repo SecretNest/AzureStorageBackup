@@ -29,6 +29,8 @@ public class SettingsTransferEndpointsTests(TestWebAppFactory factory) : IClassF
         Assert.NotNull(disposition);
         Assert.Equal("attachment", disposition!.DispositionType);
         Assert.Matches(@"^""?asb-settings-\d{8}-\d{4}\.json""?$", disposition.FileName);
+        // A file that may hold account keys must never land in a shared or proxy cache.
+        Assert.True(res.Headers.CacheControl?.NoStore, "Cache-Control: no-store expected on the export");
         var doc = await res.Content.ReadFromJsonAsync<SettingsDocument>();
         Assert.False(doc!.IncludesSecrets);
         var entry = doc.Accounts!.Single(a => a.Name == "export-a");

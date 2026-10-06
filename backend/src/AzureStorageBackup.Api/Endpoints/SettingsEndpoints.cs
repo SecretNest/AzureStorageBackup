@@ -37,6 +37,8 @@ public static class SettingsEndpoints
             var doc = await transfer.ExportAsync(withSecrets, ct);
             var name = $"asb-settings-{doc.ExportedAt:yyyyMMdd-HHmm}.json";
             http.Response.Headers.ContentDisposition = $"attachment; filename=\"{name}\"";
+            // Keys may be in this body; no cache anywhere between here and the download.
+            http.Response.Headers.CacheControl = "no-store";
             return Results.Json(doc);
         });
 
