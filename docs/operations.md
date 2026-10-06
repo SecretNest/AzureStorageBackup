@@ -609,6 +609,39 @@ The **info file is a separate thing**, stored in the Azure container, not in the
 Secrets are stored reversibly encrypted with the Data Protection key ring; everything else is stored
 in the clear.
 
+## Settings export and import
+
+Settings → About exports everything under Settings — accounts, backup defaults, performance, notifications — as
+one JSON file, and imports such a file. Backups, groups and schedules are not in it: they reference accounts by
+id and have their own pages.
+
+The file (`format: "azure-storage-backup-settings"`, `version: 1`) carries no ids and no `createdAt`. Each
+section is the same shape as its GET endpoint (`/api/settings/defaults`, `/api/settings/performance`,
+`/api/notifications`); accounts are the `AccountRequest` shape with `accountKey` / `proxyPassword` plaintext or
+null. Every section is optional on import — a hand-trimmed file carrying only `performance` changes only that.
+
+**Accounts are matched by endpoint**, not by name and not by id: the endpoint with its trailing `/` dropped and
+lower-cased, the same key `AccountService` uses to refuse a second account on one endpoint
+(`BlobEndpointKey.Normalize`). A match is updated in place, so the backups, groups and schedules that reference
+it by id are unaffected. No match creates the account. Accounts on the server that the file does not mention are
+left alone — an import never deletes.
+
+> **Rationale.** Ids are meaningless across installs and names are what people rename. The endpoint is the one
+> thing that identifies a storage account to Azure itself, and the server already treats it as unique.
+
+**Secrets** leave only on request: the export has an "Include account keys and proxy passwords" box, off by
+default, and with it on the file holds them in plain text. With the keyring lost that export is refused with the
+usual `keyring_lost` 409 rather than silently writing nulls, and the response carries `Cache-Control: no-store`
+either way. On import a non-empty key replaces the stored one; an empty key on a matched account keeps what is
+stored (including an unreadable ciphertext while the keyring is lost); an empty key on a **new** account is the
+one case the server refuses, because a keyless account is not flagged anywhere — it looks normal and fails on
+first use. The UI runs `POST /api/settings/import/preview` first and asks for each such key in the dialog, so a
+normal import never hits that refusal.
+
+The endpoints: `GET /api/settings/export?includeSecrets=` (a named download), `POST /api/settings/import/preview`
+(the plan, no writes), `POST /api/settings/import` (same body, applies). Import is one SQLite transaction under
+the account topology gate; any failure leaves the database as it was. `SettingsTransfer` holds all three.
+
 ## Environment variables
 
 | Variable | Effect |

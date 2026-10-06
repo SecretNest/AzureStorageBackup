@@ -95,6 +95,12 @@ saved by that tab's own button.
 > mobile, in the sidebar on desktop" is exactly the kind of fork later maintenance forgets to keep in
 > sync.
 
+**Export / Import also lives on About.** One file for all four settings pages; the import shows a preview dialog
+(what is created, what is updated, which sections are overwritten) and collects a key for every new account the
+file has none for before anything is written. After an import the Backup defaults and Performance pages refetch
+(a reload counter passed into `useSettingsHalf`); Accounts and Notifications fetch on mount anyway. The rules
+are in operations.md § Settings export and import.
+
 ## Touch
 
 **Control height** goes to 44px under `pointer: coarse` alone. Because every control references
